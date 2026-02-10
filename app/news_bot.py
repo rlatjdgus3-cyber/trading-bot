@@ -114,7 +114,7 @@ def db_news_summary(db, minutes=60, limit=20) -> str:
         return (row[0] if row and row[0] else "📰 DB News\n• (none)")
 
 def run_summary_once():
-    db = psycopg2.connect(DATABASE_URL)
+    db = psycopg2.connect(DATABASE_URL, connect_timeout=10, options="-c statement_timeout=30000")
     ensure_table(db)
     minutes = int(os.getenv("NEWS_SUMMARY_MINUTES", "60"))
     limit = int(os.getenv("NEWS_SUMMARY_LIMIT", "20"))
@@ -132,7 +132,7 @@ def main():
     if client is None:
         log("[news_bot] NOTE: OPENAI_API_KEY 없음/자리표시자 -> LLM 없이 저장만 진행")
 
-    db = psycopg2.connect(DATABASE_URL)
+    db = psycopg2.connect(DATABASE_URL, connect_timeout=10, options="-c statement_timeout=30000")
     ensure_table(db)
 
     while True:
