@@ -162,8 +162,19 @@ def main():
                             continue
 
                     impact, direction, summary = 0, "neutral", ""
-                    if client and worth_llm(title):
+                    try:
+                        from news_scorer_local import should_call_ai
+                        should_ai, local_score = should_call_ai(title)
+                    except Exception:
+                        should_ai = worth_llm(title)
+                        local_score = 0.5 if should_ai else 0.0
+
+                    if client and should_ai:
                         impact, direction, summary = llm_analyze(client, title)
+                    elif local_score > 0:
+                        impact = int(local_score * 10)
+                        direction = "neutral"
+                        summary = "(local scoring only)"
 
                     kw = extract_keywords(title)
 
