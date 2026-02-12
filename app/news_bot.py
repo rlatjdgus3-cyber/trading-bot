@@ -40,9 +40,7 @@ def extract_keywords(title: str):
 
 def get_openai():
     key = os.getenv("OPENAI_API_KEY", "")
-    # 🔑 키를 넣어야 하는 곳(systemd override.conf)에서 아래 글자를 실제 키로 교체:
-    # Environment="OPENAI_API_KEY=여기에_실제_OpenAI_API_키를_넣으세요"
-    if not key or "REDACTED_OPENAI_KEY" in key:
+    if not key:
         return None
     return OpenAI(api_key=key)
 
