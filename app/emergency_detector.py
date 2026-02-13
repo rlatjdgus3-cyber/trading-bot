@@ -31,7 +31,30 @@ def _db():
     return psycopg2.connect(**DB)
 
 
-def check_price_crash(conn=None):
+def _load_thresholds(conn=None):
+    """Load thresholds from openclaw_policies, fallback to hardcoded."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT value FROM openclaw_policies WHERE key = 'emergency_thresholds';
+            """)
+            row = cur.fetchone()
+            if row and row[0]:
+                import json
+                custom = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                return {
+                    '1m_pct': Decimal(str(custom.get('1m_pct', '1.0'))),
+                    '5m_pct': Decimal(str(custom.get('5m_pct', '2.0'))),
+                    'vol_multiplier': Decimal(str(custom.get('vol_multiplier', '3.0'))),
+                    'consecutive_stops': int(custom.get('consecutive_stops', 2)),
+                }
+    except Exception:
+        pass
+    return dict(THRESHOLDS)
+
+
+def check_price_crash(conn=None, thresholds=None):
+    th = thresholds or THRESHOLDS
     alerts = []
     try:
         with conn.cursor() as cur:
@@ -47,7 +70,7 @@ def check_price_crash(conn=None):
                 prev = rows[1]
                 if prev[1] and prev[1] > 0:
                     pct = abs((latest[2] - prev[2]) / prev[2]) * 100
-                    if pct >= float(THRESHOLDS['1m_pct']):
+                    if pct >= float(th['1m_pct']):
                         direction = 'UP' if latest[2] > prev[2] else 'DOWN'
                         alerts.append({
                             'type': '1m_move',
@@ -67,7 +90,7 @@ def check_price_crash(conn=None):
                 oldest = float(candles[-1][0])
                 if oldest > 0:
                     pct_5m = abs((newest - oldest) / oldest) * 100
-                    if pct_5m >= float(THRESHOLDS['5m_pct']):
+                    if pct_5m >= float(th['5m_pct']):
                         direction = 'UP' if newest > oldest else 'DOWN'
                         alerts.append({
                             'type': '5m_move',
@@ -78,7 +101,8 @@ def check_price_crash(conn=None):
     return alerts
 
 
-def check_volume_spike(conn=None):
+def check_volume_spike(conn=None, thresholds=None):
+    th = thresholds or THRESHOLDS
     alerts = []
     try:
         with conn.cursor() as cur:
@@ -90,7 +114,7 @@ def check_volume_spike(conn=None):
             row = cur.fetchone()
             if row and row[0] and row[1] and float(row[1]) > 0:
                 ratio = float(row[0]) / float(row[1])
-                if ratio >= float(THRESHOLDS['vol_multiplier']):
+                if ratio >= float(th['vol_multiplier']):
                     alerts.append({
                         'type': 'volume_spike',
                         'ratio': round(ratio, 2)})
@@ -99,7 +123,8 @@ def check_volume_spike(conn=None):
     return alerts
 
 
-def check_consecutive_stops(conn=None):
+def check_consecutive_stops(conn=None, thresholds=None):
+    th = thresholds or THRESHOLDS
     alerts = []
     try:
         with conn.cursor() as cur:
@@ -107,9 +132,9 @@ def check_consecutive_stops(conn=None):
                 SELECT close_reason FROM execution_log
                 WHERE close_reason LIKE '%%stop%%'
                 ORDER BY ts DESC LIMIT %s;
-            """, (THRESHOLDS['consecutive_stops'],))
+            """, (th['consecutive_stops'],))
             rows = cur.fetchall()
-            if len(rows) >= THRESHOLDS['consecutive_stops']:
+            if len(rows) >= th['consecutive_stops']:
                 alerts.append({
                     'type': 'consecutive_stops',
                     'count': len(rows)})
@@ -171,10 +196,11 @@ def gather_context(conn=None):
 def run_check():
     '''Main entry. Returns alert dict or None.'''
     conn = _db()
+    th = _load_thresholds(conn)
     all_alerts = []
     for checker in (check_price_crash, check_volume_spike, check_consecutive_stops):
         try:
-            result = checker(conn)
+            result = checker(conn, thresholds=th)
             if result:
                 all_alerts.extend(result)
         except Exception:

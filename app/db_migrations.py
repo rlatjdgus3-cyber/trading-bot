@@ -688,6 +688,77 @@ def ensure_price_event_stats(cur):
     _log('ensure_price_event_stats done')
 
 
+def ensure_openclo_tables(cur):
+    '''Create settings and command_queue tables used by openclo.py.'''
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS command_queue (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ DEFAULT now(),
+            cmd TEXT,
+            args JSONB DEFAULT '{}',
+            status TEXT DEFAULT 'pending',
+            who TEXT DEFAULT 'unknown',
+            result TEXT
+        );
+    ''')
+    _log('ensure_openclo_tables done')
+
+
+def ensure_openclaw_directives(cur):
+    '''Create openclaw_directives table for directive logging.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.openclaw_directives (
+            id              BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+            dtype           TEXT NOT NULL,
+            params          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            source          TEXT DEFAULT 'telegram',
+            status          TEXT NOT NULL DEFAULT 'PENDING',
+            result          JSONB DEFAULT '{}'::jsonb,
+            idempotency_key TEXT UNIQUE,
+            applied_at      TIMESTAMPTZ,
+            error           TEXT
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_ocd_ts ON openclaw_directives(ts DESC);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_ocd_dtype ON openclaw_directives(dtype);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_ocd_status ON openclaw_directives(status);')
+    _log('ensure_openclaw_directives done')
+
+
+def ensure_openclaw_policies(cur):
+    '''Create openclaw_policies table for active policy key-value store.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.openclaw_policies (
+            key             TEXT PRIMARY KEY,
+            value           JSONB NOT NULL,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            directive_id    BIGINT,
+            description     TEXT
+        );
+    """)
+    _log('ensure_openclaw_policies done')
+
+
+def ensure_claude_gate_columns(cur):
+    '''Add token/cost/gate columns to claude_analyses for gate tracking.'''
+    for col, dtype in (('input_tokens', 'INTEGER'),
+                        ('output_tokens', 'INTEGER'),
+                        ('estimated_cost_usd', 'NUMERIC(8,4)'),
+                        ('gate_type', 'TEXT')):
+        cur.execute(f"""
+            ALTER TABLE claude_analyses
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_claude_gate_columns done')
+
+
 def ensure_score_weights_v2(cur):
     '''Add news_event_w column and update weights for price-event strategy.'''
     # Add news_event_w column if missing
@@ -754,6 +825,13 @@ def run_all():
             # Price-event strategy
             ensure_price_event_stats(cur)
             ensure_score_weights_v2(cur)
+            # OpenClo tables
+            ensure_openclo_tables(cur)
+            # Claude gate columns
+            ensure_claude_gate_columns(cur)
+            # OpenClaw directive tables
+            ensure_openclaw_directives(cur)
+            ensure_openclaw_policies(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

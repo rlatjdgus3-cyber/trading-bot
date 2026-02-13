@@ -12,12 +12,51 @@ import datetime
 import decimal
 from dotenv import load_dotenv
 load_dotenv('/root/trading-bot/app/.env')
-TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TG_CHAT = os.getenv('TELEGRAM_CHAT_ID')
-ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')
+
+# Telegram credentials from telegram_cmd.env (single source of truth)
+def _load_tg_env():
+    _env = {}
+    try:
+        with open('/root/trading-bot/app/telegram_cmd.env', 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                _env[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return _env
+_tg_env = _load_tg_env()
+TG_TOKEN = _tg_env.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+TG_CHAT = _tg_env.get('TELEGRAM_ALLOWED_CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID')
+ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY') or None
+if ANTHROPIC_KEY == 'DISABLED':
+    ANTHROPIC_KEY = None
 ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
-ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')
+ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514')
 db = psycopg2.connect(host='localhost', dbname='trading', user='bot', password='botpass')
+db.autocommit = True
+
+
+def _db_reconnect():
+    global db
+    try:
+        db.close()
+    except Exception:
+        pass
+    db = psycopg2.connect(host='localhost', dbname='trading', user='bot', password='botpass')
+    db.autocommit = True
+
+
+def _db_query(func):
+    """Execute a DB function with auto-reconnect on failure."""
+    try:
+        return func(db)
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        _db_reconnect()
+        return func(db)
+
 
 def tg_send(text=None):
     if not TG_TOKEN or not TG_CHAT:
@@ -61,65 +100,73 @@ def clean_user_reply(s=None):
 
 
 def settings_get():
-    with db.cursor() as cur:
-        cur.execute("SELECT key, value FROM settings;")
-        rows = cur.fetchall()
-    return {k: v for k, v in rows}
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM settings;")
+            return {k: v for k, v in cur.fetchall()}
+    return _db_query(_run)
 
 
 def settings_set(key=None, value=None):
-    with db.cursor() as cur:
-        cur.execute(
-            "INSERT INTO settings (key, value) VALUES (%s, %s) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;",
-            (key, json.dumps(value) if not isinstance(value, str) else value)
-        )
-    db.commit()
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;",
+                (key, json.dumps(value) if not isinstance(value, str) else value)
+            )
+    _db_query(_run)
 
 
 def enqueue(cmd=None, args=None, who=None):
-    with db.cursor() as cur:
-        cur.execute(
-            "INSERT INTO command_queue (cmd, args, status, who) VALUES (%s, %s, 'pending', %s) RETURNING id;",
-            (cmd, json.dumps(args or {}), who or 'openclo')
-        )
-        cid = cur.fetchone()[0]
-    db.commit()
-    return cid
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO command_queue (cmd, args, status, who) VALUES (%s, %s, 'pending', %s) RETURNING id;",
+                (cmd, json.dumps(args or {}), who or 'openclo')
+            )
+            return cur.fetchone()[0]
+    return _db_query(_run)
 
 
 def cmd_status_tail(limit=8):
-    with db.cursor() as cur:
-        cur.execute(
-            "SELECT id, ts, cmd, status, result FROM command_queue ORDER BY id DESC LIMIT %s;",
-            (limit,)
-        )
-        return cur.fetchall()
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ts, cmd, status, result FROM command_queue ORDER BY id DESC LIMIT %s;",
+                (limit,)
+            )
+            return cur.fetchall()
+    return _db_query(_run)
 
 
 def get_status():
-    with db.cursor() as cur:
-        cur.execute("SELECT key, value FROM settings;")
-        settings = {k: v for k, v in cur.fetchall()}
-        cur.execute("SELECT enabled, updated_at FROM trade_switch LIMIT 1;")
-        sw = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM live_order_once_lock;")
-        lock = cur.fetchone()
-    return {
-        'settings': settings,
-        'trade_switch': {'enabled': bool(sw[0]) if sw else False, 'updated_at': str(sw[1]) if sw else 'n/a'},
-        'once_lock_count': int(lock[0]) if lock else 0,
-    }
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM settings;")
+            settings = {k: v for k, v in cur.fetchall()}
+            cur.execute("SELECT enabled, updated_at FROM trade_switch LIMIT 1;")
+            sw = cur.fetchone()
+            cur.execute("SELECT COUNT(*) FROM live_order_once_lock;")
+            lock = cur.fetchone()
+        return {
+            'settings': settings,
+            'trade_switch': {'enabled': bool(sw[0]) if sw else False, 'updated_at': str(sw[1]) if sw else 'n/a'},
+            'once_lock_count': int(lock[0]) if lock else 0,
+        }
+    return _db_query(_run)
 
 
 def get_top_news(limit=5, min_impact=6):
-    with db.cursor() as cur:
-        cur.execute(
-            "SELECT id, title, impact_score, summary, url FROM news "
-            "WHERE impact_score >= %s ORDER BY id DESC LIMIT %s;",
-            (min_impact, limit)
-        )
-        rows = cur.fetchall()
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, impact_score, summary, url FROM news "
+                "WHERE impact_score >= %s ORDER BY id DESC LIMIT %s;",
+                (min_impact, limit)
+            )
+            return cur.fetchall()
+    rows = _db_query(_run)
     if not rows:
         return '최근 고임팩트 뉴스 없음'
     lines = [f'📰 최근 고임팩트 뉴스 ({len(rows)}건)']
@@ -131,22 +178,18 @@ def get_top_news(limit=5, min_impact=6):
 def anthropic_call(user_text=None, system_text=None, max_tokens=None):
     if not ANTHROPIC_KEY:
         return 'Claude 키가 없어요.'
-    headers = {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'}
-    body = {
-        'model': ANTHROPIC_MODEL,
-        'max_tokens': max_tokens,
-        'messages': [
-            {
-                'role': 'user',
-                'content': (system_text + '\n\n' + user_text).strip()}]}
-    r = requests.post(ANTHROPIC_URL, headers=headers, json=body, timeout=60)
-    if r.status_code != 200:
-        return 'Claude 오류(' + str(r.status_code) + '): ' + r.text[:300]
-    data = r.json()
-    return data['content'][0]['text']
+    try:
+        import claude_gate
+        prompt = ((system_text or '') + '\n\n' + (user_text or '')).strip()
+        result = claude_gate.call_claude(
+            gate='telegram', prompt=prompt,
+            cooldown_key='openclo', context={'intent': 'chat'},
+            max_tokens=max_tokens or 300)
+        if result.get('fallback_used'):
+            return f'Claude 게이트 거부: {result.get("gate_reason", "unknown")}'
+        return result.get('text', '')
+    except Exception as e:
+        return f'Claude 오류: {e}'
 
 
 def extract_json(text=None):
@@ -181,15 +224,22 @@ def consume(token=None):
 
 
 def help_text():
-    return '✅ OpenClo (대화형+운영)\n명령어:\n/help\n/status\n/decision 또는 /d\n/news (중요뉴스)\n/arm (긴급명령 허용 ON)\n/disarm (긴급명령 OFF)\n/ops (최근 명령 결과)\n\n자연어 예시:\n- 오늘자 뉴스 정리해줘\n- 중요뉴스 가져와\n- 한글로\n- 뉴스 기준 7로 바꿔\n- 메인 재시작해줘\n- 긴급이야 매매 멈춰\n'
+    return ('✅ OpenClo (대화형+운영+디렉티브)\n명령어:\n/help\n/status\n/decision 또는 /d\n'
+            '/news (중요뉴스)\n/arm (긴급명령 허용 ON)\n/disarm (긴급명령 OFF)\n/ops (최근 명령 결과)\n'
+            '/audit (시스템 감사)\n/risk <mode> (conservative/normal/aggressive)\n'
+            '/keywords (워치 키워드 목록)\n/directives (최근 디렉티브)\n\n'
+            '자연어 예시:\n- 오늘자 뉴스 정리해줘\n- 중요뉴스 가져와\n- 한글로\n'
+            '- 뉴스 기준 7로 바꿔\n- 메인 재시작해줘\n- 긴급이야 매매 멈춰\n'
+            '- BTC 키워드에 trump 추가해\n- 리스크 보수적으로 바꿔\n'
+            '- 시스템 점검해줘\n')
 
 
 def route_nl(user_text=None, status_snapshot=None):
     prompt = (
         '사용자 메시지를 분석해서 JSON으로 응답하세요.\n'
-        '{"intent": "news|status|decision|set_setting|restart|pause_trading|resume_trading|chat",\n'
+        '{"intent": "news|status|decision|set_setting|restart|pause_trading|resume_trading|directive|chat",\n'
         ' "reply": "한국어 자연어 응답",\n'
-        ' "action": "none|restart|pause_trading|resume_trading|set_setting",\n'
+        ' "action": "none|restart|pause_trading|resume_trading|set_setting|directive",\n'
         ' "args": {}}\n\n'
         f'상태: {json.dumps(status_snapshot, ensure_ascii=False, default=to_jsonable)}\n\n'
         f'메시지: {user_text}'
@@ -251,6 +301,40 @@ def handle(text=None):
     if t == '/disarm':
         settings_set('trading_armed', False)
         return '✅ 긴급명령 ARM=OFF'
+    # Directive commands
+    if t == '/audit':
+        import openclaw_engine
+        result = openclaw_engine.execute_directive(db, 'AUDIT', {}, source='telegram')
+        return result.get('message', 'Audit complete')
+    if t.startswith('/risk '):
+        import openclaw_engine
+        mode = t.split(' ', 1)[1].strip()
+        result = openclaw_engine.execute_directive(db, 'RISK_MODE', {'mode': mode}, source='telegram')
+        return result.get('message', 'Risk mode updated')
+    if t == '/keywords' or t.startswith('/keywords '):
+        import openclaw_engine
+        args_text = t[len('/keywords'):].strip()
+        if args_text:
+            params = openclaw_engine._parse_keyword_text(args_text)
+        else:
+            params = {'action': 'list', 'keywords': []}
+        result = openclaw_engine.execute_directive(db, 'WATCH_KEYWORDS', params, source='telegram')
+        return result.get('message', 'Keywords processed')
+    if t == '/directives':
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, ts, dtype, status, source
+                    FROM openclaw_directives ORDER BY id DESC LIMIT 10;
+                """)
+                return cur.fetchall()
+        rows = _db_query(_run)
+        if not rows:
+            return 'No recent directives'
+        lines = ['Recent directives:']
+        for did, ts, dtype, status, source in rows:
+            lines.append(f'  #{did} {str(ts)[:16]} {dtype} [{status}] src={source}')
+        return '\n'.join(lines)
     s = get_status()
     r = route_nl(t, s)
     intent = r.get('intent', 'chat')
@@ -313,6 +397,25 @@ def handle(text=None):
         if reply:
             return (reply + '\n\n' + msg).strip()
         return msg
+    if action == 'directive':
+        import openclaw_engine
+        dtype = args.get('dtype')
+        params = args.get('params', {})
+        if dtype:
+            result = openclaw_engine.execute_directive(db, dtype, params, source='telegram')
+            msg = result.get('message', 'Directive processed')
+            if reply:
+                return (reply + '\n\n' + msg).strip()
+            return msg
+        # Try parsing from original text
+        parsed = openclaw_engine.parse_directive(t)
+        if parsed:
+            result = openclaw_engine.execute_directive(
+                db, parsed['dtype'], parsed['params'], source='telegram')
+            msg = result.get('message', 'Directive processed')
+            if reply:
+                return (reply + '\n\n' + msg).strip()
+            return msg
     if reply:
         return reply
     return '무엇을 도와드릴까요?'

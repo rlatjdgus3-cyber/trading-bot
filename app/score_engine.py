@@ -52,7 +52,8 @@ def _db_conn():
 
 
 def _load_weights(cur=None):
-    '''Load axis weights from score_weights table.'''
+    '''Load axis weights from score_weights table, with openclaw_policies override.'''
+    weights = dict(DEFAULT_WEIGHTS)
     try:
         cur.execute("""
             SELECT tech_w, position_w, regime_w, news_event_w
@@ -60,14 +61,27 @@ def _load_weights(cur=None):
         """)
         row = cur.fetchone()
         if row:
-            return {
+            weights = {
                 'tech_w': float(row[0]),
                 'position_w': float(row[1]),
                 'regime_w': float(row[2]),
                 'news_event_w': float(row[3])}
     except Exception:
         pass
-    return dict(DEFAULT_WEIGHTS)
+    # openclaw_policies override
+    try:
+        cur.execute("""
+            SELECT value FROM openclaw_policies WHERE key = 'score_weight_override';
+        """)
+        row = cur.fetchone()
+        if row and row[0]:
+            override = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            for k in ('tech_w', 'position_w', 'regime_w', 'news_event_w'):
+                if k in override:
+                    weights[k] = float(override[k])
+    except Exception:
+        pass
+    return weights
 
 
 def score_to_stage(abs_score=None):

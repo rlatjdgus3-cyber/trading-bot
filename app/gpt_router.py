@@ -25,7 +25,8 @@ BUDGET_GEAR2_THRESHOLD = 150    # 75% → stronger cooldown
 # Market-sensitive intents: shorter cooldown, gear2 does not multiply
 MARKET_COOLDOWN_INTENTS = {"strategy", "emergency"}
 
-VALID_INTENTS = ("status", "chart", "news", "strategy", "emergency", "debug", "report", "other")
+VALID_INTENTS = ("status", "chart", "news", "strategy", "emergency",
+                 "debug", "report", "directive", "other")
 VALID_ROUTES = ("local", "claude", "none")
 VALID_PRIORITIES = ("low", "normal", "high")
 
@@ -39,11 +40,12 @@ Available intents:
 - emergency: Crash analysis, stop-loss post-mortem, extreme volatility response
 - debug: Error logs, service health, system diagnostics
 - report: Daily/equity reports, performance summary
+- directive: System configuration changes. Keywords, risk mode, analysis request, pipeline tuning, audit.
 - other: Unrecognized or general conversation
 
 Routing rules:
 - "local": Data fetchable from DB/API without AI. Use for: status, positions, prices, indicators, health, news list, errors, reports, volatility stats.
-- "claude": Complex analysis requiring AI reasoning. Use for: strategy analysis, crash direction analysis, stop-loss post-mortem, high-impact news interpretation.
+- "claude": Complex analysis requiring AI reasoning. Use for: strategy analysis, crash analysis, stop-loss post-mortem, high-impact news interpretation, system directives (keyword changes, risk mode, analysis requests).
 - "none": Greetings, irrelevant, or blocked requests.
 
 local_query_type (only when route=local):
@@ -205,18 +207,18 @@ def _keyword_fallback(text: str) -> dict:
         return {"intent": "chart", "route": "local", "local_query_type": "indicator_snapshot",
                 "cooldown_key": "indicator", "priority": "normal", "_fallback": True}
 
-    # emergency/strategy BEFORE news — "긴급뉴스" should route to claude, not local news
+    # emergency/strategy → claude
     if any(x in t for x in ["긴급", "급변", "급락", "급등", "손절", "stop.?loss"]):
-        return {"intent": "emergency", "route": "claude", "claude_prompt": text,
+        return {"intent": "emergency", "route": "claude",
                 "cooldown_key": "emergency", "priority": "high", "_fallback": True}
 
     if any(x in t for x in ["전략", "strategy", "대응", "시나리오", "매매"]):
-        return {"intent": "strategy", "route": "claude", "claude_prompt": text,
+        return {"intent": "strategy", "route": "claude",
                 "cooldown_key": "strategy", "priority": "normal", "_fallback": True}
 
-    # 뉴스 + 분석 키워드 → claude로 라우팅
+    # 뉴스 + 분석 키워드 → claude
     if ("뉴스" in t or "news" in t) and any(x in t for x in ["분석", "해석", "영향", "중요", "analysis"]):
-        return {"intent": "news", "route": "claude", "claude_prompt": text,
+        return {"intent": "news", "route": "claude",
                 "cooldown_key": "news_analysis", "priority": "normal", "_fallback": True}
 
     if "뉴스" in t or "news" in t:
@@ -242,6 +244,20 @@ def _keyword_fallback(text: str) -> dict:
     if any(x in t for x in ["equity", "자본", "잔고"]):
         return {"intent": "report", "route": "local", "local_query_type": "equity_report",
                 "cooldown_key": "equity", "priority": "normal", "_fallback": True}
+
+    # directive keywords
+    if any(x in t for x in ["키워드", "워치", "감시", "keyword", "watch"]):
+        return {"intent": "directive", "route": "claude",
+                "cooldown_key": "directive_kw", "priority": "normal", "_fallback": True}
+    if any(x in t for x in ["리스크", "risk", "위험모드", "보수", "공격"]):
+        return {"intent": "directive", "route": "claude",
+                "cooldown_key": "directive_risk", "priority": "normal", "_fallback": True}
+    if any(x in t for x in ["감사", "audit", "오딧", "시스템점검"]):
+        return {"intent": "directive", "route": "local", "local_query_type": "audit",
+                "cooldown_key": "directive_audit", "priority": "normal", "_fallback": True}
+    if any(x in t for x in ["파이프라인", "가중치", "weight", "임계", "threshold"]):
+        return {"intent": "directive", "route": "claude",
+                "cooldown_key": "directive_pipeline", "priority": "normal", "_fallback": True}
 
     return {"intent": "other", "route": "none", "cooldown_key": "",
             "priority": "low", "_fallback": True}

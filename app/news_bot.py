@@ -29,13 +29,32 @@ KEYWORDS = [
 def log(msg):
     print(msg, flush=True)
 
-def worth_llm(title: str) -> bool:
-    t = (title or "").lower()
-    return any(k in t for k in KEYWORDS)
+def _load_watch_keywords(db):
+    """Load keywords from openclaw_policies. Falls back to hardcoded KEYWORDS."""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT value FROM openclaw_policies WHERE key = 'watch_keywords';
+            """)
+            row = cur.fetchone()
+            if row and row[0]:
+                custom = row[0] if isinstance(row[0], list) else json.loads(row[0])
+                if isinstance(custom, list) and len(custom) > 0:
+                    return custom
+    except Exception:
+        pass
+    return list(KEYWORDS)
 
-def extract_keywords(title: str):
+
+def worth_llm(title: str, active_keywords=None) -> bool:
     t = (title or "").lower()
-    hits = [k for k in KEYWORDS if k in t]
+    kw_list = active_keywords if active_keywords else KEYWORDS
+    return any(k in t for k in kw_list)
+
+def extract_keywords(title: str, active_keywords=None):
+    t = (title or "").lower()
+    kw_list = active_keywords if active_keywords else KEYWORDS
+    hits = [k for k in kw_list if k in t]
     return hits
 
 def get_openai():
@@ -136,6 +155,8 @@ def main():
     while True:
         log("[news_bot] TICK")
         inserted = 0
+        active_keywords = _load_watch_keywords(db)
+        log(f"[news_bot] active keywords: {len(active_keywords)}")
 
         for source, url in FEEDS:
             try:
@@ -164,7 +185,7 @@ def main():
                         from news_scorer_local import should_call_ai
                         should_ai, local_score = should_call_ai(title)
                     except Exception:
-                        should_ai = worth_llm(title)
+                        should_ai = worth_llm(title, active_keywords)
                         local_score = 0.5 if should_ai else 0.0
 
                     if client and should_ai:
@@ -174,7 +195,7 @@ def main():
                         direction = "neutral"
                         summary = "(local scoring only)"
 
-                    kw = extract_keywords(title)
+                    kw = extract_keywords(title, active_keywords)
 
                     with db.cursor() as cur:
                         cur.execute("""
