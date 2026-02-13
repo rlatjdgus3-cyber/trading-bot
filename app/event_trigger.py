@@ -34,7 +34,7 @@ PRICE_SPIKE_15M_PCT = 3.0
 VOL_SPIKE_RATIO = 2.0  # vol_last >= 2.0 * vol_ma20
 
 # ── level breaks (POC/VAH/VAL) ────────────────────────────
-POC_SHIFT_MIN_PCT = 0.5
+POC_SHIFT_MIN_PCT = 0.3
 VAH_VAL_SUSTAIN_CANDLES = 3
 
 # ── regime change ──────────────────────────────────────────
@@ -43,8 +43,15 @@ ATR_INCREASE_PCT = 30
 
 # ── emergency escalation ──────────────────────────────────
 EMERGENCY_5M_RET_PCT = 2.0
+EMERGENCY_15M_RET_PCT = 3.5
 EMERGENCY_LOSS_PCT = 2.0
-EMERGENCY_VOL_ZSCORE = 3.0
+EMERGENCY_LIQ_DIST_PCT = 3.0
+EMERGENCY_ATR_SURGE_PCT = 40
+EMERGENCY_VOL_SPIKE_RATIO = 2.5
+
+# ── box range filter (EMERGENCY suppression) ─────────────
+BOX_BB_BANDWIDTH_PCT = 0.6
+BOX_RET_5M_SUPPRESS_PCT = 1.0
 
 # ── dedup ──────────────────────────────────────────────────
 AUTO_DEDUP_WINDOW_SEC = 300    # 5 min
@@ -54,6 +61,9 @@ MIN_ORDER_QTY_BTC = 0.001     # Bybit BTC/USDT:USDT minimum
 # ── emergency lock state ──────────────────────────────────
 _emergency_lock = {}           # {symbol: expire_timestamp}
 _last_emergency_action = {}    # {symbol: {'action': str, 'direction': str, 'ts': float}}
+
+# ── per-type EVENT dedup (5 min) ─────────────────────────
+_last_trigger_ts = {}          # {trigger_type: timestamp}
 
 # ── priority ───────────────────────────────────────────────
 PRIORITY_EMERGENCY = 1
@@ -116,8 +126,21 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
     price = snapshot.get('price', 0)
 
     # Phase 1: emergency escalation (highest priority)
-    emergency_triggers = _check_emergency_escalation(snapshot, position)
+    emergency_triggers = _check_emergency_escalation(snapshot, position, prev_scores)
     if emergency_triggers:
+        # Section 5: box range filter — suppress EMERGENCY in tight ranges
+        bb_upper = snapshot.get('bb_upper', 0)
+        bb_lower = snapshot.get('bb_lower', 0)
+        bb_mid = snapshot.get('bb_mid', 0)
+        ret_5m = abs(snapshot.get('returns', {}).get('ret_5m') or 0)
+        if bb_mid and bb_mid > 0:
+            bb_bandwidth = (bb_upper - bb_lower) / bb_mid * 100
+            if bb_bandwidth < BOX_BB_BANDWIDTH_PCT and ret_5m < BOX_RET_5M_SUPPRESS_PCT:
+                _log(f'EMERGENCY suppressed by box range filter: '
+                     f'bb_bandwidth={bb_bandwidth:.3f}% < {BOX_BB_BANDWIDTH_PCT}%, '
+                     f'ret_5m={ret_5m:.2f}% < {BOX_RET_5M_SUPPRESS_PCT}%')
+                return EventResult()
+
         eh = compute_event_hash(emergency_triggers, symbol=symbol, price=price)
         _log(f'EMERGENCY: triggers={[t["type"] for t in emergency_triggers]} hash={eh[:12]}')
         return EventResult(
@@ -139,11 +162,30 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
     if not all_triggers:
         return EventResult()  # DEFAULT
 
-    eh = compute_event_hash(all_triggers, symbol=symbol, price=price)
-    _log(f'EVENT: triggers={[t["type"] for t in all_triggers]} hash={eh[:12]}')
+    # Section 2: per-type dedup (5 min) — filter triggers seen within 300s
+    now = time.time()
+    surviving = []
+    for t in all_triggers:
+        ttype = t.get('type', '')
+        last_ts = _last_trigger_ts.get(ttype, 0)
+        if now - last_ts < AUTO_DEDUP_WINDOW_SEC:
+            _log(f'trigger {ttype} deduped ({int(now - last_ts)}s since last)')
+        else:
+            surviving.append(t)
+
+    if not surviving:
+        _log(f'all triggers deduped, returning DEFAULT')
+        return EventResult()  # DEFAULT
+
+    # Update timestamps for surviving triggers only
+    for t in surviving:
+        _last_trigger_ts[t.get('type', '')] = now
+
+    eh = compute_event_hash(surviving, symbol=symbol, price=price)
+    _log(f'EVENT: triggers={[t["type"] for t in surviving]} hash={eh[:12]}')
     return EventResult(
         mode=MODE_EVENT,
-        triggers=all_triggers,
+        triggers=surviving,
         event_hash=eh,
         priority=PRIORITY_EVENT,
         call_type='AUTO',
@@ -302,22 +344,37 @@ def _check_regime_change(snapshot, prev_scores=None) -> list:
     return triggers
 
 
-def _check_emergency_escalation(snapshot, position=None) -> list:
-    """Check for emergency-level conditions."""
-    triggers = []
-    returns = snapshot.get('returns', {})
+def _check_emergency_escalation(snapshot, position=None, prev_scores=None) -> list:
+    """Check for emergency-level conditions.
 
-    # 5m return > ±2%
+    Logic: at least 1 signal condition must be met AND vol_ratio >= 2.5x (mandatory gate).
+    If signals exist but vol_ratio is insufficient, suppress and return empty.
+    """
+    signals = []
+    returns = snapshot.get('returns', {})
+    vol_ratio = snapshot.get('vol_ratio', 0)
+
+    # Signal 1: 5m return >= 2%
     ret_5m = returns.get('ret_5m')
     if ret_5m is not None and abs(ret_5m) >= EMERGENCY_5M_RET_PCT:
-        triggers.append({
+        signals.append({
             'type': 'emergency_price_5m',
             'value': ret_5m,
             'threshold': EMERGENCY_5M_RET_PCT,
             'direction': 'up' if ret_5m > 0 else 'down',
         })
 
-    # Position loss > 2%
+    # Signal 2: 15m return >= 3.5%
+    ret_15m = returns.get('ret_15m')
+    if ret_15m is not None and abs(ret_15m) >= EMERGENCY_15M_RET_PCT:
+        signals.append({
+            'type': 'emergency_price_15m',
+            'value': ret_15m,
+            'threshold': EMERGENCY_15M_RET_PCT,
+            'direction': 'up' if ret_15m > 0 else 'down',
+        })
+
+    # Signal 3: position unrealized loss >= 2%
     if position:
         entry = position.get('entry_price', 0)
         side = position.get('side', '')
@@ -328,23 +385,63 @@ def _check_emergency_escalation(snapshot, position=None) -> list:
             else:
                 loss_pct = (price - entry) / entry * 100
             if loss_pct >= EMERGENCY_LOSS_PCT:
-                triggers.append({
+                signals.append({
                     'type': 'emergency_position_loss',
                     'value': round(loss_pct, 2),
                     'threshold': EMERGENCY_LOSS_PCT,
                     'side': side,
                 })
 
-    # Volume z-score > 3 (approximated via vol_ratio)
-    vol_ratio = snapshot.get('vol_ratio', 0)
-    if vol_ratio >= EMERGENCY_VOL_ZSCORE:
-        triggers.append({
-            'type': 'emergency_volume',
-            'value': round(vol_ratio, 2),
-            'threshold': EMERGENCY_VOL_ZSCORE,
-        })
+    # Signal 4: liquidation distance <= 3%
+    if position:
+        liq_price = position.get('liquidation_price', 0)
+        price = snapshot.get('price', 0)
+        side = position.get('side', '')
+        if liq_price and liq_price > 0 and price and price > 0 and side:
+            if side == 'long':
+                liq_dist_pct = (price - liq_price) / price * 100
+            else:
+                liq_dist_pct = (liq_price - price) / price * 100
+            if liq_dist_pct <= EMERGENCY_LIQ_DIST_PCT:
+                signals.append({
+                    'type': 'emergency_liquidation_near',
+                    'value': round(liq_dist_pct, 2),
+                    'threshold': EMERGENCY_LIQ_DIST_PCT,
+                    'side': side,
+                })
 
-    return triggers
+    # Signal 5: ATR surge >= 40% vs previous cycle
+    if prev_scores:
+        prev_atr = prev_scores.get('atr_14') or prev_scores.get('atr')
+        curr_atr = snapshot.get('atr_14')
+        if prev_atr and curr_atr and prev_atr > 0:
+            atr_surge_pct = (curr_atr - prev_atr) / prev_atr * 100
+            if atr_surge_pct >= EMERGENCY_ATR_SURGE_PCT:
+                signals.append({
+                    'type': 'emergency_atr_surge',
+                    'value': round(atr_surge_pct, 1),
+                    'threshold': EMERGENCY_ATR_SURGE_PCT,
+                    'prev_atr': prev_atr,
+                    'curr_atr': curr_atr,
+                })
+
+    if not signals:
+        return []
+
+    # Mandatory gate: vol_ratio must be >= 2.5x
+    if vol_ratio < EMERGENCY_VOL_SPIKE_RATIO:
+        _log(f'emergency signals found but vol_ratio={vol_ratio:.2f} < {EMERGENCY_VOL_SPIKE_RATIO} — suppressed '
+             f'(signals={[s["type"] for s in signals]})')
+        return []
+
+    # Add vol confirmation to trigger list
+    signals.append({
+        'type': 'emergency_volume_confirmed',
+        'value': round(vol_ratio, 2),
+        'threshold': EMERGENCY_VOL_SPIKE_RATIO,
+    })
+
+    return signals
 
 
 def compute_event_hash(triggers, symbol='BTC/USDT:USDT', price=None) -> str:

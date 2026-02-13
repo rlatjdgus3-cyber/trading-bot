@@ -51,7 +51,7 @@ GATE_COOLDOWNS = {
     'scheduled': COOLDOWN_GENERAL_SEC,
     'telegram': COOLDOWN_GENERAL_SEC,
     'openclaw': 120,                      # 2 min — control tower, permissive
-    'event_trigger': 300,                 # 5 min — event dedup window
+    'event_trigger': 180,                 # 3 min — event cooldown (dedup is separate)
 }
 
 EVENT_DEDUP_WINDOW_SEC = 300              # 5 min — event hash dedup

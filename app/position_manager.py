@@ -124,13 +124,15 @@ def _fetch_position(ex=None):
         entry_price = float(p.get('entryPrice') or 0)
         mark_price = float(p.get('markPrice') or 0)
         upnl = float(p.get('unrealizedPnl') or 0)
+        liq_price = float(p.get('liquidationPrice') or 0)
         return {
             'side': side,
             'qty': contracts,
             'entry_price': entry_price,
             'mark_price': mark_price,
             'upnl': upnl,
-            'leverage': p.get('leverage')}
+            'leverage': p.get('leverage'),
+            'liquidation_price': liq_price}
     return None
 
 
@@ -450,6 +452,32 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
             f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
         return 'REVERSE'
 
+    if action in ('OPEN_LONG', 'OPEN_SHORT'):
+        pos_side = (pos.get('side') or '').upper()
+        direction = 'LONG' if action == 'OPEN_LONG' else 'SHORT'
+        if pos_side and pos_side != direction:
+            _log(f'{action} conflicts with {pos_side} in emergency — HOLD')
+            return 'HOLD'
+        import safety_manager
+        target_stage = result.get('target_stage', 1)
+        target_usdt = safety_manager.get_add_slice_usdt(cur) * target_stage
+        eq_id = _enqueue_action(
+            cur, 'ADD', direction,
+            target_usdt=target_usdt,
+            reason=f'emergency_{trigger["type"]}',
+            emergency_id=eid,
+            priority=2)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, action, execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] {action} stage={target_stage} 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return action
+
     return 'HOLD'
 
 
@@ -517,7 +545,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
 
     # ── Event stabilization guards ──
     import event_trigger as _et
-    pos_side = pos.get('side', '').upper()
+    pos_side = (pos.get('side') or '').upper()
 
     if action == 'REDUCE':
         pos_qty = pos.get('qty', 0)
@@ -706,7 +734,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
 
     # ── Emergency stabilization guards ──
     import event_trigger as _et
-    pos_side = pos.get('side', '').upper()
+    pos_side = (pos.get('side') or '').upper()
 
     if action == 'REDUCE':
         pos_qty = pos.get('qty', 0)
@@ -926,7 +954,7 @@ def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
     import safety_manager
 
     # Duplicate action check: block if same action_type already PENDING/PICKED
-    if action_type in ('REDUCE', 'CLOSE', 'ADD', 'REVERSE_CLOSE') and direction:
+    if action_type in ('REDUCE', 'CLOSE', 'ADD', 'REVERSE_CLOSE', 'REVERSE_OPEN') and direction:
         cur.execute("""
             SELECT id FROM execution_queue
             WHERE symbol = %s AND action_type = %s AND direction = %s
@@ -1098,11 +1126,15 @@ def _cycle():
                 _log(f'EMERGENCY: triggers={[t["type"] for t in event_result.triggers]}')
                 _handle_emergency_v2(cur, ctx, event_result, snapshot)
                 _prev_scores = ctx.get('scores', {})
+                if snapshot:
+                    _prev_scores['atr_14'] = snapshot.get('atr_14')
                 return LOOP_FAST_SEC
             elif event_result.mode == event_trigger.MODE_EVENT:
                 _log(f'EVENT: triggers={[t["type"] for t in event_result.triggers]}')
                 _handle_event_trigger(cur, ctx, event_result, snapshot)
                 _prev_scores = ctx.get('scores', {})
+                if snapshot:
+                    _prev_scores['atr_14'] = snapshot.get('atr_14')
                 return LOOP_FAST_SEC
             else:
                 # DEFAULT: score_engine only, no Claude call
@@ -1171,6 +1203,8 @@ def _cycle():
             # Sync position state
             _sync_position_state(cur, pos)
             _prev_scores = ctx.get('scores', {})
+            if snapshot:
+                _prev_scores['atr_14'] = snapshot.get('atr_14')
 
         return LOOP_NORMAL_SEC
 
