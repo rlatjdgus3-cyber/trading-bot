@@ -228,6 +228,37 @@ def _update_eq_status(cur, eq_id, status):
     )
 
 
+def _insert_exec_log(cur, order, order_type, direction, qty, reason,
+                     eq_id, pos_side=None, pos_qty=None, usdt=None, price=None):
+    """Insert into execution_log so fill_watcher can track this order."""
+    cur.execute("""
+        INSERT INTO execution_log
+            (order_id, symbol, order_type, direction,
+             close_reason, requested_qty, requested_usdt, ticker_price,
+             status, raw_order_response,
+             source_queue, execution_queue_id,
+             position_before_side, position_before_qty)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'SENT', %s::jsonb, %s, %s, %s, %s)
+        RETURNING id;
+    """, (
+        order.get("id", ""),
+        SYMBOL,
+        order_type,
+        direction,
+        reason,
+        qty,
+        usdt,
+        price,
+        json.dumps(order, default=str),
+        "execution_queue",
+        eq_id,
+        pos_side,
+        pos_qty,
+    ))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
 def _process_execution_queue(ex, cur, pos_side, pos_qty):
     """Main EQ consumer: expire stale, then process pending items."""
     _expire_stale_eq_items(cur)
@@ -310,6 +341,8 @@ def _eq_handle_close(ex, cur, eq_id, direction, pos_side, pos_qty, reason):
 
     order = place_close_order(ex, pos_side, pos_qty)
     _update_eq_status(cur, eq_id, "SENT")
+    _insert_exec_log(cur, order, "CLOSE", pos_side.upper(), pos_qty, reason,
+                     eq_id, pos_side, pos_qty)
     audit(cur, "EQ_CLOSE_SENT", SYMBOL, {
         "eq_id": eq_id, "side": pos_side, "qty": float(pos_qty),
         "order_id": order.get("id"), "reason": reason,
@@ -346,6 +379,8 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
 
     order = place_close_order(ex, pos_side, qty)
     _update_eq_status(cur, eq_id, "SENT")
+    _insert_exec_log(cur, order, "REDUCE", pos_side.upper(), qty, reason,
+                     eq_id, pos_side, pos_qty)
     audit(cur, "EQ_REDUCE_SENT", SYMBOL, {
         "eq_id": eq_id, "side": pos_side, "qty": float(qty),
         "order_id": order.get("id"), "reason": reason,
@@ -373,6 +408,8 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
 
     order, exec_price, amount = place_open_order(ex, dir_upper, usdt)
     _update_eq_status(cur, eq_id, "SENT")
+    _insert_exec_log(cur, order, "ADD", dir_upper, amount, reason,
+                     eq_id, usdt=usdt, price=exec_price)
     audit(cur, "EQ_ADD_SENT", SYMBOL, {
         "eq_id": eq_id, "direction": dir_upper, "usdt": usdt,
         "price": exec_price, "amount": amount,
@@ -401,6 +438,8 @@ def _eq_handle_reverse_close(ex, cur, eq_id, direction, pos_side, pos_qty, reaso
 
     order = place_close_order(ex, pos_side, pos_qty)
     _update_eq_status(cur, eq_id, "SENT")
+    _insert_exec_log(cur, order, "REVERSE_CLOSE", pos_side.upper(), pos_qty, reason,
+                     eq_id, pos_side, pos_qty)
     audit(cur, "EQ_REVERSE_CLOSE_SENT", SYMBOL, {
         "eq_id": eq_id, "side": pos_side, "qty": float(pos_qty),
         "order_id": order.get("id"), "reason": reason,
@@ -429,6 +468,8 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
 
     order, exec_price, amount = place_open_order(ex, dir_upper, usdt)
     _update_eq_status(cur, eq_id, "SENT")
+    _insert_exec_log(cur, order, "REVERSE_OPEN", dir_upper, amount, reason,
+                     eq_id, usdt=usdt, price=exec_price)
     set_once_lock(cur, SYMBOL)
     audit(cur, "EQ_REVERSE_OPEN_SENT", SYMBOL, {
         "eq_id": eq_id, "direction": dir_upper, "usdt": usdt,
