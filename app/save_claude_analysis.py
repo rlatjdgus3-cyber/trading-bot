@@ -16,7 +16,8 @@ def _log(msg):
 def save_analysis(cur, kind, input_packet=None, output=None,
                   event_id=None, similar_events=None,
                   emergency_log_id=None,
-                  model_used='claude-sonnet-4-20250514'):
+                  model_used='claude-sonnet-4-20250514',
+                  model_provider=None):
     """Insert a Claude analysis record into claude_analyses.
 
     Returns the new claude_analyses.id, or None on error.
@@ -35,12 +36,14 @@ def save_analysis(cur, kind, input_packet=None, output=None,
                  input_packet, output_packet, similar_events_used,
                  risk_level, recommended_action, confidence,
                  reason_bullets, ttl_seconds,
-                 model_used, api_latency_ms, fallback_used)
+                 model_used, model_provider, api_latency_ms, fallback_used,
+                 input_tokens, output_tokens, estimated_cost_usd, gate_type)
             VALUES (%s, %s, %s, %s,
                     %s::jsonb, %s::jsonb, %s::jsonb,
                     %s, %s, %s,
                     %s::jsonb, %s,
-                    %s, %s, %s)
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s)
             RETURNING id;
         """, (
             kind,
@@ -56,8 +59,13 @@ def save_analysis(cur, kind, input_packet=None, output=None,
             json.dumps(output.get('reason_bullets', []), ensure_ascii=False),
             output.get('ttl_seconds'),
             model_used,
+            model_provider,
             output.get('api_latency_ms'),
             output.get('fallback_used', False),
+            output.get('input_tokens'),
+            output.get('output_tokens'),
+            output.get('estimated_cost_usd'),
+            output.get('gate_type'),
         ))
         row = cur.fetchone()
         ca_id = row[0] if row else None

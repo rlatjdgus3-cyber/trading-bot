@@ -601,7 +601,8 @@ def _sync_position_state(cur=None, pos=None):
         """, (pos.get('side'), pos.get('qty'), pos.get('entry_price'), SYMBOL))
 
 
-def _log_decision(cur=None, ctx=None, action=None, reason=None):
+def _log_decision(cur=None, ctx=None, action=None, reason=None,
+                   model_used=None, model_provider=None, model_latency_ms=None):
     '''Log decision to pm_decision_log. Returns id.'''
     pos = ctx.get('position', {})
     ind = ctx.get('indicators', {})
@@ -613,8 +614,10 @@ def _log_decision(cur=None, ctx=None, action=None, reason=None):
             INSERT INTO pm_decision_log
                 (symbol, position_side, position_qty, avg_entry_price, stage,
                  current_price, long_score, short_score, atr_14, rsi_14,
-                 poc, vah, val, chosen_action, action_reason, full_context)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                 poc, vah, val, chosen_action, action_reason, full_context,
+                 model_used, model_provider, model_latency_ms)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    %s, %s, %s)
             RETURNING id;
         """, (
             SYMBOL,
@@ -633,6 +636,9 @@ def _log_decision(cur=None, ctx=None, action=None, reason=None):
             action,
             reason,
             json.dumps(ctx, default=str, ensure_ascii=False)[:10000],
+            model_used,
+            model_provider,
+            model_latency_ms,
         ))
         row = cur.fetchone()
         return row[0] if row else None
@@ -653,7 +659,8 @@ def _cycle():
         conn.autocommit = True
         with conn.cursor() as cur:
             # Check test lifecycle
-            if not test_utils.is_test_active():
+            test = test_utils.load_test_mode()
+            if not test_utils.is_test_active(test):
                 _log('test period ended, sleeping')
                 return LOOP_SLOW_SEC
 
@@ -679,7 +686,28 @@ def _cycle():
             _log(f'decision: {action} - {reason}')
 
             # Log decision
-            dec_id = _log_decision(cur, ctx, action, reason)
+            dec_id = _log_decision(cur, ctx, action, reason,
+                                   model_used='local_score_engine',
+                                   model_provider='local',
+                                   model_latency_ms=0)
+
+            # Skip if strategy_intent already queued same action
+            if action != 'HOLD':
+                cur.execute("""
+                    SELECT action_type FROM execution_queue
+                    WHERE symbol = %s AND source = 'strategy_intent'
+                      AND status = 'PENDING' AND ts >= now() - interval '5 minutes';
+                """, (SYMBOL,))
+                pending_row = cur.fetchone()
+                if pending_row:
+                    pending_action = pending_row[0]
+                    # REVERSE_CLOSE in queue corresponds to REVERSE decision
+                    if pending_action == 'REVERSE_CLOSE':
+                        pending_action = 'REVERSE'
+                    if pending_action == action:
+                        _log(f'skip {action}: strategy_intent already pending')
+                        action = 'HOLD'
+                        reason = 'deferred to strategy_intent'
 
             # Execute non-HOLD actions
             if action == 'ADD':

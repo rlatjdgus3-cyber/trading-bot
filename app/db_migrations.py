@@ -782,6 +782,27 @@ def ensure_score_weights_v2(cur):
     _log('ensure_score_weights_v2 done')
 
 
+def ensure_pm_decision_log_model_used(cur):
+    '''Add model_used, model_provider, model_latency_ms columns to pm_decision_log.'''
+    for col, dtype in (('model_used', 'TEXT'),
+                        ('model_provider', 'TEXT'),
+                        ('model_latency_ms', 'INTEGER')):
+        cur.execute(f"""
+            ALTER TABLE pm_decision_log
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_pm_decision_log_model_used done')
+
+
+def ensure_claude_analyses_model_provider(cur):
+    '''Add model_provider column to claude_analyses for provider tracking.'''
+    cur.execute("""
+        ALTER TABLE claude_analyses
+            ADD COLUMN IF NOT EXISTS model_provider TEXT;
+    """)
+    _log('ensure_claude_analyses_model_provider done')
+
+
 def run_all():
     '''Run all migrations. Safe to call multiple times.'''
     conn = None
@@ -832,6 +853,9 @@ def run_all():
             # OpenClaw directive tables
             ensure_openclaw_directives(cur)
             ensure_openclaw_policies(cur)
+            # Provider tracking
+            ensure_pm_decision_log_model_used(cur)
+            ensure_claude_analyses_model_provider(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
