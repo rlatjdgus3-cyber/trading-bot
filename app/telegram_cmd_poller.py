@@ -233,38 +233,84 @@ def _ai_strategy_advisory(text: str) -> str:
     """Strategy: gather indicators + news + score engine + AI scenario."""
     parts = []
 
-    # indicator snapshot
+    # indicator snapshot (includes BTC current price)
     ind = local_query_executor.execute("indicator_snapshot")
-    parts.append(f"지표: {ind}")
+    parts.append(f"지표:\n{ind}")
+
+    # position info
+    pos = local_query_executor.execute("position_info")
+    parts.append(f"포지션:\n{pos}")
 
     # score engine (includes NEWS_EVENT)
     score = local_query_executor.execute("score_summary")
-    parts.append(f"스코어: {score}")
+    parts.append(f"스코어:\n{score}")
 
     # vol summary
     vol = local_query_executor.execute("volatility_summary")
-    parts.append(f"변동성: {vol}")
+    parts.append(f"변동성:\n{vol}")
+
+    # vol profile (POC/VAH/VAL)
+    vp = _fetch_vol_profile()
+    if vp:
+        parts.append(f"볼륨 프로파일:\n{vp}")
 
     # news
     news = local_query_executor.execute("news_summary", "최근 6시간 뉴스 5개")
-    parts.append(f"뉴스: {news[:600]}")
+    parts.append(f"뉴스:\n{news[:600]}")
 
     prompt = (
+        f"당신은 비트코인 선물 트레이딩 분석가입니다.\n"
+        f"아래 제공된 실시간 데이터만 사용하여 분석하세요.\n"
+        f"지지/저항 레벨은 반드시 아래 Bollinger Band, Ichimoku, MA, Volume Profile 값에서 도출하세요.\n"
+        f"절대로 일반 지식이나 과거 학습 데이터의 가격 레벨을 사용하지 마세요.\n\n"
         f"사용자 요청: {text}\n\n"
-        f"데이터:\n" + "\n".join(parts) + "\n\n"
-        "분석 요청:\n"
+        f"=== 실시간 시장 데이터 ===\n" + "\n\n".join(parts) + "\n\n"
+        "=== 분석 요청 ===\n"
         "1. 현재 추세/국면 판단 (스코어 엔진 4축 종합)\n"
         "2. 뉴스 이벤트 스코어가 시장에 미치는 영향\n"
         "3. 전략 시나리오 2~3개\n"
-        "4. 핵심 지지/저항 레벨 + 대응 포인트\n"
+        "4. 핵심 지지/저항 레벨 (위 BB/Ichimoku/MA/POC에서 도출) + 대응 포인트\n"
         "※ 매매 실행 권한 없음. 분석/권고만. 800자 이내."
     )
     result, meta = _call_claude_advisory(prompt)
     _save_advisory('strategy',
-                   {'user_text': text, 'indicators': ind, 'score': score,
-                    'volatility': vol, 'news': news[:600]},
+                   {'user_text': text, 'indicators': ind, 'position': pos,
+                    'score': score, 'volatility': vol, 'vol_profile': vp,
+                    'news': news[:600]},
                    result, meta)
     return result
+
+
+def _fetch_vol_profile() -> str:
+    """Fetch latest volume profile (POC/VAH/VAL) from DB."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME", "trading"),
+            user=os.getenv("DB_USER", "bot"),
+            password=os.getenv("DB_PASS", "botpass"),
+            connect_timeout=10,
+            options="-c statement_timeout=10000",
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT poc, vah, val, ts FROM vol_profile
+                WHERE symbol = 'BTC/USDT:USDT'
+                ORDER BY ts DESC LIMIT 1;
+            """)
+            row = cur.fetchone()
+        conn.close()
+        if row:
+            return (f"  POC(주요가격대): ${float(row[0]):,.1f}\n"
+                    f"  VAH(상단): ${float(row[1]):,.1f}\n"
+                    f"  VAL(하단): ${float(row[2]):,.1f}\n"
+                    f"  기준시점: {row[3]}")
+        return ""
+    except Exception:
+        return ""
 
 
 def _ai_general_advisory(text: str) -> str:
