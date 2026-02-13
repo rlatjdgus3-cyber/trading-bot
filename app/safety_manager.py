@@ -83,9 +83,10 @@ def _load_safety_limits(cur):
     }
 
 
-def run_all_checks(cur, target_usdt=0):
+def run_all_checks(cur, target_usdt=0, limits=None):
     '''Run all safety checks. Returns (ok, reason).'''
-    limits = _load_safety_limits(cur)
+    if limits is None:
+        limits = _load_safety_limits(cur)
 
     # Daily trade count
     cur.execute("""
@@ -130,9 +131,10 @@ def run_all_checks(cur, target_usdt=0):
     return (True, 'all checks passed')
 
 
-def check_total_exposure(cur, add_usdt):
+def check_total_exposure(cur, add_usdt, limits=None):
     '''Check if adding add_usdt exceeds capital limit.'''
-    limits = _load_safety_limits(cur)
+    if limits is None:
+        limits = _load_safety_limits(cur)
     cur.execute('SELECT capital_used_usdt FROM position_state WHERE symbol = %s;', (SYMBOL,))
     row = cur.fetchone()
     current = float(row[0]) if row and row[0] else 0
@@ -142,9 +144,10 @@ def check_total_exposure(cur, add_usdt):
     return (True, 'ok')
 
 
-def check_pyramid_allowed(cur, current_stage):
+def check_pyramid_allowed(cur, current_stage, limits=None):
     '''Check if pyramiding (ADD) is allowed at current stage.'''
-    limits = _load_safety_limits(cur)
+    if limits is None:
+        limits = _load_safety_limits(cur)
     if current_stage >= limits['max_stages']:
         return (False, f'max stages reached ({current_stage}/{limits["max_stages"]})')
     return (True, 'ok')
@@ -160,9 +163,10 @@ def check_trade_budget(cur, add_pct):
     return (True, 'ok')
 
 
-def get_add_score_threshold(cur):
+def get_add_score_threshold(cur, limits=None):
     '''Get minimum score for ADD orders.'''
-    limits = _load_safety_limits(cur)
+    if limits is None:
+        limits = _load_safety_limits(cur)
     return limits['add_score_threshold']
 
 
@@ -171,9 +175,10 @@ def get_add_slice_pct():
     return STAGE_SLICE_PCT
 
 
-def get_add_slice_usdt(cur):
+def get_add_slice_usdt(cur, limits=None):
     '''Get ADD slice amount in USDT.'''
-    limits = _load_safety_limits(cur)
+    if limits is None:
+        limits = _load_safety_limits(cur)
     return limits['capital_limit_usdt'] * STAGE_SLICE_PCT / 100
 
 
@@ -194,8 +199,9 @@ def get_stage_entry_pct(start_stage):
     return start_stage * STAGE_SLICE_PCT
 
 
-def get_entry_usdt(cur, start_stage):
+def get_entry_usdt(cur, start_stage, limits=None):
     '''Get entry USDT amount for a given start stage.'''
-    limits = _load_safety_limits(cur)
+    if limits is None:
+        limits = _load_safety_limits(cur)
     pct = get_stage_entry_pct(start_stage)
     return limits['capital_limit_usdt'] * pct / 100
