@@ -41,7 +41,7 @@ def _db_conn():
 
 
 def _get_price_at(cur, ts):
-    """Get closest 5m candle close at or before ts."""
+    """Get closest candle close at or before ts. Tries 5m ohlcv first, then 1m candles."""
     cur.execute("""
         SELECT c FROM market_ohlcv
         WHERE symbol = 'BTC/USDT:USDT' AND tf = '5m' AND ts <= %s
@@ -50,13 +50,32 @@ def _get_price_at(cur, ts):
     row = cur.fetchone()
     if row:
         return float(row[0])
+    # Fallback: 1m candles table
+    cur.execute("""
+        SELECT c FROM candles
+        WHERE symbol = 'BTC/USDT:USDT' AND tf = '1m' AND ts <= %s
+        ORDER BY ts DESC LIMIT 1;
+    """, (ts,))
+    row = cur.fetchone()
+    if row:
+        return float(row[0])
 
 
 def _get_price_after(cur, ts, hours):
-    """Get closest 5m candle close at ts + hours."""
+    """Get closest candle close at ts + hours. Tries 5m ohlcv first, then 1m candles."""
     cur.execute("""
         SELECT c FROM market_ohlcv
         WHERE symbol = 'BTC/USDT:USDT' AND tf = '5m'
+          AND ts >= %s + %s * interval '1 hour'
+        ORDER BY ts ASC LIMIT 1;
+    """, (ts, hours))
+    row = cur.fetchone()
+    if row:
+        return float(row[0])
+    # Fallback: 1m candles table
+    cur.execute("""
+        SELECT c FROM candles
+        WHERE symbol = 'BTC/USDT:USDT' AND tf = '1m'
           AND ts >= %s + %s * interval '1 hour'
         ORDER BY ts ASC LIMIT 1;
     """, (ts, hours))
@@ -224,13 +243,18 @@ def _cycle(conn):
         _log('KILL_SWITCH detected. Exiting.')
         sys.exit(0)
 
-    # Check DB kill switch
-    with conn.cursor() as cur:
-        cur.execute("SELECT value FROM bot_config WHERE key='KILL_SWITCH';")
-        row = cur.fetchone()
-        if row and row[0] == 'ON':
-            _log('DB KILL_SWITCH=ON. Exiting.')
-            sys.exit(0)
+    # Check DB kill switch (bot_config may not exist)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT value FROM bot_config WHERE key='KILL_SWITCH';
+            """)
+            row = cur.fetchone()
+            if row and row[0] == 'ON':
+                _log('DB KILL_SWITCH=ON. Exiting.')
+                sys.exit(0)
+    except Exception:
+        pass  # bot_config table may not exist — skip
 
     with conn.cursor() as cur:
         ao_filled = _fill_analysis_outcomes(cur)

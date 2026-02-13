@@ -10,21 +10,28 @@ import json
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[claude_api]'
 FALLBACK_RESPONSE = {
-    'risk_level': 'high',
-    'recommended_action': 'REDUCE',
-    'reduce_pct': 50,
-    'confidence': 0.5,
-    'reason_bullets': ['API 호출 실패 — 보수적 축소 적용'],
-    'ttl_seconds': 120}
+    'action': 'HOLD',
+    'recommended_action': 'HOLD',  # backward compat
+    'reduce_pct': 0,
+    'target_stage': 0,
+    'reason_code': 'API_CALL_FAILED',
+    'reason_bullets': ['API_CALL_FAILED'],  # backward compat
+    'confidence': 0,
+    'ttl_seconds': 0,
+    'fallback_used': True,
+}
 
 ABORT_RESPONSE = {
-    'risk_level': 'unknown',
-    'recommended_action': 'ABORT',
+    'action': 'ABORT',
+    'recommended_action': 'ABORT',  # backward compat
     'reduce_pct': 0,
+    'target_stage': 0,
+    'reason_code': 'REALTIME_DATA_UNAVAILABLE',
+    'reason_bullets': ['REALTIME_DATA_UNAVAILABLE'],  # backward compat
     'confidence': 0,
-    'reason_bullets': ['REALTIME DATA NOT AVAILABLE -- STRATEGY ABORTED'],
     'ttl_seconds': 0,
-    'aborted': True}
+    'aborted': True,
+}
 
 
 def _log(msg):
@@ -142,22 +149,26 @@ def _build_prompt(ctx=None, snapshot=None):
         f"{_build_fact_section(ctx)}\n\n"
         f"{_build_snapshot_section(snapshot)}"
         f"## Instructions\n"
+        f"You are the EXECUTION AUTHORITY. Your decision will be executed immediately.\n"
         f"Respond with ONLY this JSON (no markdown, no explanation):\n"
         f'{{\n'
-        f'  "risk_level": "low|medium|high|critical",\n'
-        f'  "recommended_action": "HOLD|REDUCE|CLOSE|REVERSE",\n'
+        f'  "action": "HOLD|OPEN_LONG|OPEN_SHORT|REDUCE|CLOSE|REVERSE",\n'
         f'  "reduce_pct": 0,\n'
+        f'  "target_stage": 1,\n'
+        f'  "reason_code": "short_description",\n'
         f'  "confidence": 0.0,\n'
-        f'  "reason_bullets": ["reason1", "reason2"],\n'
-        f'  "ttl_seconds": 120\n'
+        f'  "ttl_seconds": 60\n'
         f'}}\n\n'
         f"Rules:\n"
-        f"- HOLD: situation manageable, no action needed\n"
+        f"- HOLD: no action needed\n"
+        f"- OPEN_LONG: open/add long position (target_stage=1~7, each stage=10% budget)\n"
+        f"- OPEN_SHORT: open/add short position (target_stage=1~7)\n"
         f"- REDUCE: reduce position by reduce_pct% (10-75%)\n"
         f"- CLOSE: fully close position\n"
-        f"- REVERSE: close and open opposite (only if very high confidence reversal)\n"
-        f"- ttl_seconds: how long this recommendation is valid (60-300)\n"
+        f"- REVERSE: close and open opposite (only if very high confidence)\n"
         f"- confidence: 0.0 to 1.0\n"
+        f"- ttl_seconds: recommendation validity (30-300)\n"
+        f"- reason_code: brief English reason (max 200 chars)\n"
     )
     return prompt
 
@@ -269,46 +280,45 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
     return parsed
 
 
+VALID_ACTIONS = {'HOLD', 'OPEN_LONG', 'OPEN_SHORT', 'REDUCE', 'CLOSE', 'REVERSE'}
+
+
 def _parse_response(raw=None):
     """Parse Claude's JSON response. Falls back on parse failure."""
     if not raw:
         return dict(FALLBACK_RESPONSE)
+    text = raw.strip()
+    # Strip markdown backticks
+    if text.startswith('```'):
+        lines = text.split('\n')
+        text = '\n'.join(lines[1:])
+        if text.endswith('```'):
+            text = text[:-3]
+        text = text.strip()
     try:
-        text = raw.strip()
-        if text.startswith('```'):
-            lines = text.split('\n')
-            text = '\n'.join(lines[1:])
-            if text.endswith('```'):
-                text = text[:-3]
-            text = text.strip()
         data = json.loads(text)
-        valid_risk = ('low', 'medium', 'high', 'critical')
-        valid_action = ('HOLD', 'REDUCE', 'CLOSE', 'REVERSE')
-        risk = data.get('risk_level', 'high')
-        if risk not in valid_risk:
-            risk = 'high'
-        action = data.get('recommended_action', 'REDUCE')
-        if action not in valid_action:
-            action = 'REDUCE'
-        confidence = float(data.get('confidence', 0.5))
-        confidence = max(0, min(1, confidence))
-        reduce_pct = int(data.get('reduce_pct', 50))
-        reduce_pct = max(0, min(100, reduce_pct))
-        ttl = int(data.get('ttl_seconds', 120))
-        ttl = max(60, min(300, ttl))
-        bullets = data.get('reason_bullets', [])
-        if not isinstance(bullets, list):
-            bullets = [str(bullets)]
-        return {
-            'risk_level': risk,
-            'recommended_action': action,
-            'reduce_pct': reduce_pct,
-            'confidence': confidence,
-            'reason_bullets': bullets[:5],
-            'ttl_seconds': ttl}
-    except Exception as e:
-        _log(f'parse error: {e}')
+    except json.JSONDecodeError:
+        _log(f'JSON parse failed: {text[:200]}')
         return dict(FALLBACK_RESPONSE)
+
+    action = data.get('action', '').upper()
+    if action not in VALID_ACTIONS:
+        # backward compat: try recommended_action
+        action = data.get('recommended_action', '').upper()
+        if action not in VALID_ACTIONS:
+            _log(f'invalid action: {action}')
+            return dict(FALLBACK_RESPONSE)
+
+    return {
+        'action': action,
+        'recommended_action': action,  # backward compat
+        'reduce_pct': max(0, min(100, int(data.get('reduce_pct', 0)))),
+        'target_stage': max(0, min(7, int(data.get('target_stage', 1)))),
+        'reason_code': str(data.get('reason_code', ''))[:200],
+        'reason_bullets': [str(data.get('reason_code', '') or data.get('reason_bullets', [''])[0] if isinstance(data.get('reason_bullets'), list) else data.get('reason_code', ''))],  # backward compat
+        'confidence': max(0.0, min(1.0, float(data.get('confidence', 0.5)))),
+        'ttl_seconds': max(30, min(300, int(data.get('ttl_seconds', 60)))),
+    }
 
 
 def score_change_analysis(context_packet=None):

@@ -385,13 +385,13 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
         traceback.print_exc()
         ca_id = None
 
-    action = result.get('recommended_action', 'HOLD')
+    action = result.get('action') or result.get('recommended_action', 'HOLD')
 
     if action == 'HOLD':
         _send_telegram(
-            f'[Claude] HOLD 판단 (risk={result.get("risk_level")})\n'
+            f'[Claude] HOLD 판단 (risk={result.get("risk_level", "?")})\n'
             f'- confidence: {result.get("confidence")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2]) or result.get("reason_code", "")}')
         return 'HOLD'
 
     pos = ctx.get('position', {})
@@ -511,8 +511,9 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
         traceback.print_exc()
         ca_id = None
 
-    action = result.get('recommended_action', 'HOLD')
+    action = result.get('action') or result.get('recommended_action', 'HOLD')
     pos = ctx.get('position', {})
+    reason_info = ', '.join(result.get('reason_bullets', [])[:2]) or result.get('reason_code', '')
 
     # ── Event stabilization guards ──
     import event_trigger as _et
@@ -528,7 +529,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
 
     if action == 'HOLD':
         _send_telegram(
-            f'[Event] HOLD (risk={result.get("risk_level")})\n'
+            f'[Event] HOLD (risk={result.get("risk_level", "?")})\n'
             f'triggers: {trigger_types}')
         return 'HOLD'
 
@@ -544,7 +545,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] REDUCE {reduce_pct}%\n{", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(f'[Event] REDUCE {reduce_pct}%\n{reason_info}')
         return 'REDUCE'
 
     if action == 'CLOSE':
@@ -558,8 +559,29 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] CLOSE\n{", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(f'[Event] CLOSE\n{reason_info}')
         return 'CLOSE'
+
+    if action in ('OPEN_LONG', 'OPEN_SHORT'):
+        direction = 'LONG' if action == 'OPEN_LONG' else 'SHORT'
+        if pos_side and pos_side != direction:
+            _log(f'{action} conflicts with {pos_side} — skipped')
+            return 'HOLD'
+        import safety_manager
+        target_stage = result.get('target_stage', 1)
+        target_usdt = safety_manager.get_add_slice_usdt(cur) * target_stage
+        eq_id = _enqueue_action(
+            cur, 'ADD', direction,
+            target_usdt=target_usdt,
+            reason=f'event_trigger_{trigger_types[0] if trigger_types else "unknown"}',
+            priority=3)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, action, execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(f'[Event] {action} stage={target_stage}\n{reason_info}')
+        return 'OPEN'
 
     if action == 'REVERSE':
         eq_id = _enqueue_reverse(
@@ -571,7 +593,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] REVERSE\n{", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(f'[Event] REVERSE\n{reason_info}')
         return 'REVERSE'
 
     return 'HOLD'
@@ -678,8 +700,9 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
              f'fallback={result.get("fallback_used")}')
         return 'ABORT'
 
-    action = result.get('recommended_action', 'HOLD')
+    action = result.get('action') or result.get('recommended_action', 'HOLD')
     pos = ctx.get('position', {})
+    reason_info = ', '.join(result.get('reason_bullets', [])[:2]) or result.get('reason_code', '')
 
     # ── Emergency stabilization guards ──
     import event_trigger as _et
@@ -697,9 +720,9 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
 
     if action == 'HOLD':
         _send_telegram(
-            f'[Claude] HOLD 판단 (risk={result.get("risk_level")})\n'
+            f'[Claude] HOLD 판단 (risk={result.get("risk_level", "?")})\n'
             f'- confidence: {result.get("confidence")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+            f'- reason: {reason_info}')
         return 'HOLD'
 
     if action == 'REDUCE':
@@ -720,8 +743,8 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 traceback.print_exc()
         _send_telegram(
             f'[Claude] REDUCE {reduce_pct}% 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+            f'- risk: {result.get("risk_level", "?")}\n'
+            f'- reason: {reason_info}')
         return 'REDUCE'
 
     if action == 'CLOSE':
@@ -741,9 +764,36 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 traceback.print_exc()
         _send_telegram(
             f'[Claude] CLOSE 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+            f'- risk: {result.get("risk_level", "?")}\n'
+            f'- reason: {reason_info}')
         return 'CLOSE'
+
+    if action in ('OPEN_LONG', 'OPEN_SHORT'):
+        direction = 'LONG' if action == 'OPEN_LONG' else 'SHORT'
+        if pos_side and pos_side != direction:
+            _log(f'{action} conflicts with {pos_side} — skipped')
+            return 'HOLD'
+        import safety_manager
+        target_stage = result.get('target_stage', 1)
+        target_usdt = safety_manager.get_add_slice_usdt(cur) * target_stage
+        eq_id = _enqueue_action(
+            cur, 'ADD', direction,
+            target_usdt=target_usdt,
+            reason=f'emergency_{primary_trigger.get("type", "unknown")}',
+            emergency_id=eid,
+            priority=2)
+        if eq_id:
+            _et.set_emergency_lock(SYMBOL)
+            _et.record_emergency_action(SYMBOL, action, pos_side or direction)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, action, execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] {action} stage={target_stage} 실행\n'
+            f'- reason: {reason_info}')
+        return 'OPEN'
 
     if action == 'REVERSE':
         eq_id = _enqueue_reverse(
@@ -761,8 +811,8 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 traceback.print_exc()
         _send_telegram(
             f'[Claude] REVERSE 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+            f'- risk: {result.get("risk_level", "?")}\n'
+            f'- reason: {reason_info}')
         return 'REVERSE'
 
     return 'HOLD'
@@ -875,16 +925,16 @@ def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
     '''Insert action into execution_queue.'''
     import safety_manager
 
-    # Duplicate REDUCE check: block if same direction REDUCE already pending
-    if action_type == 'REDUCE' and direction:
+    # Duplicate action check: block if same action_type already PENDING/PICKED
+    if action_type in ('REDUCE', 'CLOSE', 'ADD', 'REVERSE_CLOSE') and direction:
         cur.execute("""
             SELECT id FROM execution_queue
-            WHERE symbol = %s AND action_type = 'REDUCE' AND direction = %s
+            WHERE symbol = %s AND action_type = %s AND direction = %s
               AND status IN ('PENDING', 'PICKED')
               AND ts >= now() - interval '5 minutes';
-        """, (SYMBOL, direction))
+        """, (SYMBOL, action_type, direction))
         if cur.fetchone():
-            _log(f'duplicate REDUCE {direction} blocked (already pending in queue)')
+            _log(f'duplicate {action_type} {direction} blocked (already pending in queue)')
             return None
 
     (ok, reason) = safety_manager.run_all_checks(cur, kwargs.get('target_usdt', 0))

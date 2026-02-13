@@ -176,7 +176,7 @@ def _ai_news_advisory(text: str, high_news: list) -> tuple:
         "1. 각 뉴스의 BTC 선물 영향 방향/크기\n"
         "2. 종합 시나리오 (상승/하락/횡보)\n"
         "3. 대응 포인트\n"
-        "※ 매매 실행 권한 없음. 분석/권고만. 600자 이내."
+        "600자 이내."
     )
     gate_ctx = {
         'intent': 'news',
@@ -264,7 +264,7 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
         "1. 각 뉴스의 BTC 선물 영향 방향/크기 평가\n"
         "2. 종합 시나리오 (상승/하락/횡보)\n"
         "3. 현재 포지션 기준 대응 포인트\n"
-        "※ 매매 실행 권한 없음. 분석/권고만. 800자 이내."
+        "800자 이내."
     )
 
     # Claude for high-impact news or USER/EMERGENCY; GPT-mini otherwise
@@ -323,7 +323,6 @@ def _ai_emergency_advisory(text: str, call_type: str = 'USER') -> tuple:
         "2. 시나리오 3개: 회복 / 추세전환 / 추세지속\n"
         "3. 10~30분 체크포인트 3개\n"
         "4. 리스크 모드 권고\n"
-        "※ 매매 실행 권한 없음. 분석/권고만."
     )
     ck = 'user_tg_emergency' if no_fallback else 'auto_tg_emergency'
     gate_ctx = {
@@ -444,6 +443,152 @@ def _fetch_position_state(cur):
     except Exception as e:
         _log(f'_fetch_position_state error: {e}')
     return {}
+
+
+# Watch keywords for news matching
+WATCH_KEYWORDS_DEFAULT = [
+    'trump', 'fed', 'war', 'boj', 'sec', 'etf', 'nasdaq', 'china',
+    'tariff', 'cpi', 'fomc', 'powell', 'rate', 'inflation', 'hack',
+    'liquidation', 'ban', 'approval']
+
+
+def _load_watch_keywords(cur):
+    """Load watch keywords from openclaw_policies, fallback to default."""
+    try:
+        cur.execute("""
+            SELECT value FROM openclaw_policies WHERE key = 'watch_keywords';
+        """)
+        row = cur.fetchone()
+        if row and row[0]:
+            import json as _json
+            val = row[0] if isinstance(row[0], list) else _json.loads(row[0])
+            if isinstance(val, list) and val:
+                return [str(k).lower() for k in val]
+    except Exception:
+        pass
+    return WATCH_KEYWORDS_DEFAULT
+
+
+def _fetch_news_summary(cur):
+    """Fetch recent news for strategy output. Returns list of dicts."""
+    try:
+        cur.execute("""
+            SELECT title, source, impact_score, summary, ts,
+                   keywords
+            FROM news
+            WHERE ts >= now() - interval '6 hours'
+              AND impact_score IS NOT NULL
+            ORDER BY impact_score DESC, ts DESC
+            LIMIT 10;
+        """)
+        rows = cur.fetchall()
+        return [{
+            'title': r[0] or '',
+            'source': r[1] or '',
+            'impact_score': int(r[2]) if r[2] else 0,
+            'summary': r[3] or '',
+            'ts': str(r[4]) if r[4] else '',
+            'keywords': list(r[5]) if r[5] else [],
+        } for r in rows]
+    except Exception as e:
+        _log(f'_fetch_news_summary error: {e}')
+        return []
+
+
+def _build_news_section(news_items, scores, watch_keywords):
+    """Build [NEWS SUMMARY] and [NEWS->DECISION TRACE] sections."""
+    lines = ['', '[NEWS SUMMARY]']
+
+    if not news_items:
+        lines.append('- 최근 6시간 고영향 뉴스 없음')
+    else:
+        # Top 3 news
+        for i, n in enumerate(news_items[:3], 1):
+            ts_short = n['ts'][:16] if len(n['ts']) >= 16 else n['ts']
+            lines.append(
+                f'{i}. [{n["impact_score"]}/10] {n["title"][:80]}'
+                f'\n   ({n["source"]}, {ts_short})')
+            # Summary direction
+            summary = n.get('summary', '')
+            if summary:
+                direction_tag = ''
+                sl = summary.lower()
+                if sl.startswith('[up]') or sl.startswith('[bullish]'):
+                    direction_tag = 'UP'
+                elif sl.startswith('[down]') or sl.startswith('[bearish]'):
+                    direction_tag = 'DOWN'
+                elif sl.startswith('[neutral]'):
+                    direction_tag = 'NEUTRAL'
+                if direction_tag:
+                    lines.append(f'   direction: {direction_tag}')
+
+        # Keyword matching
+        matched = set()
+        for n in news_items:
+            text_lower = (n['title'] + ' ' + n.get('summary', '')).lower()
+            for kw in watch_keywords:
+                if kw in text_lower:
+                    matched.add(kw)
+        if matched:
+            lines.append(f'- watchlist 매칭: {", ".join(sorted(matched))}')
+        else:
+            lines.append('- watchlist 매칭: 없음')
+
+    # news_event_score + reason
+    news_score = scores.get('news_event_score', 0)
+    guarded = scores.get('news_event_guarded', False)
+    news_ctx = scores.get('context', {}).get('news_event', {})
+    sentiment = news_ctx.get('recent_sentiment', 0)
+    cat_bias = news_ctx.get('category_bias', 0)
+    evt_sim = news_ctx.get('event_similarity', 0)
+
+    score_reason = (f'sentiment={sentiment:+d} category={cat_bias:+d} '
+                    f'similarity={evt_sim:+d}')
+    guard_note = ' (GUARDED→0: tech/pos 약세)' if guarded else ''
+    lines.append(f'- news_event_score: {news_score:+d}{guard_note}')
+    lines.append(f'  근거: {score_reason}')
+
+    # Impact path (simple inference)
+    if news_items:
+        cats = set()
+        for n in news_items[:5]:
+            text_lower = (n['title'] + ' ' + n.get('summary', '')).lower()
+            if any(k in text_lower for k in ('fed', 'rate', 'cpi', 'fomc', 'powell', 'inflation')):
+                cats.add('금리')
+            if any(k in text_lower for k in ('dollar', 'usd', 'dxy')):
+                cats.add('달러')
+            if any(k in text_lower for k in ('war', 'conflict', 'sanctions', 'geopolit')):
+                cats.add('지정학')
+            if any(k in text_lower for k in ('etf', 'sec', 'regulation', 'approval', 'ban')):
+                cats.add('규제')
+            if any(k in text_lower for k in ('tariff', 'trade war', 'china')):
+                cats.add('무역')
+            if any(k in text_lower for k in ('nasdaq', 'sp500', 'stocks', 'equity')):
+                cats.add('주식')
+        if cats:
+            path = ' -> '.join(sorted(cats))
+            lines.append(f'- impact_path: {path} -> BTC')
+
+    return '\n'.join(lines)
+
+
+def _build_news_decision_trace(claude_action, engine_action, news_score, guarded):
+    """Build [NEWS->DECISION TRACE] one-liner."""
+    if guarded or news_score == 0:
+        return ('\n[NEWS->DECISION TRACE]\n'
+                f'- 뉴스 영향: 없음 (score={news_score:+d}'
+                f'{", guarded" if guarded else ""}). '
+                f'액션 변경 없음.')
+    direction = 'bullish' if news_score > 0 else 'bearish'
+    magnitude = 'weak' if abs(news_score) < 20 else ('moderate' if abs(news_score) < 50 else 'strong')
+    changed = claude_action != engine_action
+    if changed:
+        return ('\n[NEWS->DECISION TRACE]\n'
+                f'- 뉴스 영향: {magnitude} {direction} (score={news_score:+d}). '
+                f'뉴스 반영으로 engine={engine_action} -> claude={claude_action} 변경됨.')
+    return ('\n[NEWS->DECISION TRACE]\n'
+            f'- 뉴스 영향: {magnitude} {direction} (score={news_score:+d}). '
+            f'액션 변경 없음 (claude={claude_action}).')
 
 
 def _evaluate_strategy_action(scores, pos_state):
@@ -827,13 +972,293 @@ def _parse_claude_action(ai_text: str) -> str:
     return ''
 
 
+def _build_execution_prompt(scores, pos_state, strategy_ctx, snapshot, user_text,
+                            engine_action, engine_reason, news_items=None):
+    """Claude execution authority prompt. Forces JSON-only output."""
+    price = scores.get('price') or (snapshot.get('price') if snapshot else 0) or 0
+    market_data = _format_market_data(price, strategy_ctx)
+
+    side = pos_state.get('side', 'none') or 'none'
+    qty = pos_state.get('total_qty', 0)
+    entry = pos_state.get('avg_entry_price', 0)
+    stg = pos_state.get('stage', 0)
+    budget_pct = pos_state.get('budget_used_pct', 0)
+    pos_line = (f"side={side} qty={qty} entry=${entry:,.0f} "
+                f"stage={stg} budget_used={budget_pct:.0f}%")
+
+    tech = scores.get('tech_score', 0)
+    pos_s = scores.get('position_score', 0)
+    regime = scores.get('regime_score', 0)
+    news = scores.get('news_event_score', 0)
+    total = scores.get('total_score', 0)
+    dominant = scores.get('dominant_side', 'LONG')
+
+    snap_section = ''
+    if snapshot:
+        returns = snapshot.get('returns', {})
+        snap_section = (
+            f"=== 스냅샷 ===\n"
+            f"BB: {snapshot.get('bb_lower', 0):.0f}/{snapshot.get('bb_mid', 0):.0f}/{snapshot.get('bb_upper', 0):.0f}\n"
+            f"Cloud: {snapshot.get('cloud_position', '?')} | RSI: {snapshot.get('rsi_14', '?')}\n"
+            f"ATR: {snapshot.get('atr_14', '?')} | Vol ratio: {snapshot.get('vol_ratio', '?')}\n"
+            f"ret_1m={returns.get('ret_1m', '?')}% ret_5m={returns.get('ret_5m', '?')}%\n\n"
+        )
+
+    # Build news section for prompt
+    news_section = ''
+    if news_items:
+        news_lines = ['=== 최근 뉴스 ===']
+        for i, n in enumerate(news_items[:5], 1):
+            imp = n.get('impact_score', 0)
+            title = n.get('title', '?')[:80]
+            summary = n.get('summary', '')[:100]
+            news_lines.append(f'{i}. [{imp}/10] {title}')
+            if summary:
+                news_lines.append(f'   {summary}')
+        news_section = '\n'.join(news_lines) + '\n\n'
+
+    return (
+        f"당신은 BTC 선물 트레이딩 최종결정자입니다.\n"
+        f"아래 실시간 데이터를 분석하고 즉시 실행될 JSON을 출력하세요.\n\n"
+        f"사용자 요청: {user_text}\n\n"
+        f"=== 실시간 시장 데이터 ===\n{market_data}\n\n"
+        f"=== 포지션 ===\n{pos_line}\n\n"
+        f"{news_section}"
+        f"=== 스코어 엔진(참고) ===\n"
+        f"판단: {engine_action} | 이유: {engine_reason}\n"
+        f"TOTAL={total:+.1f} ({dominant}) TECH={tech:+.0f} POS={pos_s:+.0f} "
+        f"REGIME={regime:+.0f} NEWS={news:+.0f}\n"
+        f"※ 참고용. 당신의 판단이 최종입니다.\n\n"
+        f"{snap_section}"
+        f"## JSON 출력 (이것만 출력, 텍스트 금지)\n"
+        f'{{"action":"HOLD|OPEN_LONG|OPEN_SHORT|REDUCE|CLOSE|REVERSE",'
+        f'"reduce_pct":0,"target_stage":1,"reason_code":"...","confidence":0.0,"ttl_seconds":60}}\n'
+    )
+
+
+def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
+    """Claude JSON -> execution_queue. Returns eq_id or None."""
+    import safety_manager
+    import market_snapshot as _ms
+
+    action = parsed['action']
+    side = (pos_state.get('side', '') or '').upper()
+
+    # Snapshot validation
+    if snapshot:
+        ok, reason = _ms.validate_execution_ready(snapshot, scores.get('price', 0))
+        if not ok:
+            _log(f'execution validation failed: {reason}')
+            return None
+
+    # Duplicate check: same action PENDING/PICKED within 5 min
+    action_type_map = {
+        'REDUCE': 'REDUCE', 'CLOSE': 'CLOSE',
+        'OPEN_LONG': 'ADD', 'OPEN_SHORT': 'ADD',
+        'REVERSE': 'REVERSE_CLOSE',
+    }
+    eq_action = action_type_map.get(action, action)
+    cur.execute("""
+        SELECT id FROM execution_queue
+        WHERE symbol = %s AND action_type = %s
+          AND status IN ('PENDING', 'PICKED')
+          AND ts >= now() - interval '5 minutes';
+    """, (STRATEGY_SYMBOL, eq_action))
+    if cur.fetchone():
+        _log(f'duplicate {action} blocked (PENDING/PICKED exists)')
+        return None
+
+    meta = json.dumps({
+        'total_score': scores.get('total_score'),
+        'long_score': scores.get('long_score'),
+        'short_score': scores.get('short_score'),
+        'claude_action': action,
+        'reason_code': parsed.get('reason_code', ''),
+        'confidence': parsed.get('confidence', 0),
+    }, default=str)
+
+    if action == 'REDUCE':
+        (safe, r) = safety_manager.run_all_checks(cur, 0)
+        if not safe:
+            _log(f'claude safety block: {r}')
+            return None
+        reduce_pct = parsed.get('reduce_pct', 30)
+        if not side:
+            _log('REDUCE: no position side')
+            return None
+        cur.execute("""
+            INSERT INTO execution_queue
+                (symbol, action_type, direction, reduce_pct,
+                 source, reason, priority, expire_at, meta)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    now() + interval '5 minutes', %s::jsonb)
+            RETURNING id;
+        """, (STRATEGY_SYMBOL, 'REDUCE', side, reduce_pct,
+              'claude_execution', parsed.get('reason_code', 'claude_reduce'), 3, meta))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    elif action == 'CLOSE':
+        (safe, r) = safety_manager.run_all_checks(cur, 0)
+        if not safe:
+            _log(f'claude safety block: {r}')
+            return None
+        if not side:
+            _log('CLOSE: no position side')
+            return None
+        cur.execute("""
+            INSERT INTO execution_queue
+                (symbol, action_type, direction, target_qty,
+                 source, reason, priority, expire_at, meta)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    now() + interval '5 minutes', %s::jsonb)
+            RETURNING id;
+        """, (STRATEGY_SYMBOL, 'CLOSE', side,
+              pos_state.get('total_qty'),
+              'claude_execution', parsed.get('reason_code', 'claude_close'), 2, meta))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    elif action in ('OPEN_LONG', 'OPEN_SHORT'):
+        direction = 'LONG' if action == 'OPEN_LONG' else 'SHORT'
+        # Position conflict check
+        if side and side != direction:
+            _log(f'{action} conflicts with existing {side} position')
+            return None
+        target_stage = parsed.get('target_stage', 1)
+        add_usdt = safety_manager.get_add_slice_usdt(cur)
+        target_usdt = add_usdt * target_stage
+        (safe, r) = safety_manager.run_all_checks(cur, target_usdt)
+        if not safe:
+            _log(f'claude safety block: {r}')
+            return None
+        cur.execute("""
+            INSERT INTO execution_queue
+                (symbol, action_type, direction, target_usdt,
+                 source, reason, priority, expire_at, meta)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    now() + interval '5 minutes', %s::jsonb)
+            RETURNING id;
+        """, (STRATEGY_SYMBOL, 'ADD', direction, target_usdt,
+              'claude_execution', parsed.get('reason_code', f'claude_{action.lower()}'), 4, meta))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    elif action == 'REVERSE':
+        (safe, r) = safety_manager.run_all_checks(cur, 0)
+        if not safe:
+            _log(f'claude safety block: {r}')
+            return None
+        if not side:
+            _log('REVERSE: no position to reverse')
+            return None
+        new_side = 'SHORT' if side == 'LONG' else 'LONG'
+        # Step 1: REVERSE_CLOSE
+        cur.execute("""
+            INSERT INTO execution_queue
+                (symbol, action_type, direction, target_qty,
+                 source, reason, priority, expire_at, meta)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    now() + interval '5 minutes', %s::jsonb)
+            RETURNING id;
+        """, (STRATEGY_SYMBOL, 'REVERSE_CLOSE', side,
+              pos_state.get('total_qty'),
+              'claude_execution', parsed.get('reason_code', 'claude_reverse'), 2, meta))
+        close_row = cur.fetchone()
+        close_id = close_row[0] if close_row else None
+        if close_id:
+            # Step 2: REVERSE_OPEN
+            open_meta = json.dumps({
+                'total_score': scores.get('total_score'),
+                'depends_on': close_id,
+                'claude_action': action,
+            }, default=str)
+            cur.execute("""
+                INSERT INTO execution_queue
+                    (symbol, action_type, direction,
+                     source, reason, priority, expire_at, meta)
+                VALUES (%s, %s, %s, %s, %s, %s,
+                        now() + interval '5 minutes', %s::jsonb)
+                RETURNING id;
+            """, (STRATEGY_SYMBOL, 'REVERSE_OPEN', new_side,
+                  'claude_execution', parsed.get('reason_code', 'claude_reverse'), 2, open_meta))
+        return close_id
+
+    return None
+
+
+def _send_decision_alert(action, parsed, engine_action, scores, pos_state):
+    """[DECISION] Claude final JSON summary via Telegram."""
+    try:
+        side = pos_state.get('side', 'none') or 'none'
+        qty = pos_state.get('total_qty', 0)
+        total = scores.get('total_score', 0)
+        send_message(
+            _load_tg_token(), _load_tg_chat_id(),
+            f'[DECISION] Claude: {action}\n'
+            f'confidence={parsed.get("confidence", 0)} '
+            f'reason={parsed.get("reason_code", "?")}\n'
+            f'engine_ref={engine_action} | score={total:+.1f}\n'
+            f'pos={side} {qty}')
+    except Exception as e:
+        _log(f'_send_decision_alert error: {e}')
+
+
+def _send_enqueue_alert(eq_id, action, parsed, pos_state):
+    """[ENQUEUE] Execution queue push alert via Telegram."""
+    try:
+        qty_info = ''
+        if action == 'REDUCE':
+            qty_info = f'reduce_pct={parsed.get("reduce_pct", 0)}'
+        elif 'OPEN' in action:
+            qty_info = f'stage={parsed.get("target_stage", 1)}'
+        send_message(
+            _load_tg_token(), _load_tg_chat_id(),
+            f'[ENQUEUE] eq_id={eq_id} | {action} | {qty_info}\n'
+            f'reason={parsed.get("reason_code", "?")}')
+    except Exception as e:
+        _log(f'_send_enqueue_alert error: {e}')
+
+
+def _load_tg_token():
+    """Load Telegram bot token from env cache."""
+    cfg = {}
+    env_path = '/root/trading-bot/app/telegram_cmd.env'
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    cfg[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return cfg.get('TELEGRAM_BOT_TOKEN', '')
+
+
+def _load_tg_chat_id():
+    """Load Telegram chat ID from env cache."""
+    cfg = {}
+    env_path = '/root/trading-bot/app/telegram_cmd.env'
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    cfg[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return int(cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '0'))
+
+
 def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
-    """Strategy pipeline: Score → Action → Execute → AI verify.
-    Claude only for CLOSE/REVERSE/REDUCE or SL proximity (or USER/EMERGENCY).
-    call_type: AUTO/USER/EMERGENCY. Returns (text, provider)."""
+    """Claude-first strategy pipeline: Score → Claude JSON → Execute.
+    Claude is the EXECUTION AUTHORITY. Returns (text, provider)."""
     no_fallback = call_type in ('USER', 'EMERGENCY')
     import psycopg2
     import score_engine
+    import claude_api
 
     conn = None
     try:
@@ -854,35 +1279,61 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             try:
                 _ex = _get_exchange()
                 snapshot = _ms.build_and_validate(_ex, cur, STRATEGY_SYMBOL)
-                refresh_price = snapshot['price']
             except _ms.SnapshotError as e:
                 return (f'REALTIME DATA NOT AVAILABLE -- STRATEGY ABORTED\n{e}', 'error')
 
-            # Phase 1: Score evaluation + market context
+            # Phase 1: Score + position + context + news (Claude input)
             scores = score_engine.compute_total(cur=cur)
             pos_state = _fetch_position_state(cur)
             strategy_ctx = _fetch_strategy_context(cur)
+            news_items = _fetch_news_summary(cur)
+            watch_kw = _load_watch_keywords(cur)
 
-            # Phase 2: Action decision
-            (action, reason, details) = _evaluate_strategy_action(scores, pos_state)
+            # Score engine reference judgment (included in Claude input)
+            (engine_action, engine_reason, details) = _evaluate_strategy_action(scores, pos_state)
 
-            # Phase 3: Execute (auto-trading mode only)
+            # Phase 2: Claude call (JSON-only prompt)
+            prompt = _build_execution_prompt(
+                scores, pos_state, strategy_ctx, snapshot, text,
+                engine_action, engine_reason, news_items=news_items)
+            gate = 'pre_action'
+            ck = 'user_strategy' if call_type in ('USER', 'EMERGENCY') else 'auto_strategy'
+            (ai_text, ai_meta) = _call_claude_advisory(
+                prompt, gate=gate, cooldown_key=ck,
+                context={'intent': 'strategy', 'candidate_action': engine_action},
+                call_type=call_type, max_tokens=500)
+
+            # Phase 3: JSON parsing
+            if ai_meta.get('fallback_used'):
+                parsed = dict(claude_api.FALLBACK_RESPONSE)
+                parsed['fallback_used'] = True
+            else:
+                parsed = claude_api._parse_response(ai_text)
+
+            claude_action = parsed.get('action', 'HOLD')
+
+            # [DECISION] Telegram alert
+            _send_decision_alert(claude_action, parsed, engine_action, scores, pos_state)
+
+            # Phase 4: Safety guard -> enqueue
             eq_id = None
             execute_status = 'NO'
-            (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
-            if auto_ok and action not in ('HOLD', 'ENTRY_POSSIBLE'):
-                eq_id = _enqueue_strategy_action(cur, action, pos_state, scores, reason,
-                                                 snapshot=snapshot)
-                if eq_id:
-                    execute_status = f'YES (eq_id={eq_id})'
-                else:
-                    execute_status = 'NO (safety block)'
-            elif not auto_ok:
-                execute_status = f'NO ({auto_reason})'
+            if claude_action in ('HOLD', 'ABORT') or parsed.get('fallback_used') or parsed.get('aborted'):
+                execute_status = f'HOLD (claude={claude_action})'
             else:
-                execute_status = 'NO (action not required)'
+                (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
+                if not auto_ok:
+                    execute_status = f'BLOCKED ({auto_reason})'
+                else:
+                    eq_id = _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot)
+                    if eq_id:
+                        execute_status = f'YES (eq_id={eq_id})'
+                        # [ENQUEUE] Telegram alert
+                        _send_enqueue_alert(eq_id, claude_action, parsed, pos_state)
+                    else:
+                        execute_status = f'BLOCKED (safety)'
 
-            # Build output header
+            # Phase 5: Build output + DB save
             total = scores.get('total_score', 0)
             dominant = scores.get('dominant_side', 'LONG')
             stage = scores.get('stage', 1)
@@ -893,14 +1344,21 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             price = scores.get('price') or 0
 
             lines = [
-                '=== 전략 평가 ===',
-                f'ACTION: {action}',
+                '=== 전략 평가 (Claude Execution Authority) ===',
+                f'CLAUDE ACTION: {claude_action}',
+                f'confidence={parsed.get("confidence", 0)} | '
+                f'reason={parsed.get("reason_code", "?")}',
+                f'ENGINE REF: {engine_action} ({engine_reason})',
                 f'SCORE: {total:+.1f} ({dominant} stage {stage})',
                 f'  TECH: {tech:+.0f} | POS: {pos_score:+.0f} | REGIME: {regime:+.0f} | NEWS: {news_s:+.0f}',
             ]
 
             if pos_state:
-                ps_side = pos_state.get('side', '?').upper()
+                ps_side = pos_state.get('side', '?')
+                if ps_side:
+                    ps_side = ps_side.upper()
+                else:
+                    ps_side = 'NONE'
                 qty = pos_state.get('total_qty', 0)
                 entry = pos_state.get('avg_entry_price', 0)
                 lines.append(f'POSITION: {ps_side} {qty} BTC @ ${entry:,.1f}')
@@ -911,165 +1369,40 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             else:
                 lines.append('POSITION: none')
 
-            lines.append(f'REASON: {reason}')
+            if claude_action == 'REDUCE':
+                lines.append(f'REDUCE: {parsed.get("reduce_pct", 0)}%')
+            elif 'OPEN' in claude_action:
+                lines.append(f'TARGET STAGE: {parsed.get("target_stage", 1)}')
+
             lines.append(f'EXECUTE: {execute_status}')
+
+            # NEWS SUMMARY section
+            news_section_text = _build_news_section(news_items, scores, watch_kw)
+            lines.append(news_section_text)
+
+            # NEWS->DECISION TRACE
+            news_trace = _build_news_decision_trace(
+                claude_action, engine_action,
+                scores.get('news_event_score', 0),
+                scores.get('news_event_guarded', False))
+            lines.append(news_trace)
 
             header = '\n'.join(lines)
 
-            # Phase 4: AI analysis (Claude only for high-stakes actions)
-            sl_dist = details.get('sl_dist_pct')
-            sl_pct = details.get('stop_loss_pct', 2.0)
-            sl_remaining = (sl_pct + sl_dist) if sl_dist is not None else 999
-            needs_claude = (
-                action in CLAUDE_STRATEGY_ACTIONS
-                or sl_remaining < SL_PROXIMITY_PCT
-                or no_fallback
-            )
-
-            ai_text = ''
-            ai_meta = {}
-            ai_label = ''
-
-            if needs_claude:
-                try:
-                    market_data = _format_market_data(price, strategy_ctx)
-                    pos_line = (
-                        f"POSITION: {pos_state.get('side', 'none')} "
-                        f"qty={pos_state.get('total_qty', 0)} "
-                        f"entry=${pos_state.get('avg_entry_price', 0):,.0f}"
-                    )
-
-                    if no_fallback:
-                        # USER: Claude analyzes independently (no score_engine summary)
-                        claude_prompt = (
-                            f"비트코인 선물 트레이딩 전략 분석가로서 "
-                            f"아래 실시간 데이터를 기반으로 독립 분석하세요.\n\n"
-                            f"사용자 요청: {text}\n\n"
-                            f"=== 실시간 시장 데이터 ===\n{market_data}\n\n"
-                            f"=== 포지션 ===\n{pos_line}\n\n"
-                            f"[참고: 스코어 엔진 축별 원점수]\n"
-                            f"TECH={tech:+.0f} | POS={pos_score:+.0f} | "
-                            f"REGIME={regime:+.0f} | NEWS={news_s:+.0f}\n"
-                            f"※ 참고용. 당신의 독립적 판단이 우선합니다.\n\n"
-                            f"{STRATEGY_ANALYSIS_TEMPLATE}\n\n"
-                            "※ 매매 실행 권한 없음. 분석/권고만. 1000자 이내."
-                        )
-                    else:
-                        # AUTO: Claude validates system judgment with 3-stage structure
-                        score_block = (
-                            f"SCORE: {total:+.1f} ({dominant} stage {stage})\n"
-                            f"  TECH={tech:+.0f} POS={pos_score:+.0f} "
-                            f"REGIME={regime:+.0f} NEWS={news_s:+.0f}\n"
-                        )
-                        claude_prompt = (
-                            f"시스템이 아래와 같이 판단했습니다. "
-                            f"실시간 데이터로 검증하고 3단계 구조로 분석하세요.\n\n"
-                            f"=== 시스템 판단 ===\n"
-                            f"ACTION: {action}\n"
-                            f"{score_block}"
-                            f"{pos_line}\n"
-                            f"REASON: {reason}\n\n"
-                            f"=== 실시간 시장 데이터 ===\n{market_data}\n\n"
-                            f"{STRATEGY_ANALYSIS_TEMPLATE}\n\n"
-                            "※ 매매 실행 권한 없음. 분석/권고만. 800자 이내."
-                        )
-
-                    ck = 'user_tg_strategy' if no_fallback else 'auto_tg_strategy'
-                    gate_ctx = {
-                        'intent': 'strategy',
-                        'candidate_action': action,
-                        'sl_dist_pct': sl_dist,
-                    }
-                    (ai_text, ai_meta) = _call_claude_advisory(
-                        claude_prompt, gate='pre_action', cooldown_key=ck,
-                        context=gate_ctx, call_type=call_type,
-                        max_tokens=1200)
-                    ai_meta['call_type'] = call_type
-                    if ai_meta.get('fallback_used'):
-                        ai_label = 'Claude (denied)' if no_fallback else 'GPT-mini (fallback)'
-                    else:
-                        cost = ai_meta.get('estimated_cost_usd', 0)
-                        latency = ai_meta.get('api_latency_ms', 0)
-                        ai_label = f'Claude (${cost:.4f})'
-                        ai_meta['model_provider'] = 'anthropic'
-                except Exception as e:
-                    ai_text = f'(AI 분석 실패: {e})'
-                    ai_meta = {'model': 'error', 'api_latency_ms': 0, 'fallback_used': True}
-                    ai_label = 'error'
+            # Provider label
+            if ai_meta.get('fallback_used'):
+                ai_label = 'Claude (denied)' if no_fallback else 'Claude (fallback)'
+                provider = 'claude(denied)'
             else:
-                # HOLD/ADD: score_engine only, no AI call
-                _log(f'strategy: action={action} → score_engine only')
-                ai_text = ''
-                ai_meta = {'model': 'none', 'fallback_used': False,
-                           'model_provider': 'score_engine'}
-                ai_label = 'score_engine'
+                cost = ai_meta.get('estimated_cost_usd', 0)
+                latency = ai_meta.get('api_latency_ms', 0)
+                ai_label = f'Claude (${cost:.4f}, {latency}ms)'
+                provider = f'anthropic (${cost:.4f})'
 
-            # Phase 4.5: Claude response price validation
-            if ai_text and not ai_meta.get('fallback_used') and snapshot:
-                import re as _re
-                _prices_found = _re.findall(r'\$[\d,]+(?:\.\d+)?', ai_text)
-                for pm in _prices_found:
-                    mentioned = float(pm.replace('$', '').replace(',', ''))
-                    _ok, _reason = _ms.validate_price_mention(mentioned, snapshot)
-                    if not _ok:
-                        _log(f'INVALID PRICE CONTEXT: {pm}')
-                        ai_text = f'INVALID PRICE CONTEXT -- STRATEGY REJECTED\n(원본: {ai_text[:200]}...)'
-                        ai_meta['price_rejected'] = True
-                        break
-
-            # Phase 5: Claude override enqueue (no_fallback mode only)
-            claude_eq_id = None
-            claude_action = None
-            if no_fallback and ai_text and not ai_meta.get('fallback_used'):
-                claude_action = _parse_claude_action(ai_text)
-                if claude_action and claude_action != action and claude_action != 'HOLD':
-                    if auto_ok and claude_action in ('REDUCE', 'CLOSE', 'REVERSE', 'ADD'):
-                        claude_eq_id = _enqueue_strategy_action(
-                            cur, claude_action, pos_state, scores,
-                            f'claude_override: {claude_action} (engine={action})',
-                            snapshot=snapshot)
-                        if claude_eq_id:
-                            eq_id = claude_eq_id
-                            execute_status = f'YES claude_override (eq_id={claude_eq_id})'
-                            _log(f'CLAUDE OVERRIDE: {action} → {claude_action} eq_id={claude_eq_id}')
-                        else:
-                            execute_status = f'NO (claude {claude_action} safety block)'
-                            _log(f'CLAUDE OVERRIDE blocked by safety: {claude_action}')
-                    elif not auto_ok:
-                        _log(f'CLAUDE OVERRIDE skipped (auto_trading inactive): {claude_action}')
-
-            # Update header EXECUTE line if Phase 5 changed it
-            if claude_eq_id and claude_action:
-                lines[-1] = f'EXECUTE: {execute_status}'
-                header = '\n'.join(lines)
-
-            # Compose final output
             result = header
-            if ai_text:
-                if no_fallback and not ai_meta.get('fallback_used'):
-                    section_title = 'Claude 전략 분석'
-                else:
-                    section_title = 'AI 분석'
-                result += f'\n\n--- {section_title} ({ai_label}) ---\n{ai_text}'
-                # Model info line
-                m_provider = ai_meta.get('model_provider', 'unknown')
-                m_model = ai_meta.get('model', 'unknown')
-                m_latency = ai_meta.get('api_latency_ms', 0)
-                result += f'\n─ model={m_model} provider={m_provider} latency={m_latency}ms'
+            result += f'\n─ {ai_label}'
 
-            # Claude override indicator
-            if claude_eq_id and claude_action:
-                result += f'\n⚡ CLAUDE OVERRIDE: {action} → {claude_action} (eq_id={claude_eq_id})'
-
-            # Provider label for footer
-            if 'Claude' in ai_label and '(' in ai_label:
-                provider = f'anthropic ({ai_label.split("(", 1)[1]}'  # "anthropic ($X.XXXX)"
-            elif 'Claude' in ai_label:
-                provider = f'anthropic ({ai_label})'
-            else:
-                provider = ai_meta.get('model', 'gpt-4o-mini')
-
-            # Save advisory with real action
+            # Save advisory
             scores_summary = {
                 'total_score': scores.get('total_score'),
                 'dominant_side': scores.get('dominant_side'),
@@ -1085,18 +1418,20 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             }
             save_meta = {
                 **ai_meta,
-                'recommended_action': action,
-                'confidence': scores.get('confidence'),
-                'reason_bullets': [reason],
+                'recommended_action': claude_action,
+                'confidence': parsed.get('confidence'),
+                'reason_bullets': [parsed.get('reason_code', '')],
                 'execution_queue_id': eq_id,
+                'engine_action': engine_action,
             }
-            if claude_eq_id:
-                save_meta['claude_override_action'] = claude_action
-                save_meta['engine_action'] = action
             _save_advisory('strategy',
                            {'user_text': text, 'scores': scores_summary,
                             'pos_state': pos_state,
-                            'action': action, 'reason': reason},
+                            'claude_action': claude_action,
+                            'engine_action': engine_action,
+                            'reason': engine_reason,
+                            'news_top3': [{'title': n['title'], 'impact': n['impact_score']}
+                                          for n in news_items[:3]]},
                            result, save_meta)
 
             return (result, provider)
@@ -1151,7 +1486,7 @@ def _ai_general_advisory(text: str) -> str:
     prompt = (
         f"사용자 질문: {text}\n\n"
         "비트코인 선물 트레이딩봇 운영자에게 간결하게 답변해줘.\n"
-        "※ 매매 실행 권한 없음. 분석/권고만. 500자 이내."
+        "500자 이내."
     )
     start_ms = int(time.time() * 1000)
     result = _call_gpt_advisory(prompt)
