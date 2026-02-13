@@ -62,7 +62,11 @@ def _get_exchange():
         'apiKey': os.getenv('BYBIT_API_KEY'),
         'secret': os.getenv('BYBIT_SECRET'),
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}})
+        'timeout': 15000,
+        'options': {
+            'defaultType': 'swap',
+            'recvWindow': 10000,
+        }})
     _exchange.load_markets()
     return _exchange
 
@@ -464,7 +468,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
         result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
     except Exception:
         traceback.print_exc()
-        result = claude_api.FALLBACK_RESPONSE.copy()
+        result = claude_api.ABORT_RESPONSE.copy()
         result['fallback_used'] = True
 
     # Log to event_trigger_log
@@ -489,8 +493,10 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     except Exception:
         traceback.print_exc()
 
-    if result.get('aborted'):
-        _log('event analysis aborted')
+    if result.get('aborted') or result.get('fallback_used'):
+        _log(f'event analysis skipped: aborted={result.get("aborted")} '
+             f'fallback={result.get("fallback_used")} '
+             f'gate_reason={result.get("gate_reason", "")}')
         return 'ABORT'
 
     # Save claude analysis
@@ -592,7 +598,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
         result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
     except Exception:
         traceback.print_exc()
-        result = claude_api.FALLBACK_RESPONSE.copy()
+        result = claude_api.ABORT_RESPONSE.copy()
         result['fallback_used'] = True
 
     # Log to emergency_analysis_log
@@ -654,6 +660,11 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     except Exception:
         traceback.print_exc()
         ca_id = None
+
+    if result.get('aborted') or result.get('fallback_used'):
+        _log(f'emergency analysis skipped: aborted={result.get("aborted")} '
+             f'fallback={result.get("fallback_used")}')
+        return 'ABORT'
 
     action = result.get('recommended_action', 'HOLD')
     pos = ctx.get('position', {})

@@ -252,7 +252,8 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
 
     if result.get('fallback_used'):
         _log(f'gate denied (event_trigger): {result.get("gate_reason", "unknown")}')
-        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': 0,
+        return {**ABORT_RESPONSE, 'fallback_used': True, 'aborted': True,
+                'api_latency_ms': 0,
                 'gate_reason': result.get('gate_reason', ''),
                 'call_type': call_type}
 
