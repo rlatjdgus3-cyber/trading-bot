@@ -187,9 +187,13 @@ def _check_volume_spike(snapshot) -> list:
 
 VOL_PROFILE_MAX_AGE_SEC = 3600  # 1 hour — skip level_breaks if older
 
+# Module-level state to detect *transitions* (not static positions)
+_prev_level_state = {'above_vah': False, 'below_val': False, 'poc_zone': None}
+
 
 def _check_level_breaks(snapshot, cur=None) -> list:
-    """Check POC shift, VAH/VAL breach."""
+    """Check POC shift, VAH/VAL breach — only on *transitions*, not static state."""
+    global _prev_level_state
     triggers = []
     price = snapshot.get('price', 0)
     if not price:
@@ -208,10 +212,13 @@ def _check_level_breaks(snapshot, cur=None) -> list:
     vah = snapshot.get('vah')
     val = snapshot.get('val')
 
-    # POC shift: check if current price deviates from POC by more than threshold
+    # POC zone: detect transition across POC_SHIFT_MIN_PCT boundary
     if poc and poc > 0:
         poc_dist_pct = abs(price - poc) / poc * 100
-        if poc_dist_pct >= POC_SHIFT_MIN_PCT:
+        current_zone = 'far_above' if price > poc and poc_dist_pct >= POC_SHIFT_MIN_PCT else \
+                        'far_below' if price < poc and poc_dist_pct >= POC_SHIFT_MIN_PCT else 'near'
+        prev_zone = _prev_level_state.get('poc_zone')
+        if current_zone != 'near' and current_zone != prev_zone:
             triggers.append({
                 'type': 'poc_shift',
                 'value': round(poc_dist_pct, 2),
@@ -220,28 +227,36 @@ def _check_level_breaks(snapshot, cur=None) -> list:
                 'price': price,
                 'direction': 'above' if price > poc else 'below',
             })
+        _prev_level_state['poc_zone'] = current_zone
 
-    # VAH/VAL sustained break
+    # VAH break: trigger only on first sustained break (transition from below to above)
     candles = snapshot.get('candles_1m', [])
     if vah and len(candles) >= VAH_VAL_SUSTAIN_CANDLES:
         recent = candles[:VAH_VAL_SUSTAIN_CANDLES]
-        if all(c.get('c', 0) > vah for c in recent):
+        now_above_vah = all(c.get('c', 0) > vah for c in recent)
+        was_above_vah = _prev_level_state.get('above_vah', False)
+        if now_above_vah and not was_above_vah:
             triggers.append({
                 'type': 'vah_break',
                 'value': price,
                 'vah': vah,
                 'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
             })
+        _prev_level_state['above_vah'] = now_above_vah
 
+    # VAL break: trigger only on first sustained break (transition from above to below)
     if val and len(candles) >= VAH_VAL_SUSTAIN_CANDLES:
         recent = candles[:VAH_VAL_SUSTAIN_CANDLES]
-        if all(c.get('c', 0) < val for c in recent):
+        now_below_val = all(c.get('c', 0) < val for c in recent)
+        was_below_val = _prev_level_state.get('below_val', False)
+        if now_below_val and not was_below_val:
             triggers.append({
                 'type': 'val_break',
                 'value': price,
                 'val': val,
                 'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
             })
+        _prev_level_state['below_val'] = now_below_val
 
     return triggers
 
