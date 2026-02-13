@@ -1,0 +1,9 @@
+[Unit]
+Description=Trading Bot Daily Performance Report
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/trading-bot/app
+ExecStart=/usr/bin/python3 /root/trading-bot/app/strategy_report.py daily
+EnvironmentFile=/root/trading-bot/app/.env

@@ -1,0 +1,746 @@
+"""
+position_manager.py — Core position management daemon.
+
+10-30s adaptive loop:
+  1. Check autopilot enabled
+  2. Fetch Bybit position (source of truth)
+  3. Build market context
+  4. Check emergency conditions -> Claude API if triggered
+  5. Run decision engine: HOLD / ADD / REDUCE / CLOSE / REVERSE
+  6. Log to pm_decision_log
+  7. If action != HOLD, insert into execution_queue
+
+Never places orders directly — all actions go through execution_queue.
+"""
+import os
+import sys
+import time
+import json
+import traceback
+import urllib.parse
+import urllib.request
+sys.path.insert(0, '/root/trading-bot/app')
+import ccxt
+import psycopg2
+from dotenv import load_dotenv
+import test_utils
+load_dotenv('/root/trading-bot/app/.env')
+
+SYMBOL = 'BTC/USDT:USDT'
+KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
+LOOP_FAST_SEC = 10
+LOOP_NORMAL_SEC = 15
+LOOP_SLOW_SEC = 30
+LOG_PREFIX = '[pos_mgr]'
+
+
+def _log(msg):
+    print(f'{LOG_PREFIX} {msg}', flush=True)
+
+
+def _db_conn():
+    return psycopg2.connect(
+        host=os.getenv('DB_HOST', 'localhost'),
+        port=int(os.getenv('DB_PORT', '5432')),
+        dbname=os.getenv('DB_NAME', 'trading'),
+        user=os.getenv('DB_USER', 'bot'),
+        password=os.getenv('DB_PASS', 'botpass'),
+        connect_timeout=10,
+        options='-c statement_timeout=30000')
+
+
+_exchange = None
+_tables_ensured = False
+
+
+def _get_exchange():
+    global _exchange
+    if _exchange is not None:
+        return _exchange
+    _exchange = ccxt.bybit({
+        'apiKey': os.getenv('BYBIT_API_KEY'),
+        'secret': os.getenv('BYBIT_SECRET'),
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}})
+    _exchange.load_markets()
+    return _exchange
+
+
+_tg_config = {}
+
+
+def _load_tg_config():
+    if _tg_config:
+        return _tg_config
+    env_path = '/root/trading-bot/app/telegram_cmd.env'
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    _tg_config[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return _tg_config
+
+
+def _send_telegram(text=None):
+    cfg = _load_tg_config()
+    token = cfg.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
+    if not token or not chat_id:
+        return None
+    try:
+        url = f'https://api.telegram.org/bot{token}/sendMessage'
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id,
+            'text': text,
+            'disable_web_page_preview': 'true'}).encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_position(ex=None):
+    '''Fetch current Bybit position. Returns dict or None.'''
+    positions = ex.fetch_positions([SYMBOL])
+    for p in positions:
+        if p.get('symbol') != SYMBOL:
+            continue
+        contracts = float(p.get('contracts') or 0)
+        side = p.get('side')
+        if not contracts > 0:
+            continue
+        if side not in ('long', 'short'):
+            continue
+        entry_price = float(p.get('entryPrice') or 0)
+        mark_price = float(p.get('markPrice') or 0)
+        upnl = float(p.get('unrealizedPnl') or 0)
+        return {
+            'side': side,
+            'qty': contracts,
+            'entry_price': entry_price,
+            'mark_price': mark_price,
+            'upnl': upnl,
+            'leverage': p.get('leverage')}
+    return None
+
+
+def _build_context(cur=None, pos=None):
+    '''Build full market context for decision engine.'''
+    ctx = {
+        'position': pos,
+        'price': pos.get('mark_price', 0) if pos else 0}
+
+    # Indicators
+    cur.execute("""
+            SELECT ich_kijun, rsi_14, atr_14, vol, vol_ma20, vol_spike,
+                   bb_mid, bb_up, bb_dn, ich_tenkan, ma_50, ma_200
+            FROM indicators
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT 1;
+        """, (SYMBOL,))
+    row = cur.fetchone()
+    if row:
+        ctx['indicators'] = {
+            'kijun': float(row[0]) if row[0] else None,
+            'rsi': float(row[1]) if row[1] else None,
+            'atr': float(row[2]) if row[2] else None,
+            'vol': float(row[3]) if row[3] else None,
+            'vol_ma20': float(row[4]) if row[4] else None,
+            'vol_spike': bool(row[5]) if row[5] is not None else False,
+            'bb_mid': float(row[6]) if row[6] else None,
+            'bb_up': float(row[7]) if row[7] else None,
+            'bb_dn': float(row[8]) if row[8] else None,
+            'tenkan': float(row[9]) if row[9] else None,
+            'ma_50': float(row[10]) if row[10] else None,
+            'ma_200': float(row[11]) if row[11] else None,
+        }
+    else:
+        ctx['indicators'] = {}
+
+    # Vol profile
+    cur.execute("""
+            SELECT poc, vah, val FROM vol_profile
+            WHERE symbol = %s
+            ORDER BY ts DESC LIMIT 1;
+        """, (SYMBOL,))
+    vp_row = cur.fetchone()
+    if vp_row:
+        ctx['vol_profile'] = {
+            'poc': float(vp_row[0]) if vp_row[0] else None,
+            'vah': float(vp_row[1]) if vp_row[1] else None,
+            'val': float(vp_row[2]) if vp_row[2] else None,
+        }
+    else:
+        ctx['vol_profile'] = {}
+
+    # Recent candles
+    cur.execute("""
+            SELECT ts, o, h, l, c, v FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT 10;
+        """, (SYMBOL,))
+    ctx['candles_1m'] = [
+        {'ts': str(r[0]), 'o': float(r[1]), 'h': float(r[2]),
+         'l': float(r[3]), 'c': float(r[4]), 'v': float(r[5])}
+        for r in cur.fetchall()
+    ]
+
+    # Scores
+    try:
+        import score_engine
+        scores = score_engine.compute_total(cur=cur, exchange=_get_exchange())
+        ctx['scores'] = scores
+        ctx['unified_score'] = scores
+    except Exception:
+        ctx['scores'] = {}
+        ctx['unified_score'] = {}
+
+    # Position state
+    cur.execute("""
+            SELECT side, total_qty, avg_entry_price, stage,
+                   trade_budget_used_pct, next_stage_available
+            FROM position_state WHERE symbol = %s;
+        """, (SYMBOL,))
+    ps_row = cur.fetchone()
+    if ps_row:
+        ctx['pos_state'] = {
+            'side': ps_row[0],
+            'total_qty': float(ps_row[1]) if ps_row[1] else 0,
+            'avg_entry': float(ps_row[2]) if ps_row[2] else 0,
+            'stage': int(ps_row[3]) if ps_row[3] else 0,
+            'budget_used_pct': float(ps_row[4]) if ps_row[4] else 0,
+            'next_stage': int(ps_row[5]) if ps_row[5] else 0,
+        }
+    else:
+        ctx['pos_state'] = {}
+
+    # News
+    cur.execute("""
+            SELECT title, summary, impact_score, ts FROM news
+            WHERE ts >= now() - interval '2 hours'
+            ORDER BY ts DESC LIMIT 10;
+        """)
+    ctx['news'] = [
+        {'title': r[0], 'summary': r[1], 'impact_score': r[2], 'ts': str(r[3])}
+        for r in cur.fetchall()
+    ]
+
+    # Funding rate
+    try:
+        funding_data = _get_exchange().fetch_funding_rate(SYMBOL)
+        ctx['funding_rate'] = float(funding_data.get('fundingRate', 0))
+    except Exception:
+        ctx['funding_rate'] = 0
+
+    return ctx
+
+
+def _check_emergency(ctx=None):
+    '''Check for emergency conditions. Returns trigger dict or None.'''
+    ind = ctx.get('indicators', {})
+    atr = ind.get('atr')
+    price = ctx.get('price', 0)
+    candles = ctx.get('candles_1m', [])
+    funding = ctx.get('funding_rate', 0)
+
+    if not atr or atr <= 0 or not candles or len(candles) < 2:
+        return None
+
+    if len(candles) >= 2:
+        latest_c = candles[0].get('c', 0)
+        prev_c = candles[1].get('c', 0)
+        if prev_c > 0:
+            move = abs(latest_c - prev_c)
+            if move > 2.5 * atr:
+                return {
+                    'type': 'rapid_price_move',
+                    'detail': {
+                        'move': move,
+                        'atr': atr,
+                        'atr_multiple': round(move / atr, 2),
+                        'direction': 'up' if latest_c > prev_c else 'down'}}
+
+    if abs(funding) > 0.001:
+        return {
+            'type': 'extreme_funding',
+            'detail': {
+                'funding_rate': funding}}
+
+    vol = ind.get('vol', 0)
+    vol_ma = ind.get('vol_ma20', 0)
+    if vol_ma > 0 and vol > 3 * vol_ma:
+        return {
+            'type': 'volume_spike',
+            'detail': {
+                'vol': vol,
+                'vol_ma': vol_ma,
+                'ratio': round(vol / vol_ma, 2)}}
+
+    unified = ctx.get('unified_score') or ctx.get('scores', {}).get('unified') or {}
+    current_total = unified.get('total_score')
+    if current_total is not None and abs(current_total) > 80:
+        return {
+            'type': 'extreme_score',
+            'detail': {
+                'total_score': current_total,
+                'dominant_side': unified.get('dominant_side')}}
+
+    return None
+
+
+def _handle_emergency(cur=None, ctx=None, trigger=None):
+    '''Handle emergency via Claude API. Returns action taken.'''
+    _send_telegram(
+        f'\U0001f6a8 급변 감지 -> Claude 분석 중\n'
+        f'- trigger: {trigger["type"]}\n'
+        f'- detail: {json.dumps(trigger["detail"], default=str)[:200]}')
+
+    import attach_similar_events
+    import save_claude_analysis
+    from fact_categories import classify_news, extract_macro_keywords
+
+    # Find similar FACT events
+    news_text = ' '.join(n.get('summary', '') or '' for n in ctx.get('news', []))
+    fact_category = classify_news(news_text)
+    fact_keywords = extract_macro_keywords(news_text)
+    similar = attach_similar_events.find_similar(cur, category=fact_category, keywords=fact_keywords)
+    perf_summary = attach_similar_events.build_performance_summary(similar)
+
+    import claude_api
+
+    ctx['trigger'] = trigger
+    ctx['fact_similar_events'] = similar
+    ctx['fact_performance_summary'] = perf_summary
+
+    try:
+        result = claude_api.emergency_analysis(ctx)
+    except Exception:
+        traceback.print_exc()
+        result = claude_api.FALLBACK_RESPONSE.copy()
+        result['fallback_used'] = True
+
+    # Log to emergency_analysis_log
+    cur.execute("""
+        INSERT INTO emergency_analysis_log
+            (symbol, trigger_type, trigger_detail, context_packet,
+             response_raw, risk_level, recommended_action, confidence,
+             reason_bullets, ttl_seconds, api_latency_ms, fallback_used)
+        VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+        RETURNING id;
+    """, (
+        SYMBOL,
+        trigger['type'],
+        json.dumps(trigger.get('detail', {}), default=str),
+        json.dumps(ctx, default=str, ensure_ascii=False)[:10000],
+        json.dumps(result, default=str, ensure_ascii=False),
+        result.get('risk_level'),
+        result.get('recommended_action'),
+        result.get('confidence'),
+        json.dumps(result.get('reason_bullets', []), ensure_ascii=False),
+        result.get('ttl_seconds'),
+        result.get('api_latency_ms'),
+        result.get('fallback_used', False),
+    ))
+    eid_row = cur.fetchone()
+    eid = eid_row[0] if eid_row else None
+
+    # Save claude analysis for feedback loop
+    try:
+        ca_id = save_claude_analysis.save_analysis(
+            cur, kind='emergency',
+            input_packet=ctx,
+            output=result,
+            event_id=None,
+            similar_events=similar,
+            emergency_log_id=eid)
+    except Exception:
+        traceback.print_exc()
+        ca_id = None
+
+    action = result.get('recommended_action', 'HOLD')
+
+    if action == 'HOLD':
+        _send_telegram(
+            f'[Claude] HOLD 판단 (risk={result.get("risk_level")})\n'
+            f'- confidence: {result.get("confidence")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'HOLD'
+
+    pos = ctx.get('position', {})
+
+    if action == 'REDUCE':
+        reduce_pct = result.get('reduce_pct', 50)
+        eq_id = _enqueue_action(
+            cur, 'REDUCE', pos.get('side', '').upper(),
+            reduce_pct=reduce_pct,
+            reason=f'emergency_{trigger["type"]}',
+            emergency_id=eid,
+            priority=2)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] REDUCE {reduce_pct}% 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'REDUCE'
+
+    if action == 'CLOSE':
+        eq_id = _enqueue_action(
+            cur, 'CLOSE', pos.get('side', '').upper(),
+            target_qty=pos.get('qty'),
+            reason=f'emergency_{trigger["type"]}',
+            emergency_id=eid,
+            priority=1)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] CLOSE 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'CLOSE'
+
+    if action == 'REVERSE':
+        eq_id = _enqueue_reverse(
+            cur, pos,
+            reason=f'emergency_{trigger["type"]}',
+            emergency_id=eid,
+            priority=1)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] REVERSE 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'REVERSE'
+
+    return 'HOLD'
+
+
+def _decide(ctx=None):
+    '''Run decision engine. Returns (action, reason).'''
+    pos = ctx.get('position', {})
+    ind = ctx.get('indicators', {})
+    vp = ctx.get('vol_profile', {})
+    scores = ctx.get('scores', {})
+    ps = ctx.get('pos_state', {})
+    price = ctx.get('price', 0)
+    side = pos.get('side', '')
+    entry = pos.get('entry_price', 0)
+    atr = ind.get('atr')
+    rsi = ind.get('rsi')
+    kijun = ind.get('kijun')
+    poc = vp.get('poc')
+    vah = vp.get('vah')
+    val = vp.get('val')
+    vol = ind.get('vol', 0)
+    vol_ma = ind.get('vol_ma20', 0)
+    vol_ratio = vol / vol_ma if vol_ma and vol_ma > 0 else 1
+    long_score = scores.get('long_score', 50)
+    short_score = scores.get('short_score', 50)
+    stage = ps.get('stage', 0)
+    news = ctx.get('news', [])
+
+    # No position -> HOLD (autopilot_daemon handles entries)
+    if not pos or not side:
+        return ('HOLD', 'no position')
+
+    dominant = scores.get('dominant_side', 'LONG')
+
+    # Stop-loss check
+    if atr and atr > 0 and entry and entry > 0:
+        if side == 'long':
+            sl_dist = (price - entry) / entry * 100
+        else:
+            sl_dist = (entry - price) / entry * 100
+
+        sl_pct = scores.get('dynamic_stop_loss_pct', 2.0)
+        if sl_dist <= -sl_pct:
+            return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%)')
+
+    # Reversal check
+    if side == 'long' and dominant == 'SHORT' and short_score >= 70:
+        confirms = _structure_confirms(ctx, 'SHORT')
+        if confirms >= 3:
+            return ('REVERSE', f'strong SHORT reversal (score={short_score}, confirms={confirms})')
+
+    if side == 'short' and dominant == 'LONG' and long_score >= 70:
+        confirms = _structure_confirms(ctx, 'LONG')
+        if confirms >= 3:
+            return ('REVERSE', f'strong LONG reversal (score={long_score}, confirms={confirms})')
+
+    # ADD check
+    if stage < 7 and ps.get('budget_used_pct', 0) < 70:
+        direction = 'LONG' if side == 'long' else 'SHORT'
+        if dominant == direction:
+            relevant = long_score if direction == 'LONG' else short_score
+            if relevant >= 65:
+                return ('ADD', f'score {relevant} favors {direction}, stage={stage}')
+
+    # Reduce on strong counter signal
+    if side == 'long' and short_score >= 65 and long_score <= 40:
+        return ('REDUCE', f'counter signal (long={long_score}, short={short_score})')
+    if side == 'short' and long_score >= 65 and short_score <= 40:
+        return ('REDUCE', f'counter signal (long={long_score}, short={short_score})')
+
+    return ('HOLD', 'no action needed')
+
+
+def _structure_confirms(ctx=None, target_side=None):
+    '''Count structure confirmations for reversal. Returns 0-4.'''
+    confirms = 0
+    ind = ctx.get('indicators', {})
+    price = ctx.get('price', 0)
+
+    tenkan = ind.get('tenkan')
+    kijun = ind.get('kijun')
+    rsi = ind.get('rsi')
+    ma50 = ind.get('ma_50')
+    ma200 = ind.get('ma_200')
+
+    if target_side == 'LONG':
+        if tenkan is not None and kijun is not None and tenkan > kijun:
+            confirms += 1
+        if rsi is not None and rsi < 40:
+            confirms += 1
+        if ma50 is not None and ma200 is not None and ma50 > ma200:
+            confirms += 1
+        if price and kijun and price > kijun:
+            confirms += 1
+    else:  # SHORT
+        if tenkan is not None and kijun is not None and tenkan < kijun:
+            confirms += 1
+        if rsi is not None and rsi > 60:
+            confirms += 1
+        if ma50 is not None and ma200 is not None and ma50 < ma200:
+            confirms += 1
+        if price and kijun and price < kijun:
+            confirms += 1
+
+    return confirms
+
+
+def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
+    '''Insert action into execution_queue.'''
+    import safety_manager
+    (ok, reason) = safety_manager.run_all_checks(cur, kwargs.get('target_usdt', 0))
+    if not ok and action_type == 'ADD':
+        _log(f'safety block: {reason}')
+        _send_telegram(f'[주문 거부] - 사유: {reason}')
+        return None
+    cur.execute("""
+        INSERT INTO execution_queue
+            (symbol, action_type, direction, target_qty, target_usdt,
+             reduce_pct, source, pm_decision_id, emergency_id,
+             reason, priority, expire_at, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now() + interval '5 minutes',%s::jsonb)
+        RETURNING id;
+    """, (SYMBOL, action_type, direction,
+          kwargs.get('target_qty'), kwargs.get('target_usdt'),
+          kwargs.get('reduce_pct'), kwargs.get('source', 'position_manager'),
+          kwargs.get('pm_decision_id'), kwargs.get('emergency_id'),
+          kwargs.get('reason', ''), kwargs.get('priority', 5),
+          json.dumps(kwargs.get('meta', {}), default=str)))
+    row = cur.fetchone()
+    eq_id = row[0] if row else None
+    _log(f'enqueued: {action_type} {direction} eq_id={eq_id}')
+    return eq_id
+
+
+def _enqueue_reverse(cur=None, pos=None, **kwargs):
+    '''Enqueue a 2-step reverse: REVERSE_CLOSE then REVERSE_OPEN.'''
+    current_side = pos.get('side', '').upper()
+    new_side = 'SHORT' if current_side == 'LONG' else 'LONG'
+    close_id = _enqueue_action(
+        cur, 'REVERSE_CLOSE', current_side,
+        target_qty=pos.get('qty'),
+        priority=kwargs.get('priority', 2),
+        reason=kwargs.get('reason', 'reverse'),
+        emergency_id=kwargs.get('emergency_id'),
+        pm_decision_id=kwargs.get('pm_decision_id'))
+    if close_id:
+        _enqueue_action(
+            cur, 'REVERSE_OPEN', new_side,
+            priority=kwargs.get('priority', 2),
+            reason=kwargs.get('reason', 'reverse'),
+            emergency_id=kwargs.get('emergency_id'),
+            pm_decision_id=kwargs.get('pm_decision_id'),
+            meta={'depends_on': close_id})
+    return close_id
+
+
+def _sync_position_state(cur=None, pos=None):
+    '''Sync position_state with Bybit reality.'''
+    if pos is None:
+        cur.execute("""
+            UPDATE position_state SET
+                side = NULL, total_qty = 0, stage = 0,
+                capital_used_usdt = 0, trade_budget_used_pct = 0,
+                updated_at = now()
+            WHERE symbol = %s;
+        """, (SYMBOL,))
+    else:
+        cur.execute("""
+            UPDATE position_state SET
+                side = %s, total_qty = %s, avg_entry_price = %s,
+                updated_at = now()
+            WHERE symbol = %s;
+        """, (pos.get('side'), pos.get('qty'), pos.get('entry_price'), SYMBOL))
+
+
+def _log_decision(cur=None, ctx=None, action=None, reason=None):
+    '''Log decision to pm_decision_log. Returns id.'''
+    pos = ctx.get('position', {})
+    ind = ctx.get('indicators', {})
+    vp = ctx.get('vol_profile', {})
+    scores = ctx.get('scores', {})
+    ps = ctx.get('pos_state', {})
+    try:
+        cur.execute("""
+            INSERT INTO pm_decision_log
+                (symbol, position_side, position_qty, avg_entry_price, stage,
+                 current_price, long_score, short_score, atr_14, rsi_14,
+                 poc, vah, val, chosen_action, action_reason, full_context)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            RETURNING id;
+        """, (
+            SYMBOL,
+            pos.get('side'),
+            pos.get('qty'),
+            pos.get('entry_price'),
+            ps.get('stage'),
+            ctx.get('price'),
+            scores.get('long_score'),
+            scores.get('short_score'),
+            ind.get('atr'),
+            ind.get('rsi'),
+            vp.get('poc'),
+            vp.get('vah'),
+            vp.get('val'),
+            action,
+            reason,
+            json.dumps(ctx, default=str, ensure_ascii=False)[:10000],
+        ))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _cycle():
+    '''One position management cycle. Returns sleep seconds.'''
+    if os.path.exists(KILL_SWITCH_PATH):
+        _log('KILL_SWITCH detected. Exiting.')
+        sys.exit(0)
+
+    conn = None
+    try:
+        conn = _db_conn()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # Check test lifecycle
+            if not test_utils.is_test_active():
+                _log('test period ended, sleeping')
+                return LOOP_SLOW_SEC
+
+            # Fetch Bybit position
+            ex = _get_exchange()
+            pos = _fetch_position(ex)
+            if pos is None:
+                _log('no position, sleeping')
+                return LOOP_SLOW_SEC
+
+            # Build context
+            ctx = _build_context(cur, pos)
+
+            # Check emergency
+            trigger = _check_emergency(ctx)
+            if trigger:
+                _log(f'emergency trigger: {trigger["type"]}')
+                _handle_emergency(cur, ctx, trigger)
+                return LOOP_FAST_SEC
+
+            # Run decision engine
+            (action, reason) = _decide(ctx)
+            _log(f'decision: {action} - {reason}')
+
+            # Log decision
+            dec_id = _log_decision(cur, ctx, action, reason)
+
+            # Execute non-HOLD actions
+            if action == 'ADD':
+                import safety_manager
+                add_usdt = safety_manager.get_add_slice_usdt(cur)
+                direction = pos.get('side', '').upper()
+                _enqueue_action(
+                    cur, 'ADD', direction,
+                    target_usdt=add_usdt,
+                    reason=reason,
+                    pm_decision_id=dec_id,
+                    priority=5)
+            elif action == 'REDUCE':
+                _enqueue_action(
+                    cur, 'REDUCE', pos.get('side', '').upper(),
+                    reduce_pct=30,
+                    reason=reason,
+                    pm_decision_id=dec_id,
+                    priority=3)
+            elif action == 'CLOSE':
+                _enqueue_action(
+                    cur, 'CLOSE', pos.get('side', '').upper(),
+                    target_qty=pos.get('qty'),
+                    reason=reason,
+                    pm_decision_id=dec_id,
+                    priority=2)
+            elif action == 'REVERSE':
+                _enqueue_reverse(
+                    cur, pos,
+                    reason=reason,
+                    pm_decision_id=dec_id,
+                    priority=2)
+
+            # Sync position state
+            _sync_position_state(cur, pos)
+
+        return LOOP_NORMAL_SEC
+
+    except Exception:
+        traceback.print_exc()
+        return LOOP_SLOW_SEC
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def main():
+    _log('=== POSITION MANAGER START ===')
+    import db_migrations
+    db_migrations.run_all()
+    while True:
+        try:
+            sleep_sec = _cycle()
+            time.sleep(sleep_sec)
+        except Exception:
+            traceback.print_exc()
+            time.sleep(LOOP_SLOW_SEC)
+
+
+if __name__ == '__main__':
+    main()

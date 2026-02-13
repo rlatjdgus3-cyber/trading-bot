@@ -1,0 +1,32 @@
+# Secrets / env
+.env
+.env.*
+*.env
+telegram_cmd.env
+
+# Backups
+*.bak
+*.bak.*
+*.bak_*
+*.broken_*
+*.truncated_backup
+.backup_*/
+_recovered/
+
+# Logs
+*.log
+log.txt
+logs/
+*.err
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state
+*.db
+.chat_history.json
+.error_watcher_state.json
+.gpt_router_state.json
+status/
+:last_id

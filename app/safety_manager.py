@@ -1,0 +1,201 @@
+"""
+safety_manager.py — Centralized safety checks for position_manager and executor.
+
+Checks:
+  - Total capital exposure (trade budget 70% cap)
+  - Daily/hourly trade counts
+  - Daily loss limit (auto-OFF)
+  - Circuit breaker (order flood)
+
+7-Stage Budget System:
+  - 7 stages, each 10% of capital_limit (cumulative: 10->20->30->40->50->60->70%)
+  - Dynamic start_stage based on direction score
+  - Policy A (cumulative): start_stage=k -> initial entry = k*10%
+  - ADD = one slice (10%), total never exceeds 70%
+"""
+import os
+import sys
+sys.path.insert(0, '/root/trading-bot/app')
+LOG_PREFIX = '[safety_mgr]'
+SYMBOL = 'BTC/USDT:USDT'
+TRADE_BUDGET_PCT = 70
+STAGE_SLICE_PCT = 10
+MAX_STAGES = 7
+
+
+def _log(msg):
+    print(f'{LOG_PREFIX} {msg}', flush=True)
+
+
+def _db_conn():
+    import psycopg2
+    return psycopg2.connect(
+        host=os.getenv('DB_HOST', 'localhost'),
+        port=int(os.getenv('DB_PORT', '5432')),
+        dbname=os.getenv('DB_NAME', 'trading'),
+        user=os.getenv('DB_USER', 'bot'),
+        password=os.getenv('DB_PASS', 'botpass'),
+        connect_timeout=10,
+        options='-c statement_timeout=30000')
+
+
+def _load_safety_limits(cur):
+    '''Load safety_limits from DB. Returns dict.'''
+    cur.execute("""
+        SELECT capital_limit_usdt, max_daily_trades, max_hourly_trades,
+               daily_loss_limit_usdt, max_pyramid_stages, add_size_min_pct,
+               add_size_max_pct, circuit_breaker_window_sec, circuit_breaker_max_orders,
+               add_score_threshold, trade_budget_pct, stage_slice_pct, max_stages,
+               stop_loss_pct
+        FROM safety_limits ORDER BY id DESC LIMIT 1;
+    """)
+    row = cur.fetchone()
+    if not row:
+        return {
+            'capital_limit_usdt': 900,
+            'max_daily_trades': 20,
+            'max_hourly_trades': 8,
+            'daily_loss_limit_usdt': -150,
+            'max_pyramid_stages': 7,
+            'add_score_threshold': 65,
+            'trade_budget_pct': 70,
+            'stage_slice_pct': 10,
+            'max_stages': 7,
+            'stop_loss_pct': 2.0,
+            'circuit_breaker_window_sec': 300,
+            'circuit_breaker_max_orders': 10,
+        }
+    return {
+        'capital_limit_usdt': float(row[0]) if row[0] else 900,
+        'max_daily_trades': int(row[1]) if row[1] else 20,
+        'max_hourly_trades': int(row[2]) if row[2] else 8,
+        'daily_loss_limit_usdt': float(row[3]) if row[3] else -150,
+        'max_pyramid_stages': int(row[4]) if row[4] else 7,
+        'add_size_min_pct': float(row[5]) if row[5] else 5,
+        'add_size_max_pct': float(row[6]) if row[6] else 10,
+        'circuit_breaker_window_sec': int(row[7]) if row[7] else 300,
+        'circuit_breaker_max_orders': int(row[8]) if row[8] else 10,
+        'add_score_threshold': int(row[9]) if row[9] else 65,
+        'trade_budget_pct': float(row[10]) if row[10] else 70,
+        'stage_slice_pct': float(row[11]) if row[11] else 10,
+        'max_stages': int(row[12]) if row[12] else 7,
+        'stop_loss_pct': float(row[13]) if row[13] else 2.0,
+    }
+
+
+def run_all_checks(cur, target_usdt=0):
+    '''Run all safety checks. Returns (ok, reason).'''
+    limits = _load_safety_limits(cur)
+
+    # Daily trade count
+    cur.execute("""
+        SELECT count(*) FROM execution_queue
+        WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'
+          AND status != 'REJECTED';
+    """)
+    daily_count = int(cur.fetchone()[0])
+    if daily_count >= limits['max_daily_trades']:
+        return (False, f"daily trade limit ({daily_count}/{limits['max_daily_trades']})")
+
+    # Hourly trade count
+    cur.execute("""
+        SELECT count(*) FROM execution_queue
+        WHERE ts >= now() - interval '1 hour'
+          AND status != 'REJECTED';
+    """)
+    hourly_count = int(cur.fetchone()[0])
+    if hourly_count >= limits['max_hourly_trades']:
+        return (False, f"hourly trade limit ({hourly_count}/{limits['max_hourly_trades']})")
+
+    # Circuit breaker
+    window = limits['circuit_breaker_window_sec']
+    cur.execute("""
+        SELECT count(*) FROM execution_queue
+        WHERE ts >= now() - make_interval(secs => %s);
+    """, (window,))
+    recent_count = int(cur.fetchone()[0])
+    if recent_count >= limits['circuit_breaker_max_orders']:
+        return (False, f"circuit breaker ({recent_count} orders in {window}s)")
+
+    # Daily loss limit
+    cur.execute("""
+        SELECT COALESCE(sum(realized_pnl), 0) FROM execution_log
+        WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'
+          AND realized_pnl IS NOT NULL;
+    """)
+    daily_pnl = float(cur.fetchone()[0])
+    if daily_pnl <= limits['daily_loss_limit_usdt']:
+        return (False, f"daily loss limit ({daily_pnl:.1f} <= {limits['daily_loss_limit_usdt']})")
+
+    return (True, 'all checks passed')
+
+
+def check_total_exposure(cur, add_usdt):
+    '''Check if adding add_usdt exceeds capital limit.'''
+    limits = _load_safety_limits(cur)
+    cur.execute('SELECT capital_used_usdt FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    row = cur.fetchone()
+    current = float(row[0]) if row and row[0] else 0
+    cap = limits['capital_limit_usdt'] * limits['trade_budget_pct'] / 100
+    if current + add_usdt > cap:
+        return (False, f'total exposure would exceed budget ({current + add_usdt:.0f} > {cap:.0f})')
+    return (True, 'ok')
+
+
+def check_pyramid_allowed(cur, current_stage):
+    '''Check if pyramiding (ADD) is allowed at current stage.'''
+    limits = _load_safety_limits(cur)
+    if current_stage >= limits['max_stages']:
+        return (False, f'max stages reached ({current_stage}/{limits["max_stages"]})')
+    return (True, 'ok')
+
+
+def check_trade_budget(cur, add_pct):
+    '''Check if adding add_pct exceeds trade budget.'''
+    cur.execute('SELECT trade_budget_used_pct FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    row = cur.fetchone()
+    current_pct = float(row[0]) if row and row[0] else 0
+    if current_pct + add_pct > TRADE_BUDGET_PCT:
+        return (False, f'budget would exceed {TRADE_BUDGET_PCT}% ({current_pct + add_pct:.0f}%)')
+    return (True, 'ok')
+
+
+def get_add_score_threshold(cur):
+    '''Get minimum score for ADD orders.'''
+    limits = _load_safety_limits(cur)
+    return limits['add_score_threshold']
+
+
+def get_add_slice_pct():
+    '''Get ADD slice percentage (fixed 10%).'''
+    return STAGE_SLICE_PCT
+
+
+def get_add_slice_usdt(cur):
+    '''Get ADD slice amount in USDT.'''
+    limits = _load_safety_limits(cur)
+    return limits['capital_limit_usdt'] * STAGE_SLICE_PCT / 100
+
+
+def compute_start_stage(score):
+    '''Compute start stage based on direction score (0-100).
+    Higher score -> higher start stage -> larger initial entry.'''
+    if score >= 85:
+        return 4
+    if score >= 75:
+        return 3
+    if score >= 65:
+        return 2
+    return 1
+
+
+def get_stage_entry_pct(start_stage):
+    '''Get entry percentage for a given start stage.'''
+    return start_stage * STAGE_SLICE_PCT
+
+
+def get_entry_usdt(cur, start_stage):
+    '''Get entry USDT amount for a given start stage.'''
+    limits = _load_safety_limits(cur)
+    pct = get_stage_entry_pct(start_stage)
+    return limits['capital_limit_usdt'] * pct / 100

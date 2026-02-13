@@ -1,0 +1,729 @@
+"""
+fill_watcher.py — Bybit order fill verification daemon
+
+Polls execution_log for SENT / PARTIALLY_FILLED orders every 5 seconds.
+For each order:
+  1. fetch_order() from Bybit -> verify actual fill status
+  2. Update execution_log with fill details
+  3. For EXIT/EMERGENCY: verify position=0 before declaring "정리 완료"
+  4. Send Telegram notifications based on verified facts only
+
+Statuses: SENT -> PARTIALLY_FILLED -> FILLED -> VERIFIED
+          or CANCELED / REJECTED / TIMEOUT
+"""
+import os
+import sys
+import time
+import json
+import datetime
+import traceback
+import urllib.parse
+import urllib.request
+import ccxt
+import psycopg2
+from dotenv import load_dotenv
+load_dotenv('/root/trading-bot/app/.env')
+
+POLL_SEC = 5
+ORDER_TIMEOUT_SEC = 60
+POSITION_VERIFY_DELAY_SEC = 2
+MAX_POLLS_PER_ORDER = 30
+SYMBOL = 'BTC/USDT:USDT'
+KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
+DB = dict(
+    host=os.getenv('DB_HOST', 'localhost'),
+    port=int(os.getenv('DB_PORT', '5432')),
+    dbname=os.getenv('DB_NAME', 'trading'),
+    user=os.getenv('DB_USER', 'bot'),
+    password=os.getenv('DB_PASS', 'botpass'),
+    connect_timeout=10,
+    options='-c statement_timeout=30000')
+ACTION_TBL = 'signals_action_v3'
+_TG_CONFIG = {}
+
+
+def log(msg):
+    print(f'[FILL_WATCHER] {msg}', flush=True)
+
+
+def db_conn():
+    return psycopg2.connect(**DB)
+
+
+def _exchange():
+    ex = ccxt.bybit({
+        'apiKey': os.getenv('BYBIT_API_KEY'),
+        'secret': os.getenv('BYBIT_SECRET'),
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}})
+    ex.load_markets()
+    return ex
+
+
+def _load_tg_config():
+    if _TG_CONFIG:
+        return _TG_CONFIG
+    env_path = '/root/trading-bot/app/telegram_cmd.env'
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    _TG_CONFIG[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return _TG_CONFIG
+
+
+def _send_telegram(text=None):
+    cfg = _load_tg_config()
+    token = cfg.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
+    if not token or not chat_id:
+        return None
+    try:
+        url = f'https://api.telegram.org/bot{token}/sendMessage'
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id,
+            'text': text,
+            'disable_web_page_preview': 'true'}).encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_position(ex):
+    '''Returns (side, qty) for SYMBOL. side=None if no position.'''
+    positions = ex.fetch_positions([SYMBOL])
+    for p in positions:
+        if p.get('symbol') != SYMBOL:
+            continue
+        contracts = float(p.get('contracts') or 0)
+        side = p.get('side')
+        if contracts == 0:
+            continue
+        if side not in ('long', 'short'):
+            continue
+        return (side, contracts)
+    return (None, 0)
+
+
+def _update_stage(cur, sig_id, stage):
+    if not sig_id:
+        return None
+    cur.execute(f'UPDATE {ACTION_TBL} SET stage = %s WHERE id = %s;', (stage, sig_id))
+
+
+def _update_trade_process_log(cur, sig_id, **kwargs):
+    if not sig_id:
+        return None
+    sets = []
+    vals = []
+    for k, v in kwargs.items():
+        sets.append(f'{k} = %s')
+        vals.append(v)
+    if not sets:
+        return None
+    vals.append(sig_id)
+    cur.execute(f"UPDATE trade_process_log SET {', '.join(sets)} WHERE signal_id = %s;", vals)
+
+
+def _poll_cycle(ex):
+    conn = db_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, order_id, order_type, direction, signal_id, decision_id,
+                       close_reason, requested_qty, ticker_price, status,
+                       order_sent_at, poll_count, symbol, source_queue, execution_queue_id
+                FROM execution_log
+                WHERE status IN ('SENT', 'PARTIALLY_FILLED')
+                ORDER BY id ASC;
+            """)
+            rows = cur.fetchall()
+            if not rows:
+                return
+            for row in rows:
+                try:
+                    _process_order(ex, cur, row)
+                except Exception:
+                    traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _process_order(ex, cur, row):
+    (eid, order_id, order_type, direction, signal_id, decision_id,
+     close_reason, requested_qty, ticker_price, status,
+     order_sent_at, poll_count, symbol, source_queue, execution_queue_id) = row
+
+    poll_count = (poll_count or 0) + 1
+    cur.execute("""
+        UPDATE execution_log SET poll_count = %s, last_poll_at = now() WHERE id = %s;
+    """, (poll_count, eid))
+
+    if poll_count > MAX_POLLS_PER_ORDER:
+        _handle_timeout(cur, eid, order_id, order_type, direction, signal_id)
+        return None
+
+    sym = symbol or SYMBOL
+    elapsed = time.time() - order_sent_at.timestamp() if order_sent_at else 999
+
+    fetched = None
+    try:
+        fetched = ex.fetch_closed_order(order_id, sym)
+    except Exception:
+        try:
+            fetched = ex.fetch_order(order_id, sym)
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    if fetched is None:
+        return None
+
+    fx_status = fetched.get('status', '')
+    filled_qty = float(fetched.get('filled', 0) or 0)
+    avg_price = float(fetched.get('average', 0) or 0)
+    fee_info = fetched.get('fee', {}) or {}
+    fee_cost = float(fee_info.get('cost', 0) or 0)
+    fee_currency = fee_info.get('currency', '')
+
+    # Update raw response
+    cur.execute("""
+        UPDATE execution_log SET raw_fetch_response = %s::jsonb WHERE id = %s;
+    """, (json.dumps(fetched, default=str)[:5000], eid))
+
+    if fx_status == 'canceled':
+        _handle_canceled(cur, eid, order_id, order_type, direction, signal_id)
+        if execution_queue_id:
+            _update_eq_status(cur, execution_queue_id, 'CANCELED')
+        return None
+
+    if fx_status in ('closed', 'filled') or (filled_qty > 0 and fx_status != 'open'):
+        # Order filled
+        cur.execute("""
+            UPDATE execution_log SET
+                status = 'FILLED', filled_qty = %s, avg_fill_price = %s,
+                fee = %s, fee_currency = %s,
+                first_fill_at = COALESCE(first_fill_at, now()),
+                last_fill_at = now()
+            WHERE id = %s;
+        """, (filled_qty, avg_price, fee_cost, fee_currency, eid))
+
+        if execution_queue_id:
+            _update_eq_status(cur, execution_queue_id, 'FILLED')
+
+        # Route to appropriate handler
+        if order_type in ('ENTRY', 'OPEN'):
+            _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
+                                 filled_qty, avg_price, fee_cost, fee_currency)
+        elif order_type in ('EXIT', 'CLOSE', 'EMERGENCY_CLOSE', 'STOP_LOSS'):
+            _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
+                                signal_id, decision_id, close_reason,
+                                filled_qty, avg_price, fee_cost, fee_currency)
+        elif order_type == 'ADD':
+            _handle_add_filled(ex, cur, eid, order_id, direction,
+                               filled_qty, avg_price, fee_cost, fee_currency,
+                               execution_queue_id)
+        elif order_type == 'REDUCE':
+            _handle_reduce_filled(ex, cur, eid, order_id, direction,
+                                  filled_qty, avg_price, fee_cost, fee_currency,
+                                  close_reason, execution_queue_id)
+        elif order_type == 'REVERSE_CLOSE':
+            _handle_reverse_close_filled(ex, cur, eid, order_id, direction,
+                                         filled_qty, avg_price, fee_cost, fee_currency,
+                                         close_reason, signal_id, decision_id,
+                                         execution_queue_id)
+        elif order_type == 'REVERSE_OPEN':
+            _handle_reverse_open_filled(ex, cur, eid, order_id, direction,
+                                        filled_qty, avg_price, fee_cost, fee_currency,
+                                        execution_queue_id)
+
+    elif fx_status == 'open' and filled_qty > 0:
+        cur.execute("""
+            UPDATE execution_log SET
+                status = 'PARTIALLY_FILLED', filled_qty = %s, avg_fill_price = %s,
+                first_fill_at = COALESCE(first_fill_at, now())
+            WHERE id = %s;
+        """, (filled_qty, avg_price, eid))
+
+    elif elapsed > ORDER_TIMEOUT_SEC:
+        _handle_timeout(cur, eid, order_id, order_type, direction, signal_id)
+        if execution_queue_id:
+            _update_eq_status(cur, execution_queue_id, 'TIMEOUT')
+
+
+def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
+                          filled_qty, avg_price, fee_cost, fee_currency):
+    '''Entry order filled -> update stage + verify position + set budget.'''
+    _update_stage(cur, signal_id, 'ORDER_FILLED')
+    _update_trade_process_log(cur, signal_id,
+                               order_fill_time=datetime.datetime.now(datetime.timezone.utc),
+                               fill_price=avg_price)
+    time.sleep(POSITION_VERIFY_DELAY_SEC)
+    (pos_side, pos_qty) = _fetch_position(ex)
+    cur.execute("""
+        UPDATE execution_log SET
+            status = 'VERIFIED',
+            position_after_side = %s, position_after_qty = %s,
+            position_verified = true, verified_at = now()
+        WHERE id = %s;
+    """, (pos_side, pos_qty, eid))
+
+    start_stage = 1
+    entry_pct = 10
+    if signal_id:
+        cur.execute(f"""
+                SELECT meta FROM {ACTION_TBL} WHERE id = %s;
+            """, (signal_id,))
+        meta_row = cur.fetchone()
+        if meta_row and meta_row[0]:
+            meta = meta_row[0] if isinstance(meta_row[0], dict) else json.loads(meta_row[0])
+            start_stage = int(meta.get('start_stage', 0)) or 1
+            entry_pct = float(meta.get('entry_pct', 0)) or start_stage * 10
+
+    capital_used = avg_price * filled_qty
+    consumed_mask = sum(1 << (s - 1) for s in range(1, start_stage + 1))
+    next_stage = start_stage + 1 if start_stage < 7 else 7
+    cur.execute("""
+            INSERT INTO position_state
+                (symbol, side, total_qty, avg_entry_price, stage, capital_used_usdt,
+                 start_stage_used, trade_budget_used_pct, next_stage_available,
+                 stage_consumed_mask, stages_detail)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (symbol) DO UPDATE SET
+                side = EXCLUDED.side, total_qty = EXCLUDED.total_qty,
+                avg_entry_price = EXCLUDED.avg_entry_price,
+                stage = EXCLUDED.stage, capital_used_usdt = EXCLUDED.capital_used_usdt,
+                start_stage_used = EXCLUDED.start_stage_used,
+                trade_budget_used_pct = EXCLUDED.trade_budget_used_pct,
+                next_stage_available = EXCLUDED.next_stage_available,
+                stage_consumed_mask = EXCLUDED.stage_consumed_mask,
+                stages_detail = EXCLUDED.stages_detail,
+                updated_at = now();
+        """, (SYMBOL, pos_side, pos_qty, avg_price, start_stage, capital_used,
+              start_stage, entry_pct, next_stage, consumed_mask,
+              json.dumps([{
+                  'stage': start_stage,
+                  'price': avg_price,
+                  'qty': filled_qty,
+                  'pct': entry_pct}])))
+    _update_trade_process_log(cur, signal_id, trade_budget_used_after=entry_pct)
+
+    pos_str = f'{pos_side} {pos_qty}' if pos_side else 'NONE'
+    sig_str = str(signal_id) if signal_id else 'N/A'
+    msg = (
+        f'[진입 체결 완료]\n'
+        f'- side: {direction}\n'
+        f'- 체결가: ${avg_price:,.1f}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
+        f'- signal_id: {sig_str}\n'
+        f'- start_stage: {start_stage} ({entry_pct:.0f}%)\n'
+        f'- 남은 budget: {70 - entry_pct:.0f}% (stage{next_stage}~7)\n'
+        f'- 포지션 확인: {pos_str}\n'
+        f'- verification: order_filled\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'ENTRY VERIFIED: {direction} qty={filled_qty} price={avg_price} signal={signal_id} start_stage={start_stage}')
+
+
+def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
+                         signal_id, decision_id, close_reason,
+                         filled_qty, avg_price, fee_cost, fee_currency):
+    '''Exit/emergency order filled -> verify position=0 + PnL.'''
+    time.sleep(POSITION_VERIFY_DELAY_SEC)
+    (pos_side, pos_qty) = _fetch_position(ex)
+    position_verified = pos_qty < 1e-09
+    realized_pnl = None
+    entry_price = None
+
+    if signal_id:
+        cur.execute("""
+                SELECT fill_price FROM trade_process_log
+                WHERE signal_id = %s AND fill_price IS NOT NULL
+                ORDER BY id DESC LIMIT 1;
+            """, (signal_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            entry_price = float(row[0])
+
+    if entry_price is None:
+        cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+        row = cur.fetchone()
+        if row and row[0]:
+            entry_price = float(row[0])
+
+    if entry_price and entry_price > 0:
+        dir_sign = 1 if direction in ('LONG', 'long') else -1
+        realized_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+
+    cur.execute("""
+        UPDATE execution_log SET
+            status = 'VERIFIED',
+            position_after_side = %s, position_after_qty = %s,
+            position_verified = %s, verified_at = now(),
+            realized_pnl = %s
+        WHERE id = %s;
+    """, (pos_side, pos_qty, position_verified, realized_pnl, eid))
+
+    if position_verified:
+        _sync_position_state(cur, None, 0)
+
+    pnl_str = f'{realized_pnl:+.2f} USDT' if realized_pnl is not None else 'N/A'
+    pos_str = f'{pos_side} {pos_qty}' if pos_side else 'NONE'
+    msg = (
+        f'[정리 체결 완료]\n'
+        f'- type: {order_type} {direction}\n'
+        f'- 체결가: ${avg_price:,.1f}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
+        f'- PnL: {pnl_str}\n'
+        f'- 포지션 확인: {pos_str}\n'
+        f'- close_reason: {close_reason}\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'EXIT VERIFIED: {order_type} {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
+
+
+def _handle_timeout(cur, eid, order_id, order_type, direction, signal_id):
+    '''Order not filled within timeout.'''
+    cur.execute("""
+        UPDATE execution_log SET status = 'TIMEOUT', error_detail = 'order_timeout'
+        WHERE id = %s;
+    """, (eid,))
+    _update_stage(cur, signal_id, 'ORDER_TIMEOUT')
+    msg = (
+        f'[주문 미체결 타임아웃]\n'
+        f'- order_type: {order_type} {direction}\n'
+        f'- order_id: {order_id}\n'
+        f'- {ORDER_TIMEOUT_SEC}초 내 체결 안 됨. 수동 확인 필요.\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'TIMEOUT: {order_type} {direction} order_id={order_id}')
+
+
+def _handle_canceled(cur, eid, order_id, order_type, direction, signal_id):
+    '''Order canceled by exchange.'''
+    cur.execute("""
+        UPDATE execution_log SET status = 'CANCELED', error_detail = 'exchange_canceled'
+        WHERE id = %s;
+    """, (eid,))
+    _update_stage(cur, signal_id, 'ORDER_CANCELED')
+    msg = (
+        f'[주문 취소됨]\n'
+        f'- order_type: {order_type} {direction}\n'
+        f'- order_id: {order_id}\n'
+        f'- 거래소에서 취소됨. 수동 확인 필요.\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'CANCELED: {order_type} {direction} order_id={order_id}')
+
+
+def _update_eq_status(cur, eq_id, status):
+    '''Update execution_queue status.'''
+    if not eq_id:
+        return None
+    cur.execute('UPDATE execution_queue SET status = %s WHERE id = %s;', (status, eq_id))
+
+
+def _sync_position_state(cur, pos_side, pos_qty, avg_price=None, stage_delta=0, capital_delta=0):
+    '''Sync position_state table after fill.'''
+    symbol = SYMBOL
+    cur.execute(
+        'SELECT stage, capital_used_usdt, avg_entry_price, stages_detail FROM position_state WHERE symbol = %s;',
+        (symbol,))
+    row = cur.fetchone()
+    if not row:
+        if pos_side and pos_qty > 0:
+            cur.execute("""
+                INSERT INTO position_state (symbol, side, total_qty, avg_entry_price, stage, capital_used_usdt)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol) DO UPDATE SET
+                    side = EXCLUDED.side, total_qty = EXCLUDED.total_qty,
+                    avg_entry_price = EXCLUDED.avg_entry_price,
+                    stage = EXCLUDED.stage, capital_used_usdt = EXCLUDED.capital_used_usdt,
+                    updated_at = now();
+            """, (symbol, pos_side, pos_qty, avg_price or 0, max(1, stage_delta), max(0, capital_delta)))
+        return
+
+    old_stage = int(row[0]) if row[0] else 0
+    old_capital = float(row[1]) if row[1] else 0
+
+    new_stage = max(0, old_stage + stage_delta)
+    new_capital = max(0, old_capital + capital_delta)
+
+    if pos_side is None or pos_qty == 0:
+        # Position closed
+        cur.execute("""
+            UPDATE position_state SET
+                side = NULL, total_qty = 0, stage = 0,
+                capital_used_usdt = 0, trade_budget_used_pct = 0,
+                stage_consumed_mask = 0, updated_at = now()
+            WHERE symbol = %s;
+        """, (symbol,))
+    else:
+        updates = ['side = %s', 'total_qty = %s', 'updated_at = now()']
+        vals = [pos_side, pos_qty]
+        if avg_price is not None:
+            updates.append('avg_entry_price = %s')
+            vals.append(avg_price)
+        if stage_delta != 0:
+            updates.append('stage = %s')
+            vals.append(new_stage)
+        if capital_delta != 0:
+            updates.append('capital_used_usdt = %s')
+            vals.append(new_capital)
+        vals.append(symbol)
+        cur.execute(f"UPDATE position_state SET {', '.join(updates)} WHERE symbol = %s;", vals)
+
+
+def _handle_add_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
+                        fee_cost, fee_currency, execution_queue_id):
+    '''ADD order filled -> update position_state with budget tracking + Telegram.'''
+    time.sleep(POSITION_VERIFY_DELAY_SEC)
+    (pos_side, pos_qty) = _fetch_position(ex)
+    cur.execute("""
+        UPDATE execution_log SET
+            status = 'VERIFIED',
+            position_after_side = %s, position_after_qty = %s,
+            position_verified = true, verified_at = now()
+        WHERE id = %s;
+    """, (pos_side, pos_qty, eid))
+
+    new_stage = '?'
+    budget_used_pct = 0
+    budget_remaining = 70
+
+    cur.execute("""
+            SELECT avg_entry_price, total_qty, stage,
+                   trade_budget_used_pct, next_stage_available, stage_consumed_mask
+            FROM position_state WHERE symbol = %s;
+        """, (SYMBOL,))
+    row = cur.fetchone()
+    old_avg = float(row[0]) if row and row[0] else avg_price
+    old_qty = float(row[1]) if row and row[1] else 0
+    old_stage = int(row[2]) if row and row[2] else 0
+    old_budget_pct = float(row[3]) if row and row[3] else 0
+    old_next_stage = int(row[4]) if row and row[4] else old_stage + 1
+    old_mask = int(row[5]) if row and row[5] else 0
+
+    total_qty = old_qty + filled_qty
+    new_avg = (old_avg * old_qty + avg_price * filled_qty) / total_qty if total_qty > 0 else avg_price
+    capital_delta = avg_price * filled_qty
+    new_stage = old_stage + 1
+    add_slice_pct = 10
+    budget_used_pct = min(old_budget_pct + add_slice_pct, 70)
+    budget_remaining = 70 - budget_used_pct
+    new_mask = old_mask | (1 << (new_stage - 1))
+    next_avail = new_stage + 1 if new_stage < 7 else 7
+
+    _sync_position_state(cur, pos_side, pos_qty, avg_price=new_avg,
+                          stage_delta=1, capital_delta=capital_delta)
+    cur.execute("""
+            UPDATE position_state SET
+                trade_budget_used_pct = %s,
+                next_stage_available = %s,
+                stage_consumed_mask = %s
+            WHERE symbol = %s;
+        """, (budget_used_pct, next_avail, new_mask, SYMBOL))
+
+    msg = (
+        f'[추가 진입 체결] - {direction} ADD (stage {new_stage}/7)\n'
+        f'- 체결가: ${avg_price:,.1f}\n'
+        f'- 추가: {filled_qty} BTC\n'
+        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
+        f'- 총 포지션: {pos_side} {pos_qty} BTC\n'
+        f'- budget: {budget_used_pct:.0f}%/70% (잔여 {budget_remaining:.0f}%)\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'ADD VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={new_stage} budget={budget_used_pct:.0f}%')
+
+
+def _handle_reduce_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
+                           fee_cost, fee_currency, close_reason, execution_queue_id):
+    '''REDUCE order filled -> calc partial PnL + Telegram.'''
+    time.sleep(POSITION_VERIFY_DELAY_SEC)
+    (pos_side, pos_qty) = _fetch_position(ex)
+    realized_pnl = None
+    cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    row = cur.fetchone()
+    entry_price = float(row[0]) if row and row[0] else None
+    if entry_price:
+        dir_sign = 1 if direction in ('LONG', 'long') else -1
+        realized_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+
+    cur.execute("""
+        UPDATE execution_log SET
+            status = 'VERIFIED',
+            position_after_side = %s, position_after_qty = %s,
+            position_verified = true, verified_at = now(),
+            realized_pnl = %s
+        WHERE id = %s;
+    """, (pos_side, pos_qty, realized_pnl, eid))
+
+    capital_delta = -(avg_price * filled_qty)
+    _sync_position_state(cur, pos_side, pos_qty, capital_delta=capital_delta)
+
+    pnl_str = f'{realized_pnl:+.2f} USDT' if realized_pnl is not None else 'N/A'
+    msg = (
+        f'[부분 축소 체결]\n'
+        f'- {direction} REDUCE\n'
+        f'- 체결가: ${avg_price:,.1f}\n'
+        f'- 축소: {filled_qty} BTC\n'
+        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
+        f'- PnL: {pnl_str}\n'
+        f'- 남은 포지션: {pos_side} {pos_qty} BTC\n'
+        f'- reason: {close_reason}\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'REDUCE VERIFIED: {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
+
+
+def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
+                                   fee_cost, fee_currency, close_reason, signal_id,
+                                   decision_id, execution_queue_id):
+    '''REVERSE_CLOSE filled -> verify position=0 + PnL.'''
+    time.sleep(POSITION_VERIFY_DELAY_SEC)
+    (pos_side, pos_qty) = _fetch_position(ex)
+    position_verified = pos_qty < 1e-09
+    realized_pnl = None
+
+    cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    row = cur.fetchone()
+    entry_price = float(row[0]) if row and row[0] else None
+
+    if not entry_price and signal_id:
+        cur.execute("""
+                SELECT fill_price FROM trade_process_log
+                WHERE signal_id = %s AND fill_price IS NOT NULL
+                ORDER BY id DESC LIMIT 1;
+            """, (signal_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            entry_price = float(row[0])
+
+    if entry_price and entry_price > 0:
+        dir_sign = 1 if direction in ('LONG', 'long') else -1
+        realized_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+
+    cur.execute("""
+        UPDATE execution_log SET
+            status = 'VERIFIED',
+            position_after_side = %s, position_after_qty = %s,
+            position_verified = %s, verified_at = now(),
+            realized_pnl = %s
+        WHERE id = %s;
+    """, (pos_side, pos_qty, position_verified, realized_pnl, eid))
+
+    _sync_position_state(cur, None, 0)
+
+    pnl_str = f'{realized_pnl:+.2f} USDT' if realized_pnl is not None else 'N/A'
+    msg = (
+        f'[리버스 정리 완료]\n'
+        f'- {direction} REVERSE_CLOSE\n'
+        f'- 체결가: ${avg_price:,.1f}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- PnL: {pnl_str}\n'
+        f'- 포지션 확인: {"NONE" if position_verified else f"{pos_side} {pos_qty}"}\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'REVERSE_CLOSE VERIFIED: {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
+
+
+def _handle_reverse_open_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
+                                  fee_cost, fee_currency, execution_queue_id):
+    '''REVERSE_OPEN filled -> reset position_state with budget tracking + Telegram.'''
+    time.sleep(POSITION_VERIFY_DELAY_SEC)
+    (pos_side, pos_qty) = _fetch_position(ex)
+    cur.execute("""
+        UPDATE execution_log SET
+            status = 'VERIFIED',
+            position_after_side = %s, position_after_qty = %s,
+            position_verified = true, verified_at = now()
+        WHERE id = %s;
+    """, (pos_side, pos_qty, eid))
+
+    capital_used = avg_price * filled_qty
+    start_stage = 1
+    entry_pct = 10
+    consumed_mask = 1
+    next_stage = 2
+
+    cur.execute("""
+            INSERT INTO position_state
+                (symbol, side, total_qty, avg_entry_price, stage, capital_used_usdt,
+                 start_stage_used, trade_budget_used_pct, next_stage_available,
+                 stage_consumed_mask, stages_detail)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (symbol) DO UPDATE SET
+                side = EXCLUDED.side, total_qty = EXCLUDED.total_qty,
+                avg_entry_price = EXCLUDED.avg_entry_price,
+                stage = EXCLUDED.stage, capital_used_usdt = EXCLUDED.capital_used_usdt,
+                start_stage_used = EXCLUDED.start_stage_used,
+                trade_budget_used_pct = EXCLUDED.trade_budget_used_pct,
+                next_stage_available = EXCLUDED.next_stage_available,
+                stage_consumed_mask = EXCLUDED.stage_consumed_mask,
+                stages_detail = EXCLUDED.stages_detail, updated_at = now();
+        """, (SYMBOL, pos_side, pos_qty, avg_price, start_stage, capital_used,
+              start_stage, entry_pct, next_stage, consumed_mask,
+              json.dumps([{
+                  'stage': 1,
+                  'price': avg_price,
+                  'qty': filled_qty,
+                  'pct': entry_pct}])))
+
+    from_side = 'SHORT' if direction in ('LONG', 'long') else 'LONG'
+    msg = (
+        f'[리버스 진입 완료] - {from_side} -> {direction.upper()}\n'
+        f'- 체결가: ${avg_price:,.1f}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 포지션: {pos_side} {pos_qty} BTC\n'
+        f'- budget: {entry_pct:.0f}%/70% (stage{start_stage}, 잔여 {70 - entry_pct:.0f}%)\n'
+        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    _send_telegram(msg)
+    log(f'REVERSE_OPEN VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={start_stage}')
+
+
+def main():
+    log('=== FILL WATCHER START ===')
+    ex = _exchange()
+    log(f'exchange connected, watching {SYMBOL}')
+
+    # Ensure tables
+    try:
+        conn = db_conn()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            import db_migrations
+            db_migrations.ensure_execution_log(cur)
+            db_migrations.ensure_execution_log_pm_columns(cur)
+            db_migrations.ensure_position_state(cur)
+            db_migrations.ensure_position_state_budget_columns(cur)
+        conn.close()
+    except Exception:
+        traceback.print_exc()
+
+    while True:
+        try:
+            if os.path.exists(KILL_SWITCH_PATH):
+                log('KILL_SWITCH detected. Exiting.')
+                sys.exit(0)
+            _poll_cycle(ex)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(POLL_SEC)
+
+
+if __name__ == '__main__':
+    main()
