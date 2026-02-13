@@ -299,8 +299,8 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
             INSERT INTO position_state
                 (symbol, side, total_qty, avg_entry_price, stage, capital_used_usdt,
                  start_stage_used, trade_budget_used_pct, next_stage_available,
-                 stage_consumed_mask, stages_detail)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                 stage_consumed_mask, stages_detail, accumulated_entry_fee)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
             ON CONFLICT (symbol) DO UPDATE SET
                 side = EXCLUDED.side, total_qty = EXCLUDED.total_qty,
                 avg_entry_price = EXCLUDED.avg_entry_price,
@@ -310,6 +310,7 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
                 next_stage_available = EXCLUDED.next_stage_available,
                 stage_consumed_mask = EXCLUDED.stage_consumed_mask,
                 stages_detail = EXCLUDED.stages_detail,
+                accumulated_entry_fee = EXCLUDED.accumulated_entry_fee,
                 updated_at = now();
         """, (SYMBOL, pos_side, pos_qty, avg_price, start_stage, capital_used,
               start_stage, entry_pct, next_stage, consumed_mask,
@@ -317,7 +318,8 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
                   'stage': start_stage,
                   'price': avg_price,
                   'qty': filled_qty,
-                  'pct': entry_pct}])))
+                  'pct': entry_pct}]),
+              abs(fee_cost)))
     _update_trade_process_log(cur, signal_id, trade_budget_used_after=entry_pct)
 
     pos_str = f'{pos_side} {pos_qty}' if pos_side else 'NONE'
@@ -359,14 +361,20 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
             entry_price = float(row[0])
 
     if entry_price is None:
-        cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+        cur.execute('SELECT avg_entry_price, accumulated_entry_fee FROM position_state WHERE symbol = %s;', (SYMBOL,))
         row = cur.fetchone()
         if row and row[0]:
             entry_price = float(row[0])
+        acc_entry_fee = float(row[1]) if row and row[1] else 0.0
+    else:
+        cur.execute('SELECT accumulated_entry_fee FROM position_state WHERE symbol = %s;', (SYMBOL,))
+        row = cur.fetchone()
+        acc_entry_fee = float(row[0]) if row and row[0] else 0.0
 
     if entry_price and entry_price > 0:
         dir_sign = 1 if direction in ('LONG', 'long') else -1
-        realized_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+        gross_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+        realized_pnl = gross_pnl - abs(fee_cost) - acc_entry_fee
 
     cur.execute("""
         UPDATE execution_log SET
@@ -380,7 +388,11 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
     if position_verified:
         _sync_position_state(cur, None, 0)
 
-    pnl_str = f'{realized_pnl:+.2f} USDT' if realized_pnl is not None else 'N/A'
+    # Backfill pnl_after_trade in trade_process_log for the originating signal
+    if realized_pnl is not None and signal_id:
+        _update_trade_process_log(cur, signal_id, pnl_after_trade=realized_pnl)
+
+    pnl_str = f'{realized_pnl:+.4f} USDT (net)' if realized_pnl is not None else 'N/A'
     pos_str = f'{pos_side} {pos_qty}' if pos_side else 'NONE'
     msg = (
         f'[정리 체결 완료]\n'
@@ -469,7 +481,8 @@ def _sync_position_state(cur, pos_side, pos_qty, avg_price=None, stage_delta=0, 
             UPDATE position_state SET
                 side = NULL, total_qty = 0, stage = 0,
                 capital_used_usdt = 0, trade_budget_used_pct = 0,
-                stage_consumed_mask = 0, updated_at = now()
+                stage_consumed_mask = 0, accumulated_entry_fee = 0,
+                updated_at = now()
             WHERE symbol = %s;
         """, (symbol,))
     else:
@@ -534,9 +547,10 @@ def _handle_add_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
             UPDATE position_state SET
                 trade_budget_used_pct = %s,
                 next_stage_available = %s,
-                stage_consumed_mask = %s
+                stage_consumed_mask = %s,
+                accumulated_entry_fee = COALESCE(accumulated_entry_fee, 0) + %s
             WHERE symbol = %s;
-        """, (budget_used_pct, next_avail, new_mask, SYMBOL))
+        """, (budget_used_pct, next_avail, new_mask, abs(fee_cost), SYMBOL))
 
     msg = (
         f'[추가 진입 체결] - {direction} ADD (stage {new_stage}/7)\n'
@@ -556,12 +570,18 @@ def _handle_reduce_filled(ex, cur, eid, order_id, direction, filled_qty, avg_pri
     time.sleep(POSITION_VERIFY_DELAY_SEC)
     (pos_side, pos_qty) = _fetch_position(ex)
     realized_pnl = None
-    cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    cur.execute('SELECT avg_entry_price, total_qty, accumulated_entry_fee FROM position_state WHERE symbol = %s;', (SYMBOL,))
     row = cur.fetchone()
     entry_price = float(row[0]) if row and row[0] else None
-    if entry_price:
+    total_qty_before = float(row[1]) if row and row[1] else 0.0
+    acc_entry_fee = float(row[2]) if row and row[2] else 0.0
+
+    proportional_entry_fee = 0.0
+    if entry_price and total_qty_before > 0:
         dir_sign = 1 if direction in ('LONG', 'long') else -1
-        realized_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+        gross_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+        proportional_entry_fee = acc_entry_fee * (filled_qty / total_qty_before)
+        realized_pnl = gross_pnl - abs(fee_cost) - proportional_entry_fee
 
     cur.execute("""
         UPDATE execution_log SET
@@ -575,7 +595,12 @@ def _handle_reduce_filled(ex, cur, eid, order_id, direction, filled_qty, avg_pri
     capital_delta = -(avg_price * filled_qty)
     _sync_position_state(cur, pos_side, pos_qty, capital_delta=capital_delta)
 
-    pnl_str = f'{realized_pnl:+.2f} USDT' if realized_pnl is not None else 'N/A'
+    # Deduct proportional entry fee from accumulated total
+    remaining_fee = max(0, acc_entry_fee - proportional_entry_fee)
+    cur.execute('UPDATE position_state SET accumulated_entry_fee = %s WHERE symbol = %s;',
+                (remaining_fee, SYMBOL))
+
+    pnl_str = f'{realized_pnl:+.4f} USDT (net)' if realized_pnl is not None else 'N/A'
     msg = (
         f'[부분 축소 체결]\n'
         f'- {direction} REDUCE\n'
@@ -599,9 +624,10 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
     position_verified = pos_qty < 1e-09
     realized_pnl = None
 
-    cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    cur.execute('SELECT avg_entry_price, accumulated_entry_fee FROM position_state WHERE symbol = %s;', (SYMBOL,))
     row = cur.fetchone()
     entry_price = float(row[0]) if row and row[0] else None
+    acc_entry_fee = float(row[1]) if row and row[1] else 0.0
 
     if not entry_price and signal_id:
         cur.execute("""
@@ -615,7 +641,8 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
 
     if entry_price and entry_price > 0:
         dir_sign = 1 if direction in ('LONG', 'long') else -1
-        realized_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+        gross_pnl = (avg_price - entry_price) * filled_qty * dir_sign
+        realized_pnl = gross_pnl - abs(fee_cost) - acc_entry_fee
 
     cur.execute("""
         UPDATE execution_log SET
@@ -628,7 +655,7 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
 
     _sync_position_state(cur, None, 0)
 
-    pnl_str = f'{realized_pnl:+.2f} USDT' if realized_pnl is not None else 'N/A'
+    pnl_str = f'{realized_pnl:+.4f} USDT (net)' if realized_pnl is not None else 'N/A'
     msg = (
         f'[리버스 정리 완료]\n'
         f'- {direction} REVERSE_CLOSE\n'
@@ -664,8 +691,8 @@ def _handle_reverse_open_filled(ex, cur, eid, order_id, direction, filled_qty, a
             INSERT INTO position_state
                 (symbol, side, total_qty, avg_entry_price, stage, capital_used_usdt,
                  start_stage_used, trade_budget_used_pct, next_stage_available,
-                 stage_consumed_mask, stages_detail)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                 stage_consumed_mask, stages_detail, accumulated_entry_fee)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
             ON CONFLICT (symbol) DO UPDATE SET
                 side = EXCLUDED.side, total_qty = EXCLUDED.total_qty,
                 avg_entry_price = EXCLUDED.avg_entry_price,
@@ -674,14 +701,17 @@ def _handle_reverse_open_filled(ex, cur, eid, order_id, direction, filled_qty, a
                 trade_budget_used_pct = EXCLUDED.trade_budget_used_pct,
                 next_stage_available = EXCLUDED.next_stage_available,
                 stage_consumed_mask = EXCLUDED.stage_consumed_mask,
-                stages_detail = EXCLUDED.stages_detail, updated_at = now();
+                stages_detail = EXCLUDED.stages_detail,
+                accumulated_entry_fee = EXCLUDED.accumulated_entry_fee,
+                updated_at = now();
         """, (SYMBOL, pos_side, pos_qty, avg_price, start_stage, capital_used,
               start_stage, entry_pct, next_stage, consumed_mask,
               json.dumps([{
                   'stage': 1,
                   'price': avg_price,
                   'qty': filled_qty,
-                  'pct': entry_pct}])))
+                  'pct': entry_pct}]),
+              abs(fee_cost)))
 
     from_side = 'SHORT' if direction in ('LONG', 'long') else 'LONG'
     msg = (

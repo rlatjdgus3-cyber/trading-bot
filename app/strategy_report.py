@@ -88,8 +88,8 @@ def gather_data():
 
             # Indicator snapshot
             cur.execute("""
-                SELECT bb_upper, bb_mid, bb_lower,
-                       ichimoku_tenkan, ichimoku_kijun, volume_spike
+                SELECT bb_up, bb_mid, bb_dn,
+                       ich_tenkan, ich_kijun, vol_spike
                 FROM indicators
                 WHERE symbol = %s
                 ORDER BY ts DESC LIMIT 1;
@@ -177,7 +177,11 @@ def _local_only_report(data=None):
 
 
 def _gather_daily_performance():
-    '''Gather trade_process_log stats for today (KST).'''
+    '''Gather execution_log PnL stats for today (KST).
+
+    PnL source: execution_log.realized_pnl (populated by fill_watcher on CLOSE/REDUCE).
+    Covers order types: CLOSE, REDUCE, REVERSE_CLOSE, EXIT, EMERGENCY_CLOSE, STOP_LOSS.
+    '''
     conn = _db()
     data = {}
     try:
@@ -186,16 +190,18 @@ def _gather_daily_performance():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT COUNT(*),
-                       COUNT(*) FILTER (WHERE pnl > 0),
-                       COUNT(*) FILTER (WHERE pnl < 0),
-                       COUNT(*) FILTER (WHERE pnl = 0 OR pnl IS NULL),
-                       COALESCE(SUM(pnl), 0),
-                       COALESCE(AVG(pnl), 0),
-                       COALESCE(MAX(pnl), 0),
-                       COALESCE(MIN(pnl), 0)
-                FROM trade_process_log
-                WHERE action IN ('CLOSE', 'STOPLOSS')
-                  AND ts::date = %s::date;
+                       COUNT(*) FILTER (WHERE realized_pnl > 0),
+                       COUNT(*) FILTER (WHERE realized_pnl < 0),
+                       COUNT(*) FILTER (WHERE realized_pnl = 0 OR realized_pnl IS NULL),
+                       COALESCE(SUM(realized_pnl), 0),
+                       COALESCE(AVG(realized_pnl), 0),
+                       COALESCE(MAX(realized_pnl), 0),
+                       COALESCE(MIN(realized_pnl), 0)
+                FROM execution_log
+                WHERE order_type IN ('CLOSE', 'REDUCE', 'REVERSE_CLOSE',
+                                     'EXIT', 'EMERGENCY_CLOSE', 'STOP_LOSS')
+                  AND status IN ('FILLED', 'VERIFIED')
+                  AND (ts AT TIME ZONE 'Asia/Seoul')::date = %s::date;
             """, (today_kst,))
             row = cur.fetchone()
         if row:

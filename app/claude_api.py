@@ -5,9 +5,7 @@ Uses Anthropic API to analyze sudden market changes and recommend actions.
 Model: claude-sonnet-4-20250514 (~$0.01/call)
 Never raises exceptions — always returns a valid response dict.
 """
-import os
 import sys
-import time
 import json
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[claude_api]'
@@ -19,17 +17,32 @@ FALLBACK_RESPONSE = {
     'reason_bullets': ['API 호출 실패 — 보수적 축소 적용'],
     'ttl_seconds': 120}
 
+ABORT_RESPONSE = {
+    'risk_level': 'unknown',
+    'recommended_action': 'ABORT',
+    'reduce_pct': 0,
+    'confidence': 0,
+    'reason_bullets': ['REALTIME DATA NOT AVAILABLE -- STRATEGY ABORTED'],
+    'ttl_seconds': 0,
+    'aborted': True}
+
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
 
 
-def emergency_analysis(context_packet=None):
+def emergency_analysis(context_packet=None, snapshot=None):
     """Analyze emergency via Claude gate. Falls back on denial."""
+    if snapshot:
+        import market_snapshot
+        valid, reason = market_snapshot.validate_snapshot(snapshot)
+        if not valid:
+            return {**ABORT_RESPONSE, 'abort_reason': reason}
+
     ctx = context_packet or {}
     import claude_gate
     ctx_compact = claude_gate.compact_context(ctx)
-    prompt = _build_prompt(ctx_compact)
+    prompt = _build_prompt(ctx_compact, snapshot=snapshot)
 
     trigger = ctx.get('trigger', {})
     cooldown_key = trigger.get('type', 'unknown')
@@ -46,7 +59,8 @@ def emergency_analysis(context_packet=None):
     if result.get('fallback_used'):
         _log(f'gate denied: {result.get("gate_reason", "unknown")}')
         return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': 0,
-                'gate_reason': result.get('gate_reason', '')}
+                'gate_reason': result.get('gate_reason', ''),
+                'call_type': 'EMERGENCY'}
 
     parsed = _parse_response(result.get('text', ''))
     parsed['fallback_used'] = False
@@ -59,12 +73,26 @@ def emergency_analysis(context_packet=None):
     return parsed
 
 
-def _build_prompt(ctx=None):
+def _build_prompt(ctx=None, snapshot=None):
+    if ctx is None:
+        ctx = {}
     pos = ctx.get('position', {})
     ind = ctx.get('indicators', {})
     trigger = ctx.get('trigger', {})
     scores = ctx.get('scores', {})
     unified = ctx.get('unified_score') or scores.get('unified') or {}
+
+    # Override indicators from snapshot if available
+    if snapshot:
+        ind = {
+            'atr': snapshot.get('atr_14', ind.get('atr')),
+            'rsi': snapshot.get('rsi_14', ind.get('rsi')),
+            'kijun': snapshot.get('kijun', ind.get('kijun')),
+            'poc': snapshot.get('poc', ind.get('poc')),
+            'vah': snapshot.get('vah', ind.get('vah')),
+            'val': snapshot.get('val', ind.get('val')),
+        }
+        ctx['price'] = snapshot.get('price', ctx.get('price', 0))
 
     score_section = ''
     if unified:
@@ -112,6 +140,7 @@ def _build_prompt(ctx=None):
         f"## Recent News\n"
         f"{json.dumps(ctx.get('news', []), ensure_ascii=False)[:500]}\n\n"
         f"{_build_fact_section(ctx)}\n\n"
+        f"{_build_snapshot_section(snapshot)}"
         f"## Instructions\n"
         f"Respond with ONLY this JSON (no markdown, no explanation):\n"
         f'{{\n'
@@ -155,8 +184,94 @@ def _build_fact_section(ctx=None):
     return '\n'.join(lines)
 
 
+def _build_snapshot_section(snapshot=None):
+    """Build snapshot data section for the prompt."""
+    if not snapshot:
+        return ''
+    returns = snapshot.get('returns', {})
+    lines = [
+        '## Real-time Snapshot',
+        f"- Snapshot TS: {snapshot.get('snapshot_ts', 'N/A')}",
+        f"- Price: ${snapshot.get('price', 0):,.1f}",
+        f"- BB: upper=${snapshot.get('bb_upper', 0):,.0f} mid=${snapshot.get('bb_mid', 0):,.0f} lower=${snapshot.get('bb_lower', 0):,.0f}",
+        f"- Ichimoku: kijun=${snapshot.get('kijun', 0):,.0f} cloud={snapshot.get('cloud_position', 'N/A')}",
+        f"- RSI(14): {snapshot.get('rsi_14', 'N/A')}",
+        f"- ATR(14): {snapshot.get('atr_14', 'N/A')}",
+        f"- Volume ratio: {snapshot.get('vol_ratio', 'N/A')}",
+        f"- Returns: 1m={returns.get('ret_1m', 'N/A')}% 5m={returns.get('ret_5m', 'N/A')}% 15m={returns.get('ret_15m', 'N/A')}%",
+    ]
+    return '\n'.join(lines) + '\n\n'
+
+
+def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None):
+    """Event-trigger Claude analysis. gate=event_trigger (AUTO) or emergency (EMERGENCY)."""
+    # 1. Snapshot validation
+    import market_snapshot
+    valid, reason = market_snapshot.validate_snapshot(snapshot)
+    if not valid:
+        return {**ABORT_RESPONSE, 'abort_reason': reason}
+
+    ctx = context_packet or {}
+    import claude_gate
+
+    # 2. Build prompt with snapshot data
+    ctx_compact = claude_gate.compact_context(ctx)
+    prompt = _build_prompt(ctx_compact, snapshot=snapshot)
+
+    # Add event trigger info to prompt
+    if event_result:
+        trigger_lines = []
+        for t in (event_result.triggers if hasattr(event_result, 'triggers') else []):
+            trigger_lines.append(f"  - {t.get('type', '?')}: value={t.get('value', '?')} "
+                                 f"threshold={t.get('threshold', '?')}")
+        if trigger_lines:
+            prompt += f"\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
+
+    # 3. Gate selection: EMERGENCY → 'emergency', EVENT → 'event_trigger'
+    er_mode = event_result.mode if event_result else 'EVENT'
+    if er_mode == 'EMERGENCY':
+        gate = 'emergency'
+        call_type = 'EMERGENCY'
+    else:
+        gate = 'event_trigger'
+        call_type = 'AUTO'
+
+    cooldown_key = f'event_{er_mode.lower()}'
+    gate_context = {
+        'event_mode': er_mode,
+        'event_hash': event_result.event_hash if event_result else None,
+        'trigger_type': (event_result.triggers[0].get('type', '')
+                         if event_result and event_result.triggers else ''),
+        'is_emergency': er_mode == 'EMERGENCY',
+    }
+
+    # 4. Call Claude
+    result = claude_gate.call_claude(
+        gate=gate, prompt=prompt, cooldown_key=cooldown_key,
+        context=gate_context, max_tokens=800, call_type=call_type)
+
+    if result.get('fallback_used'):
+        _log(f'gate denied (event_trigger): {result.get("gate_reason", "unknown")}')
+        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': 0,
+                'gate_reason': result.get('gate_reason', ''),
+                'call_type': call_type}
+
+    parsed = _parse_response(result.get('text', ''))
+    parsed['fallback_used'] = False
+    parsed['api_latency_ms'] = result.get('api_latency_ms', 0)
+    parsed['input_tokens'] = result.get('input_tokens', 0)
+    parsed['output_tokens'] = result.get('output_tokens', 0)
+    parsed['estimated_cost_usd'] = result.get('estimated_cost_usd', 0)
+    parsed['gate_type'] = result.get('gate_type', gate)
+    parsed['model'] = result.get('model', '')
+    parsed['call_type'] = call_type
+    return parsed
+
+
 def _parse_response(raw=None):
     """Parse Claude's JSON response. Falls back on parse failure."""
+    if not raw:
+        return dict(FALLBACK_RESPONSE)
     try:
         text = raw.strip()
         if text.startswith('```'):
@@ -217,7 +332,8 @@ def score_change_analysis(context_packet=None):
     if result.get('fallback_used'):
         _log(f'gate denied (score_change): {result.get("gate_reason", "unknown")}')
         return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': 0,
-                'gate_reason': result.get('gate_reason', '')}
+                'gate_reason': result.get('gate_reason', ''),
+                'call_type': 'AUTO'}
 
     parsed = _parse_response(result.get('text', ''))
     parsed['fallback_used'] = False

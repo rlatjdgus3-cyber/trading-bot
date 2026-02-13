@@ -1,0 +1,332 @@
+"""
+event_trigger.py — Event detection engine.
+
+Snapshot-based event evaluation to decide if/how Claude should be called.
+Replaces the old stage-based routing (HOLD/ADD → GPT, CLOSE/REVERSE → Claude).
+
+Modes:
+  DEFAULT    — score_engine only, no AI call
+  EVENT      — anomaly detected → Claude (AUTO)
+  EMERGENCY  — critical condition → Claude forced
+  USER       — /force command → Claude forced
+"""
+import hashlib
+import json
+import sys
+import time
+
+sys.path.insert(0, '/root/trading-bot/app')
+
+LOG_PREFIX = '[event_trigger]'
+
+# ── modes ──────────────────────────────────────────────────
+MODE_DEFAULT = 'DEFAULT'
+MODE_EVENT = 'EVENT'
+MODE_EMERGENCY = 'EMERGENCY'
+MODE_USER = 'USER'
+
+# ── price spike thresholds (return %) ──────────────────────
+PRICE_SPIKE_1M_PCT = 0.8
+PRICE_SPIKE_5M_PCT = 1.8
+PRICE_SPIKE_15M_PCT = 3.0
+
+# ── volume spike ───────────────────────────────────────────
+VOL_SPIKE_RATIO = 2.0  # vol_last >= 2.0 * vol_ma20
+
+# ── level breaks (POC/VAH/VAL) ────────────────────────────
+POC_SHIFT_MIN_PCT = 0.5
+VAH_VAL_SUSTAIN_CANDLES = 3
+
+# ── regime change ──────────────────────────────────────────
+REGIME_SCORE_CHANGE_MIN = 15
+ATR_INCREASE_PCT = 30
+
+# ── emergency escalation ──────────────────────────────────
+EMERGENCY_5M_RET_PCT = 2.0
+EMERGENCY_LOSS_PCT = 2.0
+EMERGENCY_VOL_ZSCORE = 3.0
+
+# ── dedup ──────────────────────────────────────────────────
+AUTO_DEDUP_WINDOW_SEC = 300  # 5 min
+
+# ── priority ───────────────────────────────────────────────
+PRIORITY_EMERGENCY = 1
+PRIORITY_USER = 2
+PRIORITY_EVENT = 3
+PRIORITY_DEFAULT = 10
+
+
+def _log(msg):
+    print(f'{LOG_PREFIX} {msg}', flush=True)
+
+
+class EventResult:
+    """Result of event evaluation."""
+
+    __slots__ = ('mode', 'triggers', 'event_hash', 'priority',
+                 'call_type', 'should_call_claude')
+
+    def __init__(self, mode=MODE_DEFAULT, triggers=None, event_hash=None,
+                 priority=PRIORITY_DEFAULT, call_type='AUTO',
+                 should_call_claude=False):
+        self.mode = mode
+        self.triggers = triggers or []
+        self.event_hash = event_hash
+        self.priority = priority
+        self.call_type = call_type
+        self.should_call_claude = should_call_claude
+
+    def to_dict(self):
+        return {
+            'mode': self.mode,
+            'triggers': self.triggers,
+            'event_hash': self.event_hash,
+            'priority': self.priority,
+            'call_type': self.call_type,
+            'should_call_claude': self.should_call_claude,
+        }
+
+
+def evaluate(snapshot, prev_scores=None, position=None, cur=None) -> EventResult:
+    """Main evaluation entry point.
+
+    1. _check_emergency_escalation() → EMERGENCY → immediate return
+    2. _check_price_spikes()
+    3. _check_volume_spike()
+    4. _check_level_breaks()
+    5. _check_regime_change()
+    6. No triggers → DEFAULT
+    7. Has triggers → compute hash → EVENT
+    """
+    if not snapshot:
+        return EventResult()
+
+    # Phase 1: emergency escalation (highest priority)
+    emergency_triggers = _check_emergency_escalation(snapshot, position)
+    if emergency_triggers:
+        eh = compute_event_hash(emergency_triggers)
+        _log(f'EMERGENCY: triggers={[t["type"] for t in emergency_triggers]}')
+        return EventResult(
+            mode=MODE_EMERGENCY,
+            triggers=emergency_triggers,
+            event_hash=eh,
+            priority=PRIORITY_EMERGENCY,
+            call_type='EMERGENCY',
+            should_call_claude=True,
+        )
+
+    # Phase 2-5: event triggers
+    all_triggers = []
+    all_triggers.extend(_check_price_spikes(snapshot))
+    all_triggers.extend(_check_volume_spike(snapshot))
+    all_triggers.extend(_check_level_breaks(snapshot, cur))
+    all_triggers.extend(_check_regime_change(snapshot, prev_scores))
+
+    if not all_triggers:
+        return EventResult()  # DEFAULT
+
+    eh = compute_event_hash(all_triggers)
+    _log(f'EVENT: triggers={[t["type"] for t in all_triggers]} hash={eh[:12]}')
+    return EventResult(
+        mode=MODE_EVENT,
+        triggers=all_triggers,
+        event_hash=eh,
+        priority=PRIORITY_EVENT,
+        call_type='AUTO',
+        should_call_claude=True,
+    )
+
+
+def _check_price_spikes(snapshot) -> list:
+    """Check ret_1m/5m/15m against thresholds."""
+    triggers = []
+    returns = snapshot.get('returns', {})
+
+    ret_1m = returns.get('ret_1m')
+    if ret_1m is not None and abs(ret_1m) >= PRICE_SPIKE_1M_PCT:
+        triggers.append({
+            'type': 'price_spike_1m',
+            'value': ret_1m,
+            'threshold': PRICE_SPIKE_1M_PCT,
+            'direction': 'up' if ret_1m > 0 else 'down',
+        })
+
+    ret_5m = returns.get('ret_5m')
+    if ret_5m is not None and abs(ret_5m) >= PRICE_SPIKE_5M_PCT:
+        triggers.append({
+            'type': 'price_spike_5m',
+            'value': ret_5m,
+            'threshold': PRICE_SPIKE_5M_PCT,
+            'direction': 'up' if ret_5m > 0 else 'down',
+        })
+
+    ret_15m = returns.get('ret_15m')
+    if ret_15m is not None and abs(ret_15m) >= PRICE_SPIKE_15M_PCT:
+        triggers.append({
+            'type': 'price_spike_15m',
+            'value': ret_15m,
+            'threshold': PRICE_SPIKE_15M_PCT,
+            'direction': 'up' if ret_15m > 0 else 'down',
+        })
+
+    return triggers
+
+
+def _check_volume_spike(snapshot) -> list:
+    """Check vol_ratio against threshold."""
+    triggers = []
+    vol_ratio = snapshot.get('vol_ratio', 0)
+    if vol_ratio >= VOL_SPIKE_RATIO:
+        triggers.append({
+            'type': 'volume_spike',
+            'value': round(vol_ratio, 2),
+            'threshold': VOL_SPIKE_RATIO,
+        })
+    return triggers
+
+
+def _check_level_breaks(snapshot, cur=None) -> list:
+    """Check POC shift, VAH/VAL breach."""
+    triggers = []
+    price = snapshot.get('price', 0)
+    if not price:
+        return triggers
+
+    poc = snapshot.get('poc')
+    vah = snapshot.get('vah')
+    val = snapshot.get('val')
+
+    # POC shift: check if current price deviates from POC by more than threshold
+    if poc and poc > 0:
+        poc_dist_pct = abs(price - poc) / poc * 100
+        if poc_dist_pct >= POC_SHIFT_MIN_PCT:
+            triggers.append({
+                'type': 'poc_shift',
+                'value': round(poc_dist_pct, 2),
+                'threshold': POC_SHIFT_MIN_PCT,
+                'poc': poc,
+                'price': price,
+                'direction': 'above' if price > poc else 'below',
+            })
+
+    # VAH/VAL sustained break
+    candles = snapshot.get('candles_1m', [])
+    if vah and len(candles) >= VAH_VAL_SUSTAIN_CANDLES:
+        recent = candles[:VAH_VAL_SUSTAIN_CANDLES]
+        if all(c.get('c', 0) > vah for c in recent):
+            triggers.append({
+                'type': 'vah_break',
+                'value': price,
+                'vah': vah,
+                'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
+            })
+
+    if val and len(candles) >= VAH_VAL_SUSTAIN_CANDLES:
+        recent = candles[:VAH_VAL_SUSTAIN_CANDLES]
+        if all(c.get('c', 0) < val for c in recent):
+            triggers.append({
+                'type': 'val_break',
+                'value': price,
+                'val': val,
+                'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
+            })
+
+    return triggers
+
+
+def _check_regime_change(snapshot, prev_scores=None) -> list:
+    """Check regime score change and ATR increase."""
+    triggers = []
+
+    if prev_scores:
+        prev_regime = prev_scores.get('regime_score', 0)
+        # We can't get current regime from snapshot alone; caller passes prev_scores
+        # The actual current scores will be available in context
+        prev_total = prev_scores.get('total_score', 0)
+
+        # ATR increase check
+        prev_atr = prev_scores.get('atr_14') or prev_scores.get('atr')
+        curr_atr = snapshot.get('atr_14')
+        if prev_atr and curr_atr and prev_atr > 0:
+            atr_change_pct = (curr_atr - prev_atr) / prev_atr * 100
+            if atr_change_pct >= ATR_INCREASE_PCT:
+                triggers.append({
+                    'type': 'atr_increase',
+                    'value': round(atr_change_pct, 1),
+                    'threshold': ATR_INCREASE_PCT,
+                    'prev_atr': prev_atr,
+                    'curr_atr': curr_atr,
+                })
+
+    return triggers
+
+
+def _check_emergency_escalation(snapshot, position=None) -> list:
+    """Check for emergency-level conditions."""
+    triggers = []
+    returns = snapshot.get('returns', {})
+
+    # 5m return > ±2%
+    ret_5m = returns.get('ret_5m')
+    if ret_5m is not None and abs(ret_5m) >= EMERGENCY_5M_RET_PCT:
+        triggers.append({
+            'type': 'emergency_price_5m',
+            'value': ret_5m,
+            'threshold': EMERGENCY_5M_RET_PCT,
+            'direction': 'up' if ret_5m > 0 else 'down',
+        })
+
+    # Position loss > 2%
+    if position:
+        entry = position.get('entry_price', 0)
+        side = position.get('side', '')
+        price = snapshot.get('price', 0)
+        if entry and entry > 0 and price > 0 and side:
+            if side == 'long':
+                loss_pct = (entry - price) / entry * 100
+            else:
+                loss_pct = (price - entry) / entry * 100
+            if loss_pct >= EMERGENCY_LOSS_PCT:
+                triggers.append({
+                    'type': 'emergency_position_loss',
+                    'value': round(loss_pct, 2),
+                    'threshold': EMERGENCY_LOSS_PCT,
+                    'side': side,
+                })
+
+    # Volume z-score > 3 (approximated via vol_ratio)
+    vol_ratio = snapshot.get('vol_ratio', 0)
+    if vol_ratio >= EMERGENCY_VOL_ZSCORE:
+        triggers.append({
+            'type': 'emergency_volume',
+            'value': round(vol_ratio, 2),
+            'threshold': EMERGENCY_VOL_ZSCORE,
+        })
+
+    return triggers
+
+
+def compute_event_hash(triggers) -> str:
+    """Compute SHA256 hash of trigger types + directions for dedup."""
+    # Hash based on trigger types and their qualitative direction
+    key_parts = []
+    for t in sorted(triggers, key=lambda x: x.get('type', '')):
+        part = t.get('type', '')
+        direction = t.get('direction', '')
+        if direction:
+            part += f':{direction}'
+        key_parts.append(part)
+    raw = '|'.join(key_parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def check_dedup(event_hash, state) -> bool:
+    """Check if event_hash was seen within dedup window.
+    Returns True if duplicate (should skip), False if new.
+    """
+    if not event_hash:
+        return False
+    dedup_hashes = state.get('event_hashes', {})
+    last_seen = dedup_hashes.get(event_hash, 0)
+    now = time.time()
+    return (now - last_seen) < AUTO_DEDUP_WINDOW_SEC

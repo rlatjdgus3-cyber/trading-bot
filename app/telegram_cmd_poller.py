@@ -291,7 +291,8 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
         start_ms = int(time.time() * 1000)
         result = _call_gpt_advisory(prompt)
         elapsed = int(time.time() * 1000) - start_ms
-        meta = {'model': 'gpt-4o-mini', 'api_latency_ms': elapsed, 'fallback_used': False,
+        meta = {'model': 'gpt-4o-mini', 'model_provider': 'openai',
+                'api_latency_ms': elapsed, 'fallback_used': False,
                 'call_type': call_type}
         provider = 'gpt-4o-mini'
 
@@ -518,11 +519,19 @@ def _evaluate_strategy_action(scores, pos_state):
     return ('HOLD', 'no action needed', details)
 
 
-def _enqueue_strategy_action(cur, action, pos_state, scores, reason):
+def _enqueue_strategy_action(cur, action, pos_state, scores, reason, snapshot=None):
     """Insert action into execution_queue. source='strategy_intent'.
-    Returns eq_id or None (safety block).
+    Returns eq_id or None (safety block / snapshot validation fail).
     """
     import safety_manager
+
+    if snapshot:
+        import market_snapshot as _ms
+        ok, reason_msg = _ms.validate_execution_ready(
+            snapshot, scores.get('price', 0))
+        if not ok:
+            _log(f'execution validation failed: {reason_msg}')
+            return None
 
     side = (pos_state.get('side', '') or '').upper()
     meta = json.dumps({
@@ -721,6 +730,38 @@ def _fetch_strategy_context(cur):
     return ctx
 
 
+_exchange_cache = None
+
+def _get_exchange():
+    """Get cached ccxt Bybit exchange instance."""
+    global _exchange_cache
+    if _exchange_cache is not None:
+        return _exchange_cache
+    import ccxt
+    _exchange_cache = ccxt.bybit({
+        'apiKey': os.getenv('BYBIT_API_KEY'),
+        'secret': os.getenv('BYBIT_SECRET'),
+        'enableRateLimit': True,
+        'timeout': 20000,
+        'options': {'defaultType': 'swap'},
+    })
+    return _exchange_cache
+
+
+def _refresh_market_snapshot(cur):
+    """Thin wrapper around market_snapshot.build_snapshot() for backward compat.
+    Returns latest price (float) or None on error.
+    """
+    import market_snapshot as _ms
+    try:
+        ex = _get_exchange()
+        snap = _ms.build_snapshot(ex, cur, STRATEGY_SYMBOL)
+        return snap.get('price')
+    except Exception as e:
+        _log(f'snapshot: refresh error: {e}')
+        return None
+
+
 def _format_market_data(price, ctx):
     """Format enriched market data block for Claude strategy prompt."""
     lines = [f'BTC 현재가: ${price:,.1f}']
@@ -807,6 +848,16 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
         )
         conn.autocommit = True
         with conn.cursor() as cur:
+            # Phase 0: Real-time market snapshot
+            import market_snapshot as _ms
+            snapshot = None
+            try:
+                _ex = _get_exchange()
+                snapshot = _ms.build_and_validate(_ex, cur, STRATEGY_SYMBOL)
+                refresh_price = snapshot['price']
+            except _ms.SnapshotError as e:
+                return (f'REALTIME DATA NOT AVAILABLE -- STRATEGY ABORTED\n{e}', 'error')
+
             # Phase 1: Score evaluation + market context
             scores = score_engine.compute_total(cur=cur)
             pos_state = _fetch_position_state(cur)
@@ -820,7 +871,8 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             execute_status = 'NO'
             (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
             if auto_ok and action not in ('HOLD', 'ENTRY_POSSIBLE'):
-                eq_id = _enqueue_strategy_action(cur, action, pos_state, scores, reason)
+                eq_id = _enqueue_strategy_action(cur, action, pos_state, scores, reason,
+                                                 snapshot=snapshot)
                 if eq_id:
                     execute_status = f'YES (eq_id={eq_id})'
                 else:
@@ -945,37 +997,37 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                     ai_meta = {'model': 'error', 'api_latency_ms': 0, 'fallback_used': True}
                     ai_label = 'error'
             else:
-                # HOLD/ADD: GPT-mini for brief summary (no Claude cost)
-                _log(f'strategy: action={action} → GPT-mini (Claude skipped)')
-                try:
-                    gpt_prompt = (
-                        f"트레이딩봇 전략 판단 요약 (200자 이내 한국어):\n"
-                        f"ACTION={action}, SCORE={total:+.1f} ({dominant}), "
-                        f"TECH={tech:+.0f} POS={pos_score:+.0f} REGIME={regime:+.0f}\n"
-                        f"이유: {reason}\n"
-                        f"간결한 시장 코멘트 1줄 추가."
-                    )
-                    start_ms = int(time.time() * 1000)
-                    ai_text = _call_gpt_advisory(gpt_prompt)
-                    elapsed = int(time.time() * 1000) - start_ms
-                    ai_meta = {'model': 'gpt-4o-mini', 'api_latency_ms': elapsed,
-                               'fallback_used': False, 'model_provider': 'openai'}
-                    ai_label = 'GPT-mini'
-                except Exception as e:
-                    ai_text = f'(GPT 분석 실패: {e})'
-                    ai_meta = {'model': 'error', 'api_latency_ms': 0,
-                               'fallback_used': True, 'model_provider': 'error'}
-                    ai_label = 'error'
+                # HOLD/ADD: score_engine only, no AI call
+                _log(f'strategy: action={action} → score_engine only')
+                ai_text = ''
+                ai_meta = {'model': 'none', 'fallback_used': False,
+                           'model_provider': 'score_engine'}
+                ai_label = 'score_engine'
+
+            # Phase 4.5: Claude response price validation
+            if ai_text and not ai_meta.get('fallback_used') and snapshot:
+                import re as _re
+                _prices_found = _re.findall(r'\$[\d,]+(?:\.\d+)?', ai_text)
+                for pm in _prices_found:
+                    mentioned = float(pm.replace('$', '').replace(',', ''))
+                    _ok, _reason = _ms.validate_price_mention(mentioned, snapshot)
+                    if not _ok:
+                        _log(f'INVALID PRICE CONTEXT: {pm}')
+                        ai_text = f'INVALID PRICE CONTEXT -- STRATEGY REJECTED\n(원본: {ai_text[:200]}...)'
+                        ai_meta['price_rejected'] = True
+                        break
 
             # Phase 5: Claude override enqueue (no_fallback mode only)
             claude_eq_id = None
+            claude_action = None
             if no_fallback and ai_text and not ai_meta.get('fallback_used'):
                 claude_action = _parse_claude_action(ai_text)
                 if claude_action and claude_action != action and claude_action != 'HOLD':
                     if auto_ok and claude_action in ('REDUCE', 'CLOSE', 'REVERSE', 'ADD'):
                         claude_eq_id = _enqueue_strategy_action(
                             cur, claude_action, pos_state, scores,
-                            f'claude_override: {claude_action} (engine={action})')
+                            f'claude_override: {claude_action} (engine={action})',
+                            snapshot=snapshot)
                         if claude_eq_id:
                             eq_id = claude_eq_id
                             execute_status = f'YES claude_override (eq_id={claude_eq_id})'
@@ -987,7 +1039,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                         _log(f'CLAUDE OVERRIDE skipped (auto_trading inactive): {claude_action}')
 
             # Update header EXECUTE line if Phase 5 changed it
-            if claude_eq_id:
+            if claude_eq_id and claude_action:
                 lines[-1] = f'EXECUTE: {execute_status}'
                 header = '\n'.join(lines)
 
@@ -1006,12 +1058,14 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                 result += f'\n─ model={m_model} provider={m_provider} latency={m_latency}ms'
 
             # Claude override indicator
-            if claude_eq_id:
+            if claude_eq_id and claude_action:
                 result += f'\n⚡ CLAUDE OVERRIDE: {action} → {claude_action} (eq_id={claude_eq_id})'
 
             # Provider label for footer
-            if 'Claude' in ai_label:
-                provider = f'anthropic ({ai_label.split("(")[1]}'  # "anthropic ($X.XXXX)"
+            if 'Claude' in ai_label and '(' in ai_label:
+                provider = f'anthropic ({ai_label.split("(", 1)[1]}'  # "anthropic ($X.XXXX)"
+            elif 'Claude' in ai_label:
+                provider = f'anthropic ({ai_label})'
             else:
                 provider = ai_meta.get('model', 'gpt-4o-mini')
 
@@ -1132,6 +1186,18 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
             reason = result.get('gate_reason', 'unknown')
             _log(f"Claude gate denied ({reason}) — call_type={call_type}, no fallback")
             return (f'⚠️ Claude 게이트 거부 (GPT fallback 차단): {reason}', {
+                'model': 'claude(denied)',
+                'model_provider': 'anthropic(denied)',
+                'api_latency_ms': 0,
+                'fallback_used': True,
+                'gate_reason': reason,
+                'call_type': call_type,
+            })
+        # Block GPT fallback for strategy/event_trigger routes
+        if gate in ('pre_action', 'event_trigger'):
+            reason = result.get('gate_reason', 'unknown')
+            _log(f"Claude gate denied ({reason}) — strategy route, no GPT fallback")
+            return ('Claude unavailable. Strategy aborted (no GPT fallback).', {
                 'model': 'claude(denied)',
                 'model_provider': 'anthropic(denied)',
                 'api_latency_ms': 0,

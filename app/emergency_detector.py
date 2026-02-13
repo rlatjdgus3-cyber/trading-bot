@@ -20,10 +20,13 @@ DB = dict(
     connect_timeout=10,
     options='-c statement_timeout=30000')
 
+# Aligned with event_trigger thresholds (EVENT tier)
+# NOTE: run_check() is kept for telegram UI display.
+# Will be replaced by event_trigger.evaluate() in the future.
 THRESHOLDS = {
-    '1m_pct': Decimal('1.0'),
-    '5m_pct': Decimal('2.0'),
-    'vol_multiplier': Decimal('3.0'),
+    '1m_pct': Decimal('0.8'),         # EVENT trigger threshold
+    '5m_pct': Decimal('1.8'),         # EVENT trigger threshold
+    'vol_multiplier': Decimal('2.0'), # EVENT trigger threshold
     'consecutive_stops': 2}
 
 

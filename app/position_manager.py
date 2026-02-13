@@ -51,6 +51,7 @@ def _db_conn():
 
 _exchange = None
 _tables_ensured = False
+_prev_scores = {}  # Previous cycle scores for regime change detection
 
 
 def _get_exchange():
@@ -129,38 +130,56 @@ def _fetch_position(ex=None):
     return None
 
 
-def _build_context(cur=None, pos=None):
+def _build_context(cur=None, pos=None, snapshot=None):
     '''Build full market context for decision engine.'''
     ctx = {
         'position': pos,
         'price': pos.get('mark_price', 0) if pos else 0}
 
-    # Indicators
-    cur.execute("""
-            SELECT ich_kijun, rsi_14, atr_14, vol, vol_ma20, vol_spike,
-                   bb_mid, bb_up, bb_dn, ich_tenkan, ma_50, ma_200
-            FROM indicators
-            WHERE symbol = %s AND tf = '1m'
-            ORDER BY ts DESC LIMIT 1;
-        """, (SYMBOL,))
-    row = cur.fetchone()
-    if row:
+    # Use snapshot for indicators if available
+    if snapshot:
+        ctx['price'] = snapshot.get('price', ctx['price'])
         ctx['indicators'] = {
-            'kijun': float(row[0]) if row[0] else None,
-            'rsi': float(row[1]) if row[1] else None,
-            'atr': float(row[2]) if row[2] else None,
-            'vol': float(row[3]) if row[3] else None,
-            'vol_ma20': float(row[4]) if row[4] else None,
-            'vol_spike': bool(row[5]) if row[5] is not None else False,
-            'bb_mid': float(row[6]) if row[6] else None,
-            'bb_up': float(row[7]) if row[7] else None,
-            'bb_dn': float(row[8]) if row[8] else None,
-            'tenkan': float(row[9]) if row[9] else None,
-            'ma_50': float(row[10]) if row[10] else None,
-            'ma_200': float(row[11]) if row[11] else None,
+            'kijun': snapshot.get('kijun'),
+            'rsi': snapshot.get('rsi_14'),
+            'atr': snapshot.get('atr_14'),
+            'vol': snapshot.get('vol_last'),
+            'vol_ma20': snapshot.get('vol_ma20'),
+            'vol_spike': (snapshot.get('vol_ratio', 0) >= 2.0),
+            'bb_mid': snapshot.get('bb_mid'),
+            'bb_up': snapshot.get('bb_upper'),
+            'bb_dn': snapshot.get('bb_lower'),
+            'tenkan': snapshot.get('tenkan'),
+            'ma_50': snapshot.get('ma_50'),
+            'ma_200': snapshot.get('ma_200'),
         }
     else:
-        ctx['indicators'] = {}
+        # Fallback: DB indicators
+        cur.execute("""
+                SELECT ich_kijun, rsi_14, atr_14, vol, vol_ma20, vol_spike,
+                       bb_mid, bb_up, bb_dn, ich_tenkan, ma_50, ma_200
+                FROM indicators
+                WHERE symbol = %s AND tf = '1m'
+                ORDER BY ts DESC LIMIT 1;
+            """, (SYMBOL,))
+        row = cur.fetchone()
+        if row:
+            ctx['indicators'] = {
+                'kijun': float(row[0]) if row[0] else None,
+                'rsi': float(row[1]) if row[1] else None,
+                'atr': float(row[2]) if row[2] else None,
+                'vol': float(row[3]) if row[3] else None,
+                'vol_ma20': float(row[4]) if row[4] else None,
+                'vol_spike': bool(row[5]) if row[5] is not None else False,
+                'bb_mid': float(row[6]) if row[6] else None,
+                'bb_up': float(row[7]) if row[7] else None,
+                'bb_dn': float(row[8]) if row[8] else None,
+                'tenkan': float(row[9]) if row[9] else None,
+                'ma_50': float(row[10]) if row[10] else None,
+                'ma_200': float(row[11]) if row[11] else None,
+            }
+        else:
+            ctx['indicators'] = {}
 
     # Vol profile
     cur.execute("""
@@ -430,6 +449,279 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
     return 'HOLD'
 
 
+def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
+    """Handle event trigger → Claude analysis → action execution."""
+    import claude_api
+    import save_claude_analysis
+
+    trigger_types = [t.get('type', '?') for t in event_result.triggers]
+    _send_telegram(
+        f'Event trigger → Claude 분석\n'
+        f'triggers: {trigger_types}\n'
+        f'mode: {event_result.mode}')
+
+    try:
+        result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
+    except Exception:
+        traceback.print_exc()
+        result = claude_api.FALLBACK_RESPONSE.copy()
+        result['fallback_used'] = True
+
+    # Log to event_trigger_log
+    try:
+        cur.execute("""
+            INSERT INTO event_trigger_log
+                (symbol, mode, triggers, event_hash, snapshot_ts, snapshot_price,
+                 claude_called, claude_result, call_type, dedup_blocked)
+            VALUES (%s, %s, %s::jsonb, %s, to_timestamp(%s), %s, %s, %s::jsonb, %s, %s)
+        """, (
+            SYMBOL,
+            event_result.mode,
+            json.dumps(event_result.triggers, default=str),
+            event_result.event_hash,
+            snapshot.get('snapshot_ts') if snapshot else None,
+            snapshot.get('price') if snapshot else None,
+            True,
+            json.dumps(result, default=str, ensure_ascii=False)[:5000],
+            event_result.call_type,
+            False,
+        ))
+    except Exception:
+        traceback.print_exc()
+
+    if result.get('aborted'):
+        _log('event analysis aborted')
+        return 'ABORT'
+
+    # Save claude analysis
+    try:
+        ca_id = save_claude_analysis.save_analysis(
+            cur, kind='event_trigger',
+            input_packet=ctx,
+            output=result,
+            event_id=None,
+            similar_events=[])
+    except Exception:
+        traceback.print_exc()
+        ca_id = None
+
+    action = result.get('recommended_action', 'HOLD')
+    pos = ctx.get('position', {})
+
+    if action == 'HOLD':
+        _send_telegram(
+            f'[Event] HOLD (risk={result.get("risk_level")})\n'
+            f'triggers: {trigger_types}')
+        return 'HOLD'
+
+    if action == 'REDUCE':
+        reduce_pct = result.get('reduce_pct', 50)
+        eq_id = _enqueue_action(
+            cur, 'REDUCE', pos.get('side', '').upper(),
+            reduce_pct=reduce_pct,
+            reason=f'event_trigger_{trigger_types[0] if trigger_types else "unknown"}',
+            priority=3)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(f'[Event] REDUCE {reduce_pct}%\n{", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'REDUCE'
+
+    if action == 'CLOSE':
+        eq_id = _enqueue_action(
+            cur, 'CLOSE', pos.get('side', '').upper(),
+            target_qty=pos.get('qty'),
+            reason=f'event_trigger_{trigger_types[0] if trigger_types else "unknown"}',
+            priority=2)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(f'[Event] CLOSE\n{", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'CLOSE'
+
+    if action == 'REVERSE':
+        eq_id = _enqueue_reverse(
+            cur, pos,
+            reason=f'event_trigger_{trigger_types[0] if trigger_types else "unknown"}',
+            priority=2)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(f'[Event] REVERSE\n{", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'REVERSE'
+
+    return 'HOLD'
+
+
+def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
+    """Handle emergency via Claude API (snapshot-based). Returns action taken."""
+    trigger_types = [t.get('type', '?') for t in event_result.triggers]
+    _send_telegram(
+        f'\U0001f6a8 긴급 감지 → Claude 분석\n'
+        f'triggers: {trigger_types}\n'
+        f'mode: EMERGENCY')
+
+    import attach_similar_events
+    import save_claude_analysis
+    from fact_categories import classify_news, extract_macro_keywords
+
+    # Find similar FACT events
+    news_text = ' '.join(n.get('summary', '') or '' for n in ctx.get('news', []))
+    fact_category = classify_news(news_text)
+    fact_keywords = extract_macro_keywords(news_text)
+    similar = attach_similar_events.find_similar(cur, category=fact_category, keywords=fact_keywords)
+    perf_summary = attach_similar_events.build_performance_summary(similar)
+
+    # Build trigger info for context
+    primary_trigger = event_result.triggers[0] if event_result.triggers else {}
+    ctx['trigger'] = {
+        'type': primary_trigger.get('type', 'event_emergency'),
+        'detail': primary_trigger,
+    }
+    ctx['fact_similar_events'] = similar
+    ctx['fact_performance_summary'] = perf_summary
+
+    import claude_api
+    try:
+        result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
+    except Exception:
+        traceback.print_exc()
+        result = claude_api.FALLBACK_RESPONSE.copy()
+        result['fallback_used'] = True
+
+    # Log to emergency_analysis_log
+    cur.execute("""
+        INSERT INTO emergency_analysis_log
+            (symbol, trigger_type, trigger_detail, context_packet,
+             response_raw, risk_level, recommended_action, confidence,
+             reason_bullets, ttl_seconds, api_latency_ms, fallback_used)
+        VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+        RETURNING id;
+    """, (
+        SYMBOL,
+        primary_trigger.get('type', 'event_emergency'),
+        json.dumps(primary_trigger, default=str),
+        json.dumps(ctx, default=str, ensure_ascii=False)[:10000],
+        json.dumps(result, default=str, ensure_ascii=False),
+        result.get('risk_level'),
+        result.get('recommended_action'),
+        result.get('confidence'),
+        json.dumps(result.get('reason_bullets', []), ensure_ascii=False),
+        result.get('ttl_seconds'),
+        result.get('api_latency_ms'),
+        result.get('fallback_used', False),
+    ))
+    eid_row = cur.fetchone()
+    eid = eid_row[0] if eid_row else None
+
+    # Log to event_trigger_log
+    try:
+        cur.execute("""
+            INSERT INTO event_trigger_log
+                (symbol, mode, triggers, event_hash, snapshot_ts, snapshot_price,
+                 claude_called, claude_result, call_type, dedup_blocked)
+            VALUES (%s, %s, %s::jsonb, %s, to_timestamp(%s), %s, %s, %s::jsonb, %s, %s)
+        """, (
+            SYMBOL,
+            event_result.mode,
+            json.dumps(event_result.triggers, default=str),
+            event_result.event_hash,
+            snapshot.get('snapshot_ts') if snapshot else None,
+            snapshot.get('price') if snapshot else None,
+            True,
+            json.dumps(result, default=str, ensure_ascii=False)[:5000],
+            event_result.call_type,
+            False,
+        ))
+    except Exception:
+        traceback.print_exc()
+
+    # Save claude analysis
+    try:
+        ca_id = save_claude_analysis.save_analysis(
+            cur, kind='emergency',
+            input_packet=ctx,
+            output=result,
+            event_id=None,
+            similar_events=similar,
+            emergency_log_id=eid)
+    except Exception:
+        traceback.print_exc()
+        ca_id = None
+
+    action = result.get('recommended_action', 'HOLD')
+    pos = ctx.get('position', {})
+
+    if action == 'HOLD':
+        _send_telegram(
+            f'[Claude] HOLD 판단 (risk={result.get("risk_level")})\n'
+            f'- confidence: {result.get("confidence")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'HOLD'
+
+    if action == 'REDUCE':
+        reduce_pct = result.get('reduce_pct', 50)
+        eq_id = _enqueue_action(
+            cur, 'REDUCE', pos.get('side', '').upper(),
+            reduce_pct=reduce_pct,
+            reason=f'emergency_{primary_trigger.get("type", "unknown")}',
+            emergency_id=eid,
+            priority=2)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] REDUCE {reduce_pct}% 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'REDUCE'
+
+    if action == 'CLOSE':
+        eq_id = _enqueue_action(
+            cur, 'CLOSE', pos.get('side', '').upper(),
+            target_qty=pos.get('qty'),
+            reason=f'emergency_{primary_trigger.get("type", "unknown")}',
+            emergency_id=eid,
+            priority=1)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] CLOSE 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'CLOSE'
+
+    if action == 'REVERSE':
+        eq_id = _enqueue_reverse(
+            cur, pos,
+            reason=f'emergency_{primary_trigger.get("type", "unknown")}',
+            emergency_id=eid,
+            priority=1)
+        if ca_id and eq_id:
+            try:
+                save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
+            except Exception:
+                traceback.print_exc()
+        _send_telegram(
+            f'[Claude] REVERSE 실행\n'
+            f'- risk: {result.get("risk_level")}\n'
+            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        return 'REVERSE'
+
+    return 'HOLD'
+
+
 def _decide(ctx=None):
     '''Run decision engine. Returns (action, reason).'''
     pos = ctx.get('position', {})
@@ -649,6 +941,8 @@ def _log_decision(cur=None, ctx=None, action=None, reason=None,
 
 def _cycle():
     '''One position management cycle. Returns sleep seconds.'''
+    global _prev_scores
+
     if os.path.exists(KILL_SWITCH_PATH):
         _log('KILL_SWITCH detected. Exiting.')
         sys.exit(0)
@@ -671,17 +965,41 @@ def _cycle():
                 _log('no position, sleeping')
                 return LOOP_SLOW_SEC
 
-            # Build context
-            ctx = _build_context(cur, pos)
+            # Phase 1: Real-time snapshot build
+            import market_snapshot
+            import event_trigger
+            snapshot = None
+            try:
+                snapshot = market_snapshot.build_and_validate(ex, cur, SYMBOL)
+            except market_snapshot.SnapshotError as e:
+                _log(f'snapshot failed: {e}')
+                # Fallback: continue with DB-only context
+                pass
 
-            # Check emergency
-            trigger = _check_emergency(ctx)
-            if trigger:
-                _log(f'emergency trigger: {trigger["type"]}')
-                _handle_emergency(cur, ctx, trigger)
+            # Phase 2: Build context (using snapshot if available)
+            ctx = _build_context(cur, pos, snapshot=snapshot)
+
+            # Phase 3: Event trigger evaluation
+            event_result = event_trigger.evaluate(
+                snapshot=snapshot, prev_scores=_prev_scores,
+                position=pos, cur=cur)
+
+            # Phase 4: Mode-based handling
+            if event_result.mode == event_trigger.MODE_EMERGENCY:
+                _log(f'EMERGENCY: triggers={[t["type"] for t in event_result.triggers]}')
+                _handle_emergency_v2(cur, ctx, event_result, snapshot)
+                _prev_scores = ctx.get('scores', {})
                 return LOOP_FAST_SEC
+            elif event_result.mode == event_trigger.MODE_EVENT:
+                _log(f'EVENT: triggers={[t["type"] for t in event_result.triggers]}')
+                _handle_event_trigger(cur, ctx, event_result, snapshot)
+                _prev_scores = ctx.get('scores', {})
+                return LOOP_FAST_SEC
+            else:
+                # DEFAULT: score_engine only, no Claude call
+                _log(f'DEFAULT mode, score_engine only')
 
-            # Run decision engine
+            # Run decision engine (DEFAULT mode)
             (action, reason) = _decide(ctx)
             _log(f'decision: {action} - {reason}')
 
@@ -743,6 +1061,7 @@ def _cycle():
 
             # Sync position state
             _sync_position_state(cur, pos)
+            _prev_scores = ctx.get('scores', {})
 
         return LOOP_NORMAL_SEC
 

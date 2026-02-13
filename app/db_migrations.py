@@ -311,7 +311,8 @@ def ensure_position_state_budget_columns(cur):
                         ('trade_budget_used_pct', 'NUMERIC NOT NULL DEFAULT 0'),
                         ('next_stage_available', 'INTEGER'),
                         ('stage_consumed_mask', 'INTEGER NOT NULL DEFAULT 0'),
-                        ('last_reason', 'TEXT'), ('last_score', 'NUMERIC')):
+                        ('last_reason', 'TEXT'), ('last_score', 'NUMERIC'),
+                        ('accumulated_entry_fee', 'NUMERIC NOT NULL DEFAULT 0')):
         cur.execute(f"""
             ALTER TABLE position_state
                 ADD COLUMN IF NOT EXISTS {col} {dtype};
@@ -803,6 +804,30 @@ def ensure_claude_analyses_model_provider(cur):
     _log('ensure_claude_analyses_model_provider done')
 
 
+def ensure_event_trigger_log(cur):
+    '''Event trigger evaluation log.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.event_trigger_log (
+            id              BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol          TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            mode            TEXT NOT NULL,
+            triggers        JSONB NOT NULL DEFAULT '[]',
+            event_hash      TEXT,
+            snapshot_ts     TIMESTAMPTZ,
+            snapshot_price  NUMERIC,
+            claude_called   BOOLEAN DEFAULT false,
+            claude_result   JSONB,
+            call_type       TEXT,
+            dedup_blocked   BOOLEAN DEFAULT false
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_etl_ts ON event_trigger_log(ts);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_etl_mode ON event_trigger_log(mode);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_etl_hash ON event_trigger_log(event_hash);')
+    _log('ensure_event_trigger_log done')
+
+
 def run_all():
     '''Run all migrations. Safe to call multiple times.'''
     conn = None
@@ -856,6 +881,8 @@ def run_all():
             # Provider tracking
             ensure_pm_decision_log_model_used(cur)
             ensure_claude_analyses_model_provider(cur)
+            # Event trigger log
+            ensure_event_trigger_log(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

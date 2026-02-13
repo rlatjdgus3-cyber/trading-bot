@@ -51,7 +51,10 @@ GATE_COOLDOWNS = {
     'scheduled': COOLDOWN_GENERAL_SEC,
     'telegram': COOLDOWN_GENERAL_SEC,
     'openclaw': 120,                      # 2 min — control tower, permissive
+    'event_trigger': 300,                 # 5 min — event dedup window
 }
+
+EVENT_DEDUP_WINDOW_SEC = 300              # 5 min — event hash dedup
 
 
 def _log(msg):
@@ -146,6 +149,12 @@ def _check_gate_condition(gate: str, context: dict) -> tuple:
     if gate == 'openclaw':
         return (True, 'openclaw gate (control tower)')
 
+    if gate == 'event_trigger':
+        event_mode = context.get('event_mode', '')
+        if event_mode in ('EVENT', 'EMERGENCY'):
+            return (True, f'event_trigger: mode={event_mode}')
+        return (False, 'event_trigger: no qualifying event')
+
     return (True, f'unknown gate {gate} (permissive)')
 
 
@@ -201,6 +210,19 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
         return {'allowed': False, 'reason': f'gate condition failed: {reason}',
                 'gate': gate, 'budget_remaining': budget_remaining,
                 'call_type': call_type}
+
+    # Stage 3.5: Event hash dedup (AUTO only)
+    if call_type == CALL_TYPE_AUTO:
+        event_hash = context.get('event_hash')
+        if event_hash:
+            dedup_hashes = state.get('event_hashes', {})
+            last_seen = dedup_hashes.get(event_hash, 0)
+            if now - last_seen < EVENT_DEDUP_WINDOW_SEC:
+                remaining = int(EVENT_DEDUP_WINDOW_SEC - (now - last_seen))
+                return {'allowed': False,
+                        'reason': f'event dedup ({remaining}s remaining)',
+                        'gate': gate, 'budget_remaining': budget_remaining,
+                        'call_type': call_type}
 
     # Stage 4: Cooldown check — call_type branching
     if cooldown_key:
@@ -343,7 +365,7 @@ def _call_claude_inner(gate, prompt, cooldown_key, context, max_tokens,
         # Record successful call
         state = _load_state()
         _record_call_to_state(state, gate, input_tokens, output_tokens,
-                              cooldown_key, call_type=call_type)
+                              cooldown_key, call_type=call_type, context=context)
         _save_state(state)
 
         _log(f'OK gate={gate} key={cooldown_key} call_type={call_type} '
@@ -390,16 +412,17 @@ def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
 
 
 def record_call(gate: str, input_tokens: int, output_tokens: int,
-                cooldown_key: str = '', call_type: str = 'AUTO'):
+                cooldown_key: str = '', call_type: str = 'AUTO',
+                context: dict = None):
     """Public interface. Records a call to state."""
     state = _load_state()
     _record_call_to_state(state, gate, input_tokens, output_tokens,
-                          cooldown_key, call_type=call_type)
+                          cooldown_key, call_type=call_type, context=context)
     _save_state(state)
 
 
 def _record_call_to_state(state, gate, input_tokens, output_tokens,
-                          cooldown_key, call_type='AUTO'):
+                          cooldown_key, call_type='AUTO', context=None):
     today = _today()
     month = _this_month()
     now = time.time()
@@ -443,6 +466,14 @@ def _record_call_to_state(state, gate, input_tokens, output_tokens,
     day_ctc = ctc.get(today, {})
     day_ctc[call_type] = day_ctc.get(call_type, 0) + 1
     state['call_type_counts'] = {today: day_ctc}
+
+    # Event hash recording
+    event_hash = (context or {}).get('event_hash')
+    if event_hash:
+        eh = state.setdefault('event_hashes', {})
+        eh[event_hash] = now
+        # Purge hashes older than 10 minutes
+        state['event_hashes'] = {k: v for k, v in eh.items() if now - v < 600}
 
 
 def record_error(status_code, error_msg: str = ''):
@@ -552,8 +583,7 @@ def _notify_budget_exceeded(state: dict, reason: str):
         req = urllib.request.Request(url, data=data, method='POST')
         urllib.request.urlopen(req, timeout=10)
 
-        notified[today] = True
-        state['budget_notified'] = {today: True}
+        state.setdefault('budget_notified', {})[today] = True
         _log(f'budget notification sent: {reason}')
     except Exception as e:
         _log(f'budget notification error: {e}')
