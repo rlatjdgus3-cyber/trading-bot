@@ -514,6 +514,18 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     action = result.get('recommended_action', 'HOLD')
     pos = ctx.get('position', {})
 
+    # ── Event stabilization guards ──
+    import event_trigger as _et
+    pos_side = pos.get('side', '').upper()
+
+    if action == 'REDUCE':
+        pos_qty = pos.get('qty', 0)
+        reduce_pct = result.get('reduce_pct', 50)
+        reduce_qty = pos_qty * reduce_pct / 100
+        if reduce_qty < _et.MIN_ORDER_QTY_BTC:
+            _log(f'REDUCE blocked: qty {reduce_qty:.4f} < min {_et.MIN_ORDER_QTY_BTC}')
+            action = 'HOLD'
+
     if action == 'HOLD':
         _send_telegram(
             f'[Event] HOLD (risk={result.get("risk_level")})\n'
@@ -523,7 +535,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     if action == 'REDUCE':
         reduce_pct = result.get('reduce_pct', 50)
         eq_id = _enqueue_action(
-            cur, 'REDUCE', pos.get('side', '').upper(),
+            cur, 'REDUCE', pos_side,
             reduce_pct=reduce_pct,
             reason=f'event_trigger_{trigger_types[0] if trigger_types else "unknown"}',
             priority=3)
@@ -537,7 +549,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
 
     if action == 'CLOSE':
         eq_id = _enqueue_action(
-            cur, 'CLOSE', pos.get('side', '').upper(),
+            cur, 'CLOSE', pos_side,
             target_qty=pos.get('qty'),
             reason=f'event_trigger_{trigger_types[0] if trigger_types else "unknown"}',
             priority=2)
@@ -669,6 +681,20 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     action = result.get('recommended_action', 'HOLD')
     pos = ctx.get('position', {})
 
+    # ── Emergency stabilization guards ──
+    import event_trigger as _et
+    pos_side = pos.get('side', '').upper()
+
+    if action == 'REDUCE':
+        pos_qty = pos.get('qty', 0)
+        reduce_pct = result.get('reduce_pct', 50)
+        reduce_qty = pos_qty * reduce_pct / 100
+        if reduce_qty < _et.MIN_ORDER_QTY_BTC:
+            _log(f'REDUCE blocked: qty {reduce_qty:.4f} < min {_et.MIN_ORDER_QTY_BTC}')
+            action = 'HOLD'
+        elif _et.is_duplicate_emergency_action(SYMBOL, 'REDUCE', pos_side):
+            action = 'HOLD'
+
     if action == 'HOLD':
         _send_telegram(
             f'[Claude] HOLD 판단 (risk={result.get("risk_level")})\n'
@@ -679,11 +705,14 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     if action == 'REDUCE':
         reduce_pct = result.get('reduce_pct', 50)
         eq_id = _enqueue_action(
-            cur, 'REDUCE', pos.get('side', '').upper(),
+            cur, 'REDUCE', pos_side,
             reduce_pct=reduce_pct,
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
             priority=2)
+        if eq_id:
+            _et.set_emergency_lock(SYMBOL)
+            _et.record_emergency_action(SYMBOL, 'REDUCE', pos_side)
         if ca_id and eq_id:
             try:
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
@@ -697,11 +726,14 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
 
     if action == 'CLOSE':
         eq_id = _enqueue_action(
-            cur, 'CLOSE', pos.get('side', '').upper(),
+            cur, 'CLOSE', pos_side,
             target_qty=pos.get('qty'),
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
             priority=1)
+        if eq_id:
+            _et.set_emergency_lock(SYMBOL)
+            _et.record_emergency_action(SYMBOL, 'CLOSE', pos_side)
         if ca_id and eq_id:
             try:
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
@@ -719,6 +751,9 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
             priority=1)
+        if eq_id:
+            _et.set_emergency_lock(SYMBOL)
+            _et.record_emergency_action(SYMBOL, 'REVERSE', pos_side)
         if ca_id and eq_id:
             try:
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
@@ -839,6 +874,19 @@ def _structure_confirms(ctx=None, target_side=None):
 def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
     '''Insert action into execution_queue.'''
     import safety_manager
+
+    # Duplicate REDUCE check: block if same direction REDUCE already pending
+    if action_type == 'REDUCE' and direction:
+        cur.execute("""
+            SELECT id FROM execution_queue
+            WHERE symbol = %s AND action_type = 'REDUCE' AND direction = %s
+              AND status IN ('PENDING', 'PICKED')
+              AND ts >= now() - interval '5 minutes';
+        """, (SYMBOL, direction))
+        if cur.fetchone():
+            _log(f'duplicate REDUCE {direction} blocked (already pending in queue)')
+            return None
+
     (ok, reason) = safety_manager.run_all_checks(cur, kwargs.get('target_usdt', 0))
     if not ok and action_type == 'ADD':
         _log(f'safety block: {reason}')
@@ -993,7 +1041,7 @@ def _cycle():
             # Phase 3: Event trigger evaluation
             event_result = event_trigger.evaluate(
                 snapshot=snapshot, prev_scores=_prev_scores,
-                position=pos, cur=cur)
+                position=pos, cur=cur, symbol=SYMBOL)
 
             # Phase 4: Mode-based handling
             if event_result.mode == event_trigger.MODE_EMERGENCY:

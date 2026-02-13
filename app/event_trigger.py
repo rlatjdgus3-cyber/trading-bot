@@ -47,7 +47,13 @@ EMERGENCY_LOSS_PCT = 2.0
 EMERGENCY_VOL_ZSCORE = 3.0
 
 # ── dedup ──────────────────────────────────────────────────
-AUTO_DEDUP_WINDOW_SEC = 300  # 5 min
+AUTO_DEDUP_WINDOW_SEC = 300    # 5 min
+EMERGENCY_LOCK_SEC = 180       # 3 min lock after emergency execution
+MIN_ORDER_QTY_BTC = 0.001     # Bybit BTC/USDT:USDT minimum
+
+# ── emergency lock state ──────────────────────────────────
+_emergency_lock = {}           # {symbol: expire_timestamp}
+_last_emergency_action = {}    # {symbol: {'action': str, 'direction': str, 'ts': float}}
 
 # ── priority ───────────────────────────────────────────────
 PRIORITY_EMERGENCY = 1
@@ -87,9 +93,11 @@ class EventResult:
         }
 
 
-def evaluate(snapshot, prev_scores=None, position=None, cur=None) -> EventResult:
+def evaluate(snapshot, prev_scores=None, position=None, cur=None,
+             symbol='BTC/USDT:USDT') -> EventResult:
     """Main evaluation entry point.
 
+    0. Check emergency lock → DEFAULT if active
     1. _check_emergency_escalation() → EMERGENCY → immediate return
     2. _check_price_spikes()
     3. _check_volume_spike()
@@ -101,11 +109,17 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None) -> EventResult
     if not snapshot:
         return EventResult()
 
+    # Emergency lock: suppress all triggers during cooldown
+    if is_emergency_locked(symbol):
+        return EventResult()
+
+    price = snapshot.get('price', 0)
+
     # Phase 1: emergency escalation (highest priority)
     emergency_triggers = _check_emergency_escalation(snapshot, position)
     if emergency_triggers:
-        eh = compute_event_hash(emergency_triggers)
-        _log(f'EMERGENCY: triggers={[t["type"] for t in emergency_triggers]}')
+        eh = compute_event_hash(emergency_triggers, symbol=symbol, price=price)
+        _log(f'EMERGENCY: triggers={[t["type"] for t in emergency_triggers]} hash={eh[:12]}')
         return EventResult(
             mode=MODE_EMERGENCY,
             triggers=emergency_triggers,
@@ -125,7 +139,7 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None) -> EventResult
     if not all_triggers:
         return EventResult()  # DEFAULT
 
-    eh = compute_event_hash(all_triggers)
+    eh = compute_event_hash(all_triggers, symbol=symbol, price=price)
     _log(f'EVENT: triggers={[t["type"] for t in all_triggers]} hash={eh[:12]}')
     return EventResult(
         mode=MODE_EVENT,
@@ -333,9 +347,13 @@ def _check_emergency_escalation(snapshot, position=None) -> list:
     return triggers
 
 
-def compute_event_hash(triggers) -> str:
-    """Compute SHA256 hash of trigger types + directions for dedup."""
-    # Hash based on trigger types and their qualitative direction
+def compute_event_hash(triggers, symbol='BTC/USDT:USDT', price=None) -> str:
+    """Compute context-aware event hash for dedup.
+
+    hash = f"{symbol}:{trigger_types}:{price_band}:{minute_bucket}"
+    - price_band: price rounded to nearest $500
+    - minute_bucket: current 5-min bucket
+    """
     key_parts = []
     for t in sorted(triggers, key=lambda x: x.get('type', '')):
         part = t.get('type', '')
@@ -343,8 +361,49 @@ def compute_event_hash(triggers) -> str:
         if direction:
             part += f':{direction}'
         key_parts.append(part)
-    raw = '|'.join(key_parts)
+    types_str = '|'.join(key_parts)
+    price_band = int(price / 500) * 500 if price else 0
+    minute_bucket = int(time.time() / 300)
+    raw = f'{symbol}:{types_str}:{price_band}:{minute_bucket}'
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def set_emergency_lock(symbol='BTC/USDT:USDT'):
+    """Set emergency lock for symbol (180s cooldown)."""
+    _emergency_lock[symbol] = time.time() + EMERGENCY_LOCK_SEC
+    _log(f'emergency lock SET for {symbol} ({EMERGENCY_LOCK_SEC}s)')
+
+
+def is_emergency_locked(symbol='BTC/USDT:USDT') -> bool:
+    """Check if emergency lock is active."""
+    expire = _emergency_lock.get(symbol, 0)
+    if time.time() < expire:
+        remaining = int(expire - time.time())
+        _log(f'emergency lock ACTIVE ({remaining}s remaining)')
+        return True
+    return False
+
+
+def record_emergency_action(symbol, action, direction):
+    """Record last emergency action for duplicate prevention."""
+    _last_emergency_action[symbol] = {
+        'action': action,
+        'direction': direction,
+        'ts': time.time(),
+    }
+
+
+def is_duplicate_emergency_action(symbol, action, direction) -> bool:
+    """Check if same action+direction was already executed within lock window."""
+    last = _last_emergency_action.get(symbol)
+    if not last:
+        return False
+    if last['action'] == action and last['direction'] == direction:
+        elapsed = time.time() - last['ts']
+        if elapsed < EMERGENCY_LOCK_SEC:
+            _log(f'duplicate {action} {direction} blocked ({int(EMERGENCY_LOCK_SEC - elapsed)}s remaining)')
+            return True
+    return False
 
 
 def check_dedup(event_hash, state) -> bool:
