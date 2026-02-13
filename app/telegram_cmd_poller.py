@@ -1086,6 +1086,29 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
         if not side:
             _log('REDUCE: no position side')
             return None
+        # Min qty check: reduce amount must be >= Bybit min (0.001 BTC)
+        total_qty = float(pos_state.get('total_qty', 0))
+        reduce_qty = total_qty * reduce_pct / 100.0
+        MIN_ORDER_QTY = 0.001
+        if reduce_qty < MIN_ORDER_QTY:
+            if total_qty >= MIN_ORDER_QTY:
+                _log(f'REDUCE {reduce_pct}% = {reduce_qty:.6f} < min {MIN_ORDER_QTY}. Upgrading to CLOSE.')
+                # Position is at minimum unit — partial reduce impossible, do full CLOSE
+                cur.execute("""
+                    INSERT INTO execution_queue
+                        (symbol, action_type, direction, target_qty,
+                         source, reason, priority, expire_at, meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s,
+                            now() + interval '5 minutes', %s::jsonb)
+                    RETURNING id;
+                """, (STRATEGY_SYMBOL, 'CLOSE', side,
+                      pos_state.get('total_qty'),
+                      'claude_execution', parsed.get('reason_code', 'reduce_upgraded_to_close'), 2, meta))
+                row = cur.fetchone()
+                return row[0] if row else None
+            else:
+                _log(f'REDUCE: position {total_qty} too small to reduce')
+                return None
         cur.execute("""
             INSERT INTO execution_queue
                 (symbol, action_type, direction, reduce_pct,
