@@ -197,8 +197,58 @@ def _ai_advisory(intent: dict, text: str) -> str:
         return _ai_emergency_advisory(claude_prompt)
     elif intent_type == "strategy":
         return _ai_strategy_advisory(claude_prompt)
+    elif intent_type == "news":
+        return _ai_news_claude_advisory(claude_prompt)
     else:
         return _ai_general_advisory(claude_prompt)
+
+
+def _ai_news_claude_advisory(text: str) -> str:
+    """News analysis via Claude. Fetches recent news + indicators."""
+    parts = []
+
+    # Recent news (broader window)
+    news = local_query_executor.execute("news_summary", "최근 6시간 뉴스 10개")
+    parts.append(f"최근 뉴스:\n{news[:800]}")
+
+    # High impact news if any
+    high = _check_news_importance()
+    if high:
+        high_lines = []
+        for n in high[:3]:
+            high_lines.append(
+                f"- [{n['impact_score']}/10] {n['title']}\n  {n.get('summary', '')}")
+        parts.append(f"고영향 뉴스:\n" + "\n".join(high_lines))
+
+    # Indicators + price
+    ind = local_query_executor.execute("indicator_snapshot")
+    parts.append(f"지표:\n{ind}")
+
+    # Score
+    score = local_query_executor.execute("score_summary")
+    parts.append(f"스코어:\n{score}")
+
+    # Position
+    pos = local_query_executor.execute("position_info")
+    parts.append(f"포지션:\n{pos}")
+
+    prompt = (
+        f"당신은 비트코인 선물 트레이딩 뉴스 분석가입니다.\n"
+        f"아래 제공된 실시간 데이터만 사용하여 분석하세요.\n\n"
+        f"사용자 요청: {text}\n\n"
+        f"=== 실시간 데이터 ===\n" + "\n\n".join(parts) + "\n\n"
+        "=== 분석 요청 ===\n"
+        "1. 각 뉴스의 BTC 선물 영향 방향/크기 평가\n"
+        "2. 종합 시나리오 (상승/하락/횡보)\n"
+        "3. 현재 포지션 기준 대응 포인트\n"
+        "※ 매매 실행 권한 없음. 분석/권고만. 800자 이내."
+    )
+    result, meta = _call_claude_advisory(prompt)
+    _save_advisory('news_advisory',
+                   {'user_text': text, 'news': news[:800], 'indicators': ind,
+                    'score': score, 'position': pos},
+                   result, meta)
+    return result
 
 
 def _ai_emergency_advisory(text: str) -> str:
