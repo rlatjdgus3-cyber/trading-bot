@@ -103,6 +103,7 @@ HELP_TEXT = (
     "  /audit     시스템 감사\n"
     "  /risk MODE 리스크 모드 (conservative/normal/aggressive)\n"
     "  /keywords  워치 키워드 목록/관리\n"
+    "  /force     쿨다운 무시 + Claude 강제 전략 분석\n"
     "\n"
     "💬 자연어 예시\n"
     "  상태 보여줘\n"
@@ -184,7 +185,7 @@ def _ai_news_advisory(text: str, high_news: list) -> tuple:
     }
     result, meta = _call_claude_advisory(
         prompt, gate='high_news', cooldown_key='tg_news_high',
-        context=gate_ctx)
+        context=gate_ctx, call_type='AUTO')
     _save_advisory('news_advisory',
                    {'user_text': text, 'high_news': high_news, 'indicators': ind},
                    result, meta)
@@ -196,11 +197,16 @@ def _ai_news_advisory(text: str, high_news: list) -> tuple:
 
 # ── AI advisory (route=claude) ───────────────────────────
 
-def _ai_advisory(intent: dict, text: str) -> tuple:
+def _ai_advisory(intent: dict, text: str, no_fallback: bool = False,
+                  force: bool = False) -> tuple:
     """Generate AI advisory. Returns (response_text, provider_label).
+    force=True → USER call_type (bypass cooldown + Claude forced + no fallback).
     Advisory only — never executes trades."""
     intent_type = intent.get("intent", "other")
     claude_prompt = intent.get("claude_prompt", "") or text
+
+    # Derive call_type from flags
+    call_type = 'USER' if (force or no_fallback) else 'AUTO'
 
     # budget gate
     state = gpt_router._load_state()
@@ -210,17 +216,18 @@ def _ai_advisory(intent: dict, text: str) -> tuple:
                 "budget_exceeded")
 
     if intent_type == "emergency":
-        return _ai_emergency_advisory(claude_prompt)
+        return _ai_emergency_advisory(claude_prompt, call_type=call_type)
     elif intent_type == "strategy":
-        return _ai_strategy_advisory(claude_prompt)
+        return _ai_strategy_advisory(claude_prompt, call_type=call_type)
     elif intent_type == "news":
-        return _ai_news_claude_advisory(claude_prompt)
+        return _ai_news_claude_advisory(claude_prompt, call_type=call_type)
     else:
         return (_ai_general_advisory(claude_prompt), "gpt-4o-mini")
 
 
-def _ai_news_claude_advisory(text: str) -> tuple:
-    """News analysis. Claude only for high-impact news. Returns (text, provider)."""
+def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
+    """News analysis. Claude only for high-impact news (or USER/EMERGENCY). Returns (text, provider)."""
+    no_fallback = call_type in ('USER', 'EMERGENCY')
     parts = []
 
     # Recent news (broader window)
@@ -260,18 +267,22 @@ def _ai_news_claude_advisory(text: str) -> tuple:
         "※ 매매 실행 권한 없음. 분석/권고만. 800자 이내."
     )
 
-    # Claude only for high-impact news (emergency-adjacent); GPT-mini otherwise
-    if high:
+    # Claude for high-impact news or USER/EMERGENCY; GPT-mini otherwise
+    if high or no_fallback:
+        ck = 'user_tg_news_claude' if no_fallback else 'auto_tg_news_claude'
         gate_ctx = {
             'intent': 'news',
-            'high_news': True,
-            'impact_score': max((n.get('impact_score', 0) for n in high), default=0),
+            'high_news': bool(high),
+            'impact_score': max((n.get('impact_score', 0) for n in high), default=0) if high else 0,
+            'source': 'openclaw' if no_fallback else 'telegram',
         }
+        gate = 'high_news' if high else 'telegram'
         result, meta = _call_claude_advisory(
-            prompt, gate='high_news', cooldown_key='tg_news_claude',
-            context=gate_ctx)
+            prompt, gate=gate, cooldown_key=ck,
+            context=gate_ctx, call_type=call_type)
+        meta['call_type'] = call_type
         if meta.get('fallback_used'):
-            provider = 'gpt-4o-mini'
+            provider = 'claude(denied)' if no_fallback else 'gpt-4o-mini'
         else:
             cost = meta.get('estimated_cost_usd', 0)
             provider = f'anthropic (${cost:.4f})'
@@ -280,7 +291,8 @@ def _ai_news_claude_advisory(text: str) -> tuple:
         start_ms = int(time.time() * 1000)
         result = _call_gpt_advisory(prompt)
         elapsed = int(time.time() * 1000) - start_ms
-        meta = {'model': 'gpt-4o-mini', 'api_latency_ms': elapsed, 'fallback_used': False}
+        meta = {'model': 'gpt-4o-mini', 'api_latency_ms': elapsed, 'fallback_used': False,
+                'call_type': call_type}
         provider = 'gpt-4o-mini'
 
     _save_advisory('news_advisory',
@@ -290,8 +302,9 @@ def _ai_news_claude_advisory(text: str) -> tuple:
     return (result, provider)
 
 
-def _ai_emergency_advisory(text: str) -> tuple:
+def _ai_emergency_advisory(text: str, call_type: str = 'USER') -> tuple:
     """Emergency: gather detector data + AI analysis. Returns (text, provider)."""
+    no_fallback = call_type in ('USER', 'EMERGENCY')
     # run emergency checks
     alert_data = emergency_detector.run_check()
     alert_summary = emergency_detector.format_alerts(alert_data) if alert_data else "현재 긴급 감지 없음"
@@ -311,18 +324,21 @@ def _ai_emergency_advisory(text: str) -> tuple:
         "4. 리스크 모드 권고\n"
         "※ 매매 실행 권한 없음. 분석/권고만."
     )
+    ck = 'user_tg_emergency' if no_fallback else 'auto_tg_emergency'
     gate_ctx = {
         'is_emergency': True,
         'trigger_type': 'telegram_emergency',
         'alert_data': alert_data,
     }
     result, meta = _call_claude_advisory(
-        prompt, gate='emergency', cooldown_key='tg_emergency', context=gate_ctx)
+        prompt, gate='emergency', cooldown_key=ck, context=gate_ctx,
+        call_type=call_type)
+    meta['call_type'] = call_type
     _save_advisory('emergency_advisory',
                    {'user_text': text, 'alert_summary': alert_summary, 'context': context_str},
                    result, meta)
     if meta.get('fallback_used'):
-        return (result, 'gpt-4o-mini')
+        return (result, 'claude(denied)' if no_fallback else 'gpt-4o-mini')
     cost = meta.get('estimated_cost_usd', 0)
     return (result, f'anthropic (${cost:.4f})')
 
@@ -586,9 +602,24 @@ def _enqueue_strategy_action(cur, action, pos_state, scores, reason):
     return None
 
 
-def _ai_strategy_advisory(text: str) -> tuple:
+def _parse_claude_action(ai_text: str) -> str:
+    """Claude 응답에서 '최종 ACTION: XXX' 패턴을 파싱. 없으면 빈 문자열."""
+    import re
+    m = re.search(r'최종\s*ACTION\s*[:\s]\s*(HOLD|ADD|REDUCE|CLOSE|REVERSE)', ai_text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # fallback: "**최종 ACTION: REDUCE**" 마크다운 패턴
+    m = re.search(r'\*\*최종\s*ACTION\s*[:\s]\s*(HOLD|ADD|REDUCE|CLOSE|REVERSE)\*\*', ai_text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return ''
+
+
+def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
     """Strategy pipeline: Score → Action → Execute → AI verify.
-    Claude only for CLOSE/REVERSE/REDUCE or SL proximity. Returns (text, provider)."""
+    Claude only for CLOSE/REVERSE/REDUCE or SL proximity (or USER/EMERGENCY).
+    call_type: AUTO/USER/EMERGENCY. Returns (text, provider)."""
+    no_fallback = call_type in ('USER', 'EMERGENCY')
     import psycopg2
     import score_engine
 
@@ -668,6 +699,7 @@ def _ai_strategy_advisory(text: str) -> tuple:
             needs_claude = (
                 action in CLAUDE_STRATEGY_ACTIONS
                 or sl_remaining < SL_PROXIMITY_PCT
+                or no_fallback
             )
 
             ai_text = ''
@@ -676,33 +708,56 @@ def _ai_strategy_advisory(text: str) -> tuple:
 
             if needs_claude:
                 try:
-                    claude_prompt = (
-                        f"시스템이 아래와 같이 판단했습니다. 타당성을 검증하세요.\n\n"
-                        f"ACTION: {action}\n"
+                    score_block = (
                         f"SCORE: {total:+.1f} ({dominant} stage {stage})\n"
                         f"  TECH={tech:+.0f} POS={pos_score:+.0f} REGIME={regime:+.0f} NEWS={news_s:+.0f}\n"
                         f"POSITION: {pos_state.get('side', 'none')} qty={pos_state.get('total_qty', 0)} "
                         f"entry=${pos_state.get('avg_entry_price', 0):,.0f}\n"
                         f"PRICE: ${price:,.1f}\n"
-                        f"REASON: {reason}\n\n"
-                        "검증 요청 (300자 이내):\n"
-                        "1. 이 판단의 타당성 (동의/주의/반대)\n"
-                        "2. 핵심 리스크 1개\n"
-                        "3. 관찰 포인트 1개"
                     )
+                    if no_fallback:
+                        # OpenClaw: Claude makes final decision
+                        claude_prompt = (
+                            f"아래 스코어 엔진 결과를 참고하여 최종 판단을 내려주세요.\n\n"
+                            f"[스코어 엔진 참고]\n"
+                            f"SUGGESTED ACTION: {action}\n"
+                            f"{score_block}"
+                            f"REASON: {reason}\n\n"
+                            "최종 판단 요청 (400자 이내):\n"
+                            "1. 최종 ACTION (HOLD/ADD/REDUCE/CLOSE/REVERSE) — 스코어 엔진과 다를 수 있음\n"
+                            "2. 판단 근거 2줄\n"
+                            "3. 핵심 리스크 1개\n"
+                            "4. 관찰 포인트 1개"
+                        )
+                    else:
+                        # Normal: Claude validates
+                        claude_prompt = (
+                            f"시스템이 아래와 같이 판단했습니다. 타당성을 검증하세요.\n\n"
+                            f"ACTION: {action}\n"
+                            f"{score_block}"
+                            f"REASON: {reason}\n\n"
+                            "검증 요청 (300자 이내):\n"
+                            "1. 이 판단의 타당성 (동의/주의/반대)\n"
+                            "2. 핵심 리스크 1개\n"
+                            "3. 관찰 포인트 1개"
+                        )
+                    ck = 'user_tg_strategy' if no_fallback else 'auto_tg_strategy'
                     gate_ctx = {
                         'intent': 'strategy',
                         'candidate_action': action,
                         'sl_dist_pct': sl_dist,
                     }
                     (ai_text, ai_meta) = _call_claude_advisory(
-                        claude_prompt, gate='pre_action', cooldown_key='tg_strategy',
-                        context=gate_ctx)
+                        claude_prompt, gate='pre_action', cooldown_key=ck,
+                        context=gate_ctx, call_type=call_type)
+                    ai_meta['call_type'] = call_type
                     if ai_meta.get('fallback_used'):
-                        ai_label = 'GPT-mini (fallback)'
+                        ai_label = 'Claude (denied)' if no_fallback else 'GPT-mini (fallback)'
                     else:
                         cost = ai_meta.get('estimated_cost_usd', 0)
+                        latency = ai_meta.get('api_latency_ms', 0)
                         ai_label = f'Claude (${cost:.4f})'
+                        ai_meta['model_provider'] = 'anthropic'
                 except Exception as e:
                     ai_text = f'(AI 분석 실패: {e})'
                     ai_meta = {'model': 'error', 'api_latency_ms': 0, 'fallback_used': True}
@@ -721,17 +776,56 @@ def _ai_strategy_advisory(text: str) -> tuple:
                     start_ms = int(time.time() * 1000)
                     ai_text = _call_gpt_advisory(gpt_prompt)
                     elapsed = int(time.time() * 1000) - start_ms
-                    ai_meta = {'model': 'gpt-4o-mini', 'api_latency_ms': elapsed, 'fallback_used': False}
+                    ai_meta = {'model': 'gpt-4o-mini', 'api_latency_ms': elapsed,
+                               'fallback_used': False, 'model_provider': 'openai'}
                     ai_label = 'GPT-mini'
                 except Exception as e:
                     ai_text = f'(GPT 분석 실패: {e})'
-                    ai_meta = {'model': 'error', 'api_latency_ms': 0, 'fallback_used': True}
+                    ai_meta = {'model': 'error', 'api_latency_ms': 0,
+                               'fallback_used': True, 'model_provider': 'error'}
                     ai_label = 'error'
+
+            # Phase 5: Claude override enqueue (no_fallback mode only)
+            claude_eq_id = None
+            if no_fallback and ai_text and not ai_meta.get('fallback_used'):
+                claude_action = _parse_claude_action(ai_text)
+                if claude_action and claude_action != action and claude_action != 'HOLD':
+                    if auto_ok and claude_action in ('REDUCE', 'CLOSE', 'REVERSE', 'ADD'):
+                        claude_eq_id = _enqueue_strategy_action(
+                            cur, claude_action, pos_state, scores,
+                            f'claude_override: {claude_action} (engine={action})')
+                        if claude_eq_id:
+                            eq_id = claude_eq_id
+                            execute_status = f'YES claude_override (eq_id={claude_eq_id})'
+                            _log(f'CLAUDE OVERRIDE: {action} → {claude_action} eq_id={claude_eq_id}')
+                        else:
+                            execute_status = f'NO (claude {claude_action} safety block)'
+                            _log(f'CLAUDE OVERRIDE blocked by safety: {claude_action}')
+                    elif not auto_ok:
+                        _log(f'CLAUDE OVERRIDE skipped (auto_trading inactive): {claude_action}')
+
+            # Update header EXECUTE line if Phase 5 changed it
+            if claude_eq_id:
+                lines[-1] = f'EXECUTE: {execute_status}'
+                header = '\n'.join(lines)
 
             # Compose final output
             result = header
             if ai_text:
-                result += f'\n\n--- AI 분석 ({ai_label}) ---\n{ai_text}'
+                if no_fallback and not ai_meta.get('fallback_used'):
+                    section_title = 'Claude 최종 판단'
+                else:
+                    section_title = 'AI 분석'
+                result += f'\n\n--- {section_title} ({ai_label}) ---\n{ai_text}'
+                # Model info line
+                m_provider = ai_meta.get('model_provider', 'unknown')
+                m_model = ai_meta.get('model', 'unknown')
+                m_latency = ai_meta.get('api_latency_ms', 0)
+                result += f'\n─ model={m_model} provider={m_provider} latency={m_latency}ms'
+
+            # Claude override indicator
+            if claude_eq_id:
+                result += f'\n⚡ CLAUDE OVERRIDE: {action} → {claude_action} (eq_id={claude_eq_id})'
 
             # Provider label for footer
             if 'Claude' in ai_label:
@@ -753,16 +847,21 @@ def _ai_strategy_advisory(text: str) -> tuple:
                 'dynamic_stop_loss_pct': scores.get('dynamic_stop_loss_pct'),
                 'price': scores.get('price'),
             }
+            save_meta = {
+                **ai_meta,
+                'recommended_action': action,
+                'confidence': scores.get('confidence'),
+                'reason_bullets': [reason],
+                'execution_queue_id': eq_id,
+            }
+            if claude_eq_id:
+                save_meta['claude_override_action'] = claude_action
+                save_meta['engine_action'] = action
             _save_advisory('strategy',
                            {'user_text': text, 'scores': scores_summary,
                             'pos_state': pos_state,
                             'action': action, 'reason': reason},
-                           result,
-                           {**ai_meta,
-                            'recommended_action': action,
-                            'confidence': scores.get('confidence'),
-                            'reason_bullets': [reason],
-                            'execution_queue_id': eq_id})
+                           result, save_meta)
 
             return (result, provider)
 
@@ -830,38 +929,56 @@ def _ai_general_advisory(text: str) -> str:
 
 
 def _call_claude_advisory(prompt: str, gate: str = 'telegram',
-                          cooldown_key: str = '', context: dict = None) -> tuple:
-    """Call Claude via gate. Falls back to GPT on denial.
+                          cooldown_key: str = '', context: dict = None,
+                          call_type: str = 'AUTO') -> tuple:
+    """Call Claude via gate. Falls back to GPT on denial (unless USER/EMERGENCY).
+    call_type: AUTO/USER/EMERGENCY controls cooldown/budget bypass and fallback.
     Returns (text_response, metadata_dict).
     """
     import claude_gate
     if context is None:
         context = {}
+    no_fallback = call_type in ('USER', 'EMERGENCY')
 
     result = claude_gate.call_claude(
         gate=gate, prompt=prompt, cooldown_key=cooldown_key,
-        context=context, max_tokens=800)
+        context=context, max_tokens=800, call_type=call_type)
 
     if result.get('fallback_used'):
+        if no_fallback:
+            reason = result.get('gate_reason', 'unknown')
+            _log(f"Claude gate denied ({reason}) — call_type={call_type}, no fallback")
+            return (f'⚠️ Claude 게이트 거부 (GPT fallback 차단): {reason}', {
+                'model': 'claude(denied)',
+                'model_provider': 'anthropic(denied)',
+                'api_latency_ms': 0,
+                'fallback_used': True,
+                'gate_reason': reason,
+                'call_type': call_type,
+            })
         _log(f"Claude gate denied ({result.get('gate_reason', '?')}) — fallback to GPT")
         start_ms = int(time.time() * 1000)
         gpt_text = _call_gpt_advisory(prompt)
         elapsed = int(time.time() * 1000) - start_ms
         return (gpt_text, {
             'model': 'gpt-4o-mini(claude-fallback)',
+            'model_provider': 'openai(fallback)',
             'api_latency_ms': elapsed,
             'fallback_used': True,
             'gate_reason': result.get('gate_reason', ''),
+            'call_type': call_type,
         })
 
     return (result.get('text', ''), {
         'model': result.get('model', 'claude'),
+        'model_provider': 'anthropic',
         'api_latency_ms': result.get('api_latency_ms', 0),
         'fallback_used': False,
         'input_tokens': result.get('input_tokens', 0),
         'output_tokens': result.get('output_tokens', 0),
         'estimated_cost_usd': result.get('estimated_cost_usd', 0),
         'gate_type': result.get('gate_type', gate),
+        'call_type': call_type,
     })
 
 def _call_gpt_advisory(prompt: str, provider_override: str = "") -> str:
@@ -917,7 +1034,8 @@ def _save_advisory(kind, input_packet, response_text, metadata):
         with conn.cursor() as cur:
             ca_id = save_claude_analysis.save_analysis(
                 cur, kind=kind, input_packet=input_packet, output=output,
-                model_used=metadata.get('model', 'unknown'))
+                model_used=metadata.get('model', 'unknown'),
+                model_provider=metadata.get('model_provider'))
             if ca_id:
                 eq_id = metadata.get('execution_queue_id')
                 save_claude_analysis.create_pending_outcome(
@@ -995,9 +1113,13 @@ def _handle_directive_intent(intent, text):
 
 # ── main command handler ─────────────────────────────────
 
-def _footer(intent_name: str, route: str, provider: str) -> str:
-    if provider.startswith('anthropic'):
-        return f"\n─\n[{intent_name}] 🤖 Claude used | {provider}"
+def _footer(intent_name: str, route: str, provider: str,
+            call_type: str = '', bypass: bool = False, cost: float = 0.0) -> str:
+    if provider.startswith('anthropic') or call_type in ('USER', 'EMERGENCY'):
+        ct_str = f' {call_type} |' if call_type else ''
+        bp_str = f' bypass={str(bypass).lower()} |' if call_type else ''
+        cost_str = f' cost=${cost:.4f}' if cost else ''
+        return f"\n─\n[{intent_name}]{ct_str} Claude used |{bp_str}{cost_str} {provider}"
     return f"\n─\n[{intent_name}] route={route} provider={provider}"
 
 def handle_command(text: str) -> str:
@@ -1021,6 +1143,16 @@ def handle_command(text: str) -> str:
         args_text = t[len('/keywords'):].strip()
         return _handle_directive_command('WATCH_KEYWORDS', _parse_kw_args(args_text)) + _footer('keywords', 'local', 'local')
 
+    # 1c. /force — cooldown bypass, Claude forced, no fallback
+    if t == '/force' or t.startswith('/force '):
+        force_text = t[len('/force'):].strip() or '지금 BTC 전략 분석해줘'
+        _log(f'/force command: call_type=USER, text={force_text[:50]}')
+        force_intent = {'intent': 'strategy', 'claude_prompt': force_text}
+        ai_result, ai_provider = _ai_advisory(force_intent, force_text,
+                                               no_fallback=True, force=True)
+        return ai_result + _footer('force_strategy', 'claude', ai_provider,
+                                   call_type='USER', bypass=True)
+
     # 2. GPT Router — classify intent
     try:
         intent = gpt_router.classify_intent(t)
@@ -1034,8 +1166,8 @@ def handle_command(text: str) -> str:
          f"fallback={intent.get('_fallback', False)} "
          f"budget_exceeded={intent.get('_budget_exceeded', False)}")
 
-    # 3. Cooldown hit
-    if intent.get("_cooldown_hit"):
+    # 3. Cooldown hit — OpenClaw (route=claude) bypasses dedup
+    if intent.get("_cooldown_hit") and route != "claude":
         return "⏳ 동일 요청이 최근에 처리되었습니다. 잠시 후 다시 시도해주세요."
 
     # 4. Route: local (NO AI) — but news may upgrade to claude
@@ -1058,10 +1190,11 @@ def handle_command(text: str) -> str:
         dir_result, dir_provider = _handle_directive_intent(intent, t)
         return dir_result + _footer('directive', 'local', dir_provider)
 
-    # 5. Route: claude → gate-controlled (Claude only when conditions met)
+    # 5. Route: claude → gate-controlled (Claude only, no GPT fallback)
     if route == "claude":
-        ai_result, ai_provider = _ai_advisory(intent, t)
-        return ai_result + _footer(intent_name, "claude", ai_provider)
+        ai_result, ai_provider = _ai_advisory(intent, t, no_fallback=True)
+        return ai_result + _footer(intent_name, "claude", ai_provider,
+                                   call_type='USER', bypass=True)
 
     # 6. Route: none / other
     return (

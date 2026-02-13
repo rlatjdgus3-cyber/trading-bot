@@ -175,16 +175,17 @@ def get_top_news(limit=5, min_impact=6):
     return '\n'.join(lines)
 
 
-def anthropic_call(user_text=None, system_text=None, max_tokens=None):
+def anthropic_call(user_text=None, system_text=None, max_tokens=None,
+                   call_type='AUTO'):
     if not ANTHROPIC_KEY:
         return 'Claude 키가 없어요.'
     try:
         import claude_gate
         prompt = ((system_text or '') + '\n\n' + (user_text or '')).strip()
         result = claude_gate.call_claude(
-            gate='telegram', prompt=prompt,
-            cooldown_key='openclo', context={'intent': 'chat'},
-            max_tokens=max_tokens or 300)
+            gate='openclaw', prompt=prompt,
+            cooldown_key='openclo', context={'intent': 'chat', 'source': 'openclaw'},
+            max_tokens=max_tokens or 300, call_type=call_type)
         if result.get('fallback_used'):
             return f'Claude 게이트 거부: {result.get("gate_reason", "unknown")}'
         return result.get('text', '')
@@ -227,7 +228,8 @@ def help_text():
     return ('✅ OpenClo (대화형+운영+디렉티브)\n명령어:\n/help\n/status\n/decision 또는 /d\n'
             '/news (중요뉴스)\n/arm (긴급명령 허용 ON)\n/disarm (긴급명령 OFF)\n/ops (최근 명령 결과)\n'
             '/audit (시스템 감사)\n/risk <mode> (conservative/normal/aggressive)\n'
-            '/keywords (워치 키워드 목록)\n/directives (최근 디렉티브)\n\n'
+            '/keywords (워치 키워드 목록)\n/directives (최근 디렉티브)\n'
+            '/force (쿨다운 무시 + Claude 강제 실행)\n\n'
             '자연어 예시:\n- 오늘자 뉴스 정리해줘\n- 중요뉴스 가져와\n- 한글로\n'
             '- 뉴스 기준 7로 바꿔\n- 메인 재시작해줘\n- 긴급이야 매매 멈춰\n'
             '- BTC 키워드에 trump 추가해\n- 리스크 보수적으로 바꿔\n'
@@ -320,6 +322,12 @@ def handle(text=None):
             params = {'action': 'list', 'keywords': []}
         result = openclaw_engine.execute_directive(db, 'WATCH_KEYWORDS', params, source='telegram')
         return result.get('message', 'Keywords processed')
+    if t == '/force' or t.startswith('/force '):
+        force_text = t[len('/force'):].strip() or '지금 BTC 전략 판단해줘'
+        return '🔓 [FORCE] 쿨다운 무시, Claude 강제 실행\n\n' + anthropic_call(
+            force_text,
+            system_text='비트코인 선물 트레이딩 전략 판단을 내려주세요. 400자 이내.',
+            max_tokens=500, call_type='USER')
     if t == '/directives':
         def _run(conn):
             with conn.cursor() as cur:

@@ -25,61 +25,38 @@ def _log(msg):
 
 
 def emergency_analysis(context_packet=None):
-    '''Analyze emergency market situation via Claude API.
+    """Analyze emergency via Claude gate. Falls back on denial."""
+    ctx = context_packet or {}
+    import claude_gate
+    ctx_compact = claude_gate.compact_context(ctx)
+    prompt = _build_prompt(ctx_compact)
 
-    Args:
-        context_packet: {
-            position: {side, qty, entry_price, upnl},
-            price: float,
-            trigger: {type, detail},
-            indicators: {atr, rsi, kijun, poc, vah, val},
-            candles_1m: [...last 10 candles],
-            scores: {long_score, short_score},
-            news: [...recent headlines],
-            funding_rate: float,
-        }
+    trigger = ctx.get('trigger', {})
+    cooldown_key = trigger.get('type', 'unknown')
+    gate_context = {
+        'trigger_type': trigger.get('type', ''),
+        'zscore_band': ctx.get('zscore_band', ''),
+        'is_emergency': True,
+    }
 
-    Returns:
-        {
-            risk_level: "low"|"medium"|"high"|"critical",
-            recommended_action: "HOLD"|"REDUCE"|"CLOSE"|"REVERSE",
-            reduce_pct: int (if REDUCE),
-            confidence: float (0-1),
-            reason_bullets: [str],
-            ttl_seconds: int,
-        }
-    '''
-    start_ms = int(time.time() * 1000)
-    try:
-        import anthropic
-        from dotenv import load_dotenv
-        load_dotenv('/root/trading-bot/app/.env')
-        api_key = os.getenv('ANTHROPIC_API_KEY', '')
-        if not api_key:
-            _log('ANTHROPIC_API_KEY not set')
-            return {**FALLBACK_RESPONSE, 'fallback_used': True}
+    result = claude_gate.call_claude(
+        gate='emergency', prompt=prompt, cooldown_key=cooldown_key,
+        context=gate_context, max_tokens=600, call_type='EMERGENCY')
 
-        client = anthropic.Anthropic(api_key=api_key)
-        prompt = _build_prompt(context_packet)
+    if result.get('fallback_used'):
+        _log(f'gate denied: {result.get("gate_reason", "unknown")}')
+        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': 0,
+                'gate_reason': result.get('gate_reason', '')}
 
-        response = client.messages.create(
-            model='claude-sonnet-4-20250514',
-            max_tokens=1024,
-            messages=[{'role': 'user', 'content': prompt}])
-
-        raw = response.content[0].text
-        elapsed = int(time.time() * 1000) - start_ms
-        _log(f'API call: {elapsed}ms')
-
-        result = _parse_response(raw)
-        result['api_latency_ms'] = elapsed
-        result['fallback_used'] = False
-        return result
-
-    except Exception as e:
-        _log(f'API error: {e}')
-        elapsed = int(time.time() * 1000) - start_ms
-        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': elapsed}
+    parsed = _parse_response(result.get('text', ''))
+    parsed['fallback_used'] = False
+    parsed['api_latency_ms'] = result.get('api_latency_ms', 0)
+    parsed['input_tokens'] = result.get('input_tokens', 0)
+    parsed['output_tokens'] = result.get('output_tokens', 0)
+    parsed['estimated_cost_usd'] = result.get('estimated_cost_usd', 0)
+    parsed['gate_type'] = result.get('gate_type', 'emergency')
+    parsed['model'] = result.get('model', '')
+    return parsed
 
 
 def _build_prompt(ctx=None):
@@ -110,7 +87,6 @@ def _build_prompt(ctx=None):
             )
             score_section += f'\n\n## Similar Historical Events\n{events_text}'
 
-        regime_detail = unified.get('axis_details', {}).get('regime', {})
 
     prompt = (
         f"You are a crypto trading risk analyst. A sudden market event was detected.\n"
@@ -220,50 +196,38 @@ def _parse_response(raw=None):
 
 
 def score_change_analysis(context_packet=None):
-    '''Analyze a rapid score change event via Claude API.
+    """Analyze score change via Claude gate (pre_action). Falls back on denial."""
+    ctx = context_packet or {}
+    import claude_gate
+    ctx_compact = claude_gate.compact_context(ctx)
+    prompt = _build_prompt(ctx_compact)
 
-    Called when the unified score changes by 30+ points in 15 minutes.
-    Uses a specialized prompt focused on score axis changes.
+    action = ctx.get('candidate_action', '')
+    sl_dist = ctx.get('sl_dist_pct')
+    cooldown_key = f'score_{action or "change"}'
+    gate_context = {
+        'candidate_action': action,
+        'sl_dist_pct': sl_dist,
+    }
 
-    Args:
-        context_packet: Same as emergency_analysis, with additional:
-            - score_delta: float (magnitude of change)
-            - previous_score: float
-            - current_score: float
+    result = claude_gate.call_claude(
+        gate='pre_action', prompt=prompt, cooldown_key=cooldown_key,
+        context=gate_context, max_tokens=600, call_type='AUTO')
 
-    Returns: Same format as emergency_analysis.
-    '''
-    start_ms = int(time.time() * 1000)
-    try:
-        import anthropic
-        from dotenv import load_dotenv
-        load_dotenv('/root/trading-bot/app/.env')
-        api_key = os.getenv('ANTHROPIC_API_KEY', '')
-        if not api_key:
-            _log('ANTHROPIC_API_KEY not set')
-            return {**FALLBACK_RESPONSE, 'fallback_used': True}
+    if result.get('fallback_used'):
+        _log(f'gate denied (score_change): {result.get("gate_reason", "unknown")}')
+        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': 0,
+                'gate_reason': result.get('gate_reason', '')}
 
-        client = anthropic.Anthropic(api_key=api_key)
-        prompt = _build_prompt(context_packet)
-
-        response = client.messages.create(
-            model='claude-sonnet-4-20250514',
-            max_tokens=1024,
-            messages=[{'role': 'user', 'content': prompt}])
-
-        raw = response.content[0].text
-        elapsed = int(time.time() * 1000) - start_ms
-        _log(f'Score change API call: {elapsed}ms')
-
-        result = _parse_response(raw)
-        result['api_latency_ms'] = elapsed
-        result['fallback_used'] = False
-        return result
-
-    except Exception as e:
-        _log(f'Score change API error: {e}')
-        elapsed = int(time.time() * 1000) - start_ms
-        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'api_latency_ms': elapsed}
+    parsed = _parse_response(result.get('text', ''))
+    parsed['fallback_used'] = False
+    parsed['api_latency_ms'] = result.get('api_latency_ms', 0)
+    parsed['input_tokens'] = result.get('input_tokens', 0)
+    parsed['output_tokens'] = result.get('output_tokens', 0)
+    parsed['estimated_cost_usd'] = result.get('estimated_cost_usd', 0)
+    parsed['gate_type'] = result.get('gate_type', 'pre_action')
+    parsed['model'] = result.get('model', '')
+    return parsed
 
 
 if __name__ == '__main__':

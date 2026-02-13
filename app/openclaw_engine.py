@@ -239,7 +239,8 @@ def execute_directive(conn, dtype, params, source='telegram'):
         elif dtype == 'RISK_MODE':
             result = _handle_risk_mode(conn, params, directive_id)
         elif dtype == 'ANALYSIS_REQUEST':
-            result = _handle_analysis_request(conn, params, directive_id)
+            result = _handle_analysis_request(conn, params, directive_id,
+                                              source=source)
         elif dtype == 'PIPELINE_TUNE':
             result = _handle_pipeline_tune(conn, params, directive_id)
         elif dtype == 'AUDIT':
@@ -384,12 +385,14 @@ def _handle_risk_mode(conn, params, directive_id=None):
     }
 
 
-def _handle_analysis_request(conn, params, directive_id=None):
+def _handle_analysis_request(conn, params, directive_id=None, source='telegram'):
     """Handle ANALYSIS_REQUEST directive.
     params: {topic: 'strategy'|'crash'|'news'|'position', context: {}}
+    source: 'telegram' → USER call_type, else AUTO.
     """
     topic = params.get('topic', 'strategy')
     context = params.get('context', {})
+    ct = 'USER' if source == 'telegram' else 'AUTO'
 
     try:
         import claude_gate
@@ -401,10 +404,10 @@ def _handle_analysis_request(conn, params, directive_id=None):
             "risk_level, recommendation, key_observations, action_items."
         )
         result = claude_gate.call_claude(
-            gate='scheduled', prompt=prompt,
+            gate='openclaw', prompt=prompt,
             cooldown_key=f'openclaw_analysis_{topic}',
-            context={'intent': 'analysis_request', 'topic': topic},
-            max_tokens=500)
+            context={'intent': 'analysis_request', 'topic': topic, 'source': 'openclaw'},
+            max_tokens=500, call_type=ct)
 
         if result.get('fallback_used'):
             return {
