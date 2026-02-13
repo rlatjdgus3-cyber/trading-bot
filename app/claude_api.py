@@ -239,7 +239,7 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
             prompt += f"\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
 
     # 3. Gate selection: EMERGENCY → 'emergency', EVENT → 'event_trigger'
-    er_mode = event_result.mode if event_result else 'EVENT'
+    er_mode = getattr(event_result, 'mode', 'EVENT') if event_result else 'EVENT'
     if er_mode == 'EMERGENCY':
         gate = 'emergency'
         call_type = 'EMERGENCY'
@@ -251,8 +251,8 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
     gate_context = {
         'event_mode': er_mode,
         'event_hash': event_result.event_hash if event_result else None,
-        'trigger_type': (event_result.triggers[0].get('type', '')
-                         if event_result and event_result.triggers else ''),
+        'trigger_type': ((getattr(event_result, 'triggers', None) or [])[0].get('type', '')
+                         if event_result and getattr(event_result, 'triggers', None) else ''),
         'is_emergency': er_mode == 'EMERGENCY',
     }
 
@@ -288,13 +288,11 @@ def _parse_response(raw=None):
     if not raw:
         return dict(FALLBACK_RESPONSE)
     text = raw.strip()
-    # Strip markdown backticks
-    if text.startswith('```'):
-        lines = text.split('\n')
-        text = '\n'.join(lines[1:])
-        if text.endswith('```'):
-            text = text[:-3]
-        text = text.strip()
+    # Strip markdown backticks (handles ```json with/without newline)
+    import re
+    text = re.sub(r'^\s*```(?:json)?\s*\n?', '', text)
+    text = re.sub(r'\n?\s*```\s*$', '', text)
+    text = text.strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -309,15 +307,24 @@ def _parse_response(raw=None):
             _log(f'invalid action: {action}')
             return dict(FALLBACK_RESPONSE)
 
+    try:
+        reduce_pct = max(0, min(100, int(data.get('reduce_pct', 0))))
+        target_stage = max(0, min(7, int(data.get('target_stage', 1))))
+        confidence = max(0.0, min(1.0, float(data.get('confidence', 0.5))))
+        ttl_seconds = max(30, min(300, int(data.get('ttl_seconds', 60))))
+    except (ValueError, TypeError):
+        _log(f'field parse error, using defaults')
+        reduce_pct, target_stage, confidence, ttl_seconds = 0, 1, 0.5, 60
+
     return {
         'action': action,
         'recommended_action': action,  # backward compat
-        'reduce_pct': max(0, min(100, int(data.get('reduce_pct', 0)))),
-        'target_stage': max(0, min(7, int(data.get('target_stage', 1)))),
+        'reduce_pct': reduce_pct,
+        'target_stage': target_stage,
         'reason_code': str(data.get('reason_code', ''))[:200],
         'reason_bullets': [str(data.get('reason_code', '') or data.get('reason_bullets', [''])[0] if isinstance(data.get('reason_bullets'), list) else data.get('reason_code', ''))],  # backward compat
-        'confidence': max(0.0, min(1.0, float(data.get('confidence', 0.5)))),
-        'ttl_seconds': max(30, min(300, int(data.get('ttl_seconds', 60)))),
+        'confidence': confidence,
+        'ttl_seconds': ttl_seconds,
     }
 
 

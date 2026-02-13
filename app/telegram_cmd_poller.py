@@ -1233,7 +1233,7 @@ def _send_enqueue_alert(eq_id, action, parsed, pos_state):
         qty_info = ''
         if action == 'REDUCE':
             qty_info = f'reduce_pct={parsed.get("reduce_pct", 0)}'
-        elif 'OPEN' in action:
+        elif action in ('OPEN_LONG', 'OPEN_SHORT'):
             qty_info = f'stage={parsed.get("target_stage", 1)}'
         send_message(
             _load_tg_token(), _load_tg_chat_id(),
@@ -1610,6 +1610,7 @@ def _call_gpt_advisory(prompt: str, provider_override: str = "") -> str:
 
 def _save_advisory(kind, input_packet, response_text, metadata):
     """Save Claude/GPT advisory to DB. Silent on error."""
+    conn = None
     try:
         import psycopg2
         import save_claude_analysis
@@ -1647,9 +1648,14 @@ def _save_advisory(kind, input_packet, response_text, metadata):
                 eq_id = metadata.get('execution_queue_id')
                 save_claude_analysis.create_pending_outcome(
                     cur, ca_id, rec_action, execution_queue_id=eq_id)
-        conn.close()
     except Exception as e:
         _log(f"_save_advisory silent error: {e}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # ── directive helpers ──────────────────────────────────────
 
