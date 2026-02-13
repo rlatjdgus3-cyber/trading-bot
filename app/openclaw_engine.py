@@ -396,13 +396,31 @@ def _handle_analysis_request(conn, params, directive_id=None, source='telegram')
 
     try:
         import claude_gate
-        prompt = (
-            f"System audit analysis request.\n"
-            f"Topic: {topic}\n"
-            f"Context: {json.dumps(context, ensure_ascii=False, default=str)}\n\n"
-            "Provide structured analysis in JSON format with keys: "
-            "risk_level, recommendation, key_observations, action_items."
-        )
+        if topic == 'strategy':
+            prompt = (
+                f"비트코인 선물 트레이딩 전략 분석 요청입니다.\n"
+                f"Context: {json.dumps(context, ensure_ascii=False, default=str)}\n\n"
+                "=== 분석 구조 (반드시 아래 순서로 작성) ===\n\n"
+                "1️⃣ 박스권 vs 추세 판정\n"
+                "- 24~72h 고점/저점 범위와 현재가 위치\n"
+                "- BB bandwidth + mid 기울기, Kijun/Cloud/POC/VAH/VAL 위치\n"
+                "- 최근 돌파 시도 성공/실패 여부\n\n"
+                "2️⃣ REGIME 해석\n"
+                "A) 고변동 하락 추세 / B) 고변동 박스권 / C) 단순 노이즈\n\n"
+                "3️⃣ 최종 결론 (반드시 하나 선택):\n"
+                "A) 박스권 반등 / B) 추세 전환 진행 / "
+                "C) 아직 불명확 — 확정 트리거 가격 제시\n\n"
+                "마지막 줄: 최종 ACTION: HOLD/ADD/REDUCE/CLOSE/REVERSE\n"
+                "1000자 이내."
+            )
+        else:
+            prompt = (
+                f"System audit analysis request.\n"
+                f"Topic: {topic}\n"
+                f"Context: {json.dumps(context, ensure_ascii=False, default=str)}\n\n"
+                "Provide structured analysis in JSON format with keys: "
+                "risk_level, recommendation, key_observations, action_items."
+            )
         result = claude_gate.call_claude(
             gate='openclaw', prompt=prompt,
             cooldown_key=f'openclaw_analysis_{topic}',

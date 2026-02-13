@@ -351,6 +351,27 @@ STRATEGY_SYMBOL = 'BTC/USDT:USDT'
 CLAUDE_STRATEGY_ACTIONS = {'CLOSE', 'REVERSE', 'REDUCE'}
 SL_PROXIMITY_PCT = 0.3  # Call Claude when remaining SL distance < this %
 
+# ── 3-stage strategy analysis template ────────────────────
+STRATEGY_ANALYSIS_TEMPLATE = (
+    "=== 분석 구조 (반드시 아래 순서로 작성) ===\n\n"
+    "1️⃣ 박스권 vs 추세 판정\n"
+    "- 최근 24~72h 고점/저점 범위(%)와 현재가 레인지 내 위치\n"
+    "- BB bandwidth + mid 기울기 해석\n"
+    "- Kijun/Cloud 대비 현재가 위치\n"
+    "- POC/VAH/VAL 대비 현재가 위치\n"
+    "- 최근 돌파 시도 성공/실패 여부 추정\n\n"
+    "2️⃣ REGIME 해석\n"
+    "현재 시장 상태를 아래 중 하나로 명확히 분류:\n"
+    "  A) 고변동 하락 추세\n"
+    "  B) 고변동 박스권\n"
+    "  C) 단순 노이즈\n\n"
+    "3️⃣ 최종 결론 (반드시 하나 선택):\n"
+    "  A) 박스권 반등\n"
+    "  B) 추세 전환 진행\n"
+    "  C) 아직 불명확 — 확정 트리거 가격 반드시 제시\n\n"
+    "마지막 줄에 반드시: 최종 ACTION: HOLD/ADD/REDUCE/CLOSE/REVERSE"
+)
+
 
 def _check_auto_trading_active(cur=None):
     """Check if auto-trading is fully active (3 gates).
@@ -602,6 +623,156 @@ def _enqueue_strategy_action(cur, action, pos_state, scores, reason):
     return None
 
 
+def _fetch_strategy_context(cur):
+    """Fetch enriched market context for 3-stage strategy analysis."""
+    ctx = {}
+    sym = STRATEGY_SYMBOL
+
+    # Current indicators (BB, Ichimoku, RSI, ATR, MA)
+    try:
+        cur.execute("""
+            SELECT rsi_14, atr_14, bb_up, bb_mid, bb_dn,
+                   ich_tenkan, ich_kijun, ich_span_a, ich_span_b,
+                   ma_50, ma_200, vol_spike
+            FROM indicators
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT 1;
+        """, (sym,))
+        row = cur.fetchone()
+        if row:
+            bb_up = float(row[2] or 0)
+            bb_mid = float(row[3] or 0)
+            bb_dn = float(row[4] or 0)
+            ctx['ind'] = {
+                'rsi': round(float(row[0] or 0), 1),
+                'atr': round(float(row[1] or 0), 1),
+                'bb_up': bb_up, 'bb_mid': bb_mid, 'bb_dn': bb_dn,
+                'bb_bw': round((bb_up - bb_dn) / bb_mid * 100, 2) if bb_mid else 0,
+                'tenkan': float(row[5] or 0),
+                'kijun': float(row[6] or 0),
+                'span_a': float(row[7] or 0),
+                'span_b': float(row[8] or 0),
+                'ma50': float(row[9] or 0),
+                'ma200': float(row[10] or 0),
+                'vol_spike': bool(row[11]),
+            }
+    except Exception as e:
+        _log(f'strategy_ctx indicators error: {e}')
+
+    # BB mid slope (last 20 readings ≈ 20 min on 1m tf)
+    try:
+        cur.execute("""
+            SELECT bb_mid FROM indicators
+            WHERE symbol = %s AND tf = '1m' AND bb_mid IS NOT NULL
+            ORDER BY ts DESC LIMIT 20;
+        """, (sym,))
+        rows = cur.fetchall()
+        if len(rows) >= 5:
+            newest = float(rows[0][0])
+            oldest = float(rows[-1][0])
+            diff = newest - oldest
+            if abs(diff) < 5:
+                slope = 'flat'
+            elif diff > 0:
+                slope = 'rising'
+            else:
+                slope = 'falling'
+            ctx.setdefault('ind', {})['bb_mid_slope'] = slope
+    except Exception:
+        pass
+
+    # 24h / 72h high-low range
+    try:
+        cur.execute("""
+            SELECT
+                MIN(l) FILTER (WHERE ts > now() - interval '24 hours'),
+                MAX(h) FILTER (WHERE ts > now() - interval '24 hours'),
+                MIN(l) FILTER (WHERE ts > now() - interval '72 hours'),
+                MAX(h) FILTER (WHERE ts > now() - interval '72 hours')
+            FROM market_ohlcv
+            WHERE symbol = %s AND tf = '5m'
+              AND ts > now() - interval '72 hours';
+        """, (sym,))
+        row = cur.fetchone()
+        if row and row[0]:
+            ctx['range'] = {
+                'low_24h': float(row[0]), 'high_24h': float(row[1]),
+                'low_72h': float(row[2]), 'high_72h': float(row[3]),
+            }
+    except Exception as e:
+        _log(f'strategy_ctx range error: {e}')
+
+    # Volume profile (POC/VAH/VAL)
+    try:
+        cur.execute("""
+            SELECT poc, vah, val FROM vol_profile
+            WHERE symbol = %s ORDER BY ts DESC LIMIT 1;
+        """, (sym,))
+        row = cur.fetchone()
+        if row:
+            ctx['vp'] = {
+                'poc': float(row[0] or 0),
+                'vah': float(row[1] or 0),
+                'val': float(row[2] or 0),
+            }
+    except Exception as e:
+        _log(f'strategy_ctx vol_profile error: {e}')
+
+    return ctx
+
+
+def _format_market_data(price, ctx):
+    """Format enriched market data block for Claude strategy prompt."""
+    lines = [f'BTC 현재가: ${price:,.1f}']
+
+    # Price range
+    rng = ctx.get('range', {})
+    if rng:
+        h24, l24 = rng.get('high_24h', 0), rng.get('low_24h', 0)
+        h72, l72 = rng.get('high_72h', 0), rng.get('low_72h', 0)
+        r24_pct = (h24 - l24) / l24 * 100 if l24 else 0
+        r72_pct = (h72 - l72) / l72 * 100 if l72 else 0
+        pos_24 = (price - l24) / (h24 - l24) * 100 if (h24 - l24) > 0 else 50
+        lines.append(f'\n[가격 범위]')
+        lines.append(f'24h: ${l24:,.0f} ~ ${h24:,.0f} (범위 {r24_pct:.1f}%)')
+        lines.append(f'72h: ${l72:,.0f} ~ ${h72:,.0f} (범위 {r72_pct:.1f}%)')
+        lines.append(f'현재가 위치: 24h 레인지 {pos_24:.0f}% 지점')
+
+    # Indicators
+    ind = ctx.get('ind', {})
+    if ind:
+        lines.append(f'\n[Bollinger Bands]')
+        lines.append(f'Upper: ${ind.get("bb_up", 0):,.0f} | Mid: ${ind.get("bb_mid", 0):,.0f} | Lower: ${ind.get("bb_dn", 0):,.0f}')
+        lines.append(f'Bandwidth: {ind.get("bb_bw", 0):.2f}% | Mid 기울기: {ind.get("bb_mid_slope", "n/a")}')
+
+        lines.append(f'\n[Ichimoku]')
+        lines.append(f'Tenkan: ${ind.get("tenkan", 0):,.0f} | Kijun: ${ind.get("kijun", 0):,.0f}')
+        lines.append(f'Cloud: Span A=${ind.get("span_a", 0):,.0f} Span B=${ind.get("span_b", 0):,.0f}')
+        cloud_top = max(ind.get('span_a', 0), ind.get('span_b', 0))
+        cloud_bot = min(ind.get('span_a', 0), ind.get('span_b', 0))
+        if price > cloud_top:
+            cloud_pos = '가격 > Cloud (위)'
+        elif price < cloud_bot:
+            cloud_pos = '가격 < Cloud (아래)'
+        else:
+            cloud_pos = '가격 ∈ Cloud (내부)'
+        lines.append(cloud_pos)
+
+        lines.append(f'\n[이동평균 & 기타]')
+        lines.append(f'MA50: ${ind.get("ma50", 0):,.0f} | MA200: ${ind.get("ma200", 0):,.0f}')
+        lines.append(f'RSI(14): {ind.get("rsi", 0)} | ATR(14): {ind.get("atr", 0)}')
+        if ind.get('vol_spike'):
+            lines.append('Volume Spike 감지')
+
+    # Volume profile
+    vp = ctx.get('vp', {})
+    if vp:
+        lines.append(f'\n[Volume Profile]')
+        lines.append(f'POC: ${vp.get("poc", 0):,.0f} | VAH: ${vp.get("vah", 0):,.0f} | VAL: ${vp.get("val", 0):,.0f}')
+
+    return '\n'.join(lines)
+
+
 def _parse_claude_action(ai_text: str) -> str:
     """Claude 응답에서 '최종 ACTION: XXX' 패턴을 파싱. 없으면 빈 문자열."""
     import re
@@ -636,9 +807,10 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
         )
         conn.autocommit = True
         with conn.cursor() as cur:
-            # Phase 1: Score evaluation
+            # Phase 1: Score evaluation + market context
             scores = score_engine.compute_total(cur=cur)
             pos_state = _fetch_position_state(cur)
+            strategy_ctx = _fetch_strategy_context(cur)
 
             # Phase 2: Action decision
             (action, reason, details) = _evaluate_strategy_action(scores, pos_state)
@@ -708,39 +880,48 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
 
             if needs_claude:
                 try:
-                    score_block = (
-                        f"SCORE: {total:+.1f} ({dominant} stage {stage})\n"
-                        f"  TECH={tech:+.0f} POS={pos_score:+.0f} REGIME={regime:+.0f} NEWS={news_s:+.0f}\n"
-                        f"POSITION: {pos_state.get('side', 'none')} qty={pos_state.get('total_qty', 0)} "
-                        f"entry=${pos_state.get('avg_entry_price', 0):,.0f}\n"
-                        f"PRICE: ${price:,.1f}\n"
+                    market_data = _format_market_data(price, strategy_ctx)
+                    pos_line = (
+                        f"POSITION: {pos_state.get('side', 'none')} "
+                        f"qty={pos_state.get('total_qty', 0)} "
+                        f"entry=${pos_state.get('avg_entry_price', 0):,.0f}"
                     )
+
                     if no_fallback:
-                        # OpenClaw: Claude makes final decision
+                        # USER: Claude analyzes independently (no score_engine summary)
                         claude_prompt = (
-                            f"아래 스코어 엔진 결과를 참고하여 최종 판단을 내려주세요.\n\n"
-                            f"[스코어 엔진 참고]\n"
-                            f"SUGGESTED ACTION: {action}\n"
-                            f"{score_block}"
-                            f"REASON: {reason}\n\n"
-                            "최종 판단 요청 (400자 이내):\n"
-                            "1. 최종 ACTION (HOLD/ADD/REDUCE/CLOSE/REVERSE) — 스코어 엔진과 다를 수 있음\n"
-                            "2. 판단 근거 2줄\n"
-                            "3. 핵심 리스크 1개\n"
-                            "4. 관찰 포인트 1개"
+                            f"비트코인 선물 트레이딩 전략 분석가로서 "
+                            f"아래 실시간 데이터를 기반으로 독립 분석하세요.\n\n"
+                            f"사용자 요청: {text}\n\n"
+                            f"=== 실시간 시장 데이터 ===\n{market_data}\n\n"
+                            f"=== 포지션 ===\n{pos_line}\n\n"
+                            f"[참고: 스코어 엔진 축별 원점수]\n"
+                            f"TECH={tech:+.0f} | POS={pos_score:+.0f} | "
+                            f"REGIME={regime:+.0f} | NEWS={news_s:+.0f}\n"
+                            f"※ 참고용. 당신의 독립적 판단이 우선합니다.\n\n"
+                            f"{STRATEGY_ANALYSIS_TEMPLATE}\n\n"
+                            "※ 매매 실행 권한 없음. 분석/권고만. 1000자 이내."
                         )
                     else:
-                        # Normal: Claude validates
+                        # AUTO: Claude validates system judgment with 3-stage structure
+                        score_block = (
+                            f"SCORE: {total:+.1f} ({dominant} stage {stage})\n"
+                            f"  TECH={tech:+.0f} POS={pos_score:+.0f} "
+                            f"REGIME={regime:+.0f} NEWS={news_s:+.0f}\n"
+                        )
                         claude_prompt = (
-                            f"시스템이 아래와 같이 판단했습니다. 타당성을 검증하세요.\n\n"
+                            f"시스템이 아래와 같이 판단했습니다. "
+                            f"실시간 데이터로 검증하고 3단계 구조로 분석하세요.\n\n"
+                            f"=== 시스템 판단 ===\n"
                             f"ACTION: {action}\n"
                             f"{score_block}"
+                            f"{pos_line}\n"
                             f"REASON: {reason}\n\n"
-                            "검증 요청 (300자 이내):\n"
-                            "1. 이 판단의 타당성 (동의/주의/반대)\n"
-                            "2. 핵심 리스크 1개\n"
-                            "3. 관찰 포인트 1개"
+                            f"=== 실시간 시장 데이터 ===\n{market_data}\n\n"
+                            f"{STRATEGY_ANALYSIS_TEMPLATE}\n\n"
+                            "※ 매매 실행 권한 없음. 분석/권고만. 800자 이내."
                         )
+
                     ck = 'user_tg_strategy' if no_fallback else 'auto_tg_strategy'
                     gate_ctx = {
                         'intent': 'strategy',
@@ -749,7 +930,8 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                     }
                     (ai_text, ai_meta) = _call_claude_advisory(
                         claude_prompt, gate='pre_action', cooldown_key=ck,
-                        context=gate_ctx, call_type=call_type)
+                        context=gate_ctx, call_type=call_type,
+                        max_tokens=1200)
                     ai_meta['call_type'] = call_type
                     if ai_meta.get('fallback_used'):
                         ai_label = 'Claude (denied)' if no_fallback else 'GPT-mini (fallback)'
@@ -813,7 +995,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             result = header
             if ai_text:
                 if no_fallback and not ai_meta.get('fallback_used'):
-                    section_title = 'Claude 최종 판단'
+                    section_title = 'Claude 전략 분석'
                 else:
                     section_title = 'AI 분석'
                 result += f'\n\n--- {section_title} ({ai_label}) ---\n{ai_text}'
@@ -930,7 +1112,8 @@ def _ai_general_advisory(text: str) -> str:
 
 def _call_claude_advisory(prompt: str, gate: str = 'telegram',
                           cooldown_key: str = '', context: dict = None,
-                          call_type: str = 'AUTO') -> tuple:
+                          call_type: str = 'AUTO',
+                          max_tokens: int = 800) -> tuple:
     """Call Claude via gate. Falls back to GPT on denial (unless USER/EMERGENCY).
     call_type: AUTO/USER/EMERGENCY controls cooldown/budget bypass and fallback.
     Returns (text_response, metadata_dict).
@@ -942,7 +1125,7 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
 
     result = claude_gate.call_claude(
         gate=gate, prompt=prompt, cooldown_key=cooldown_key,
-        context=context, max_tokens=800, call_type=call_type)
+        context=context, max_tokens=max_tokens, call_type=call_type)
 
     if result.get('fallback_used'):
         if no_fallback:
