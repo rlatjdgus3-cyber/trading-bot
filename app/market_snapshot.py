@@ -187,10 +187,10 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
         pass
 
     # Vol profile (POC/VAH/VAL)
-    poc, vah, val = None, None, None
+    poc, vah, val, vol_profile_ts = None, None, None, None
     try:
         cur.execute("""
-            SELECT poc, vah, val FROM vol_profile
+            SELECT poc, vah, val, ts FROM vol_profile
             WHERE symbol = %s ORDER BY ts DESC LIMIT 1;
         """, (sym,))
         vp_row = cur.fetchone()
@@ -198,6 +198,7 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
             poc = float(vp_row[0]) if vp_row[0] else None
             vah = float(vp_row[1]) if vp_row[1] else None
             val = float(vp_row[2]) if vp_row[2] else None
+            vol_profile_ts = vp_row[3].timestamp() if vp_row[3] else None
     except Exception:
         pass
 
@@ -248,6 +249,7 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
         'poc': poc,
         'vah': vah,
         'val': val,
+        'vol_profile_ts': vol_profile_ts,
         'candles_1m': candles_1m,
         'returns': {
             'ret_1m': round(ret_1m, 4) if ret_1m is not None else None,

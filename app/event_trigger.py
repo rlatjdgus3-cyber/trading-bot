@@ -185,12 +185,24 @@ def _check_volume_spike(snapshot) -> list:
     return triggers
 
 
+VOL_PROFILE_MAX_AGE_SEC = 3600  # 1 hour — skip level_breaks if older
+
+
 def _check_level_breaks(snapshot, cur=None) -> list:
     """Check POC shift, VAH/VAL breach."""
     triggers = []
     price = snapshot.get('price', 0)
     if not price:
         return triggers
+
+    # Skip if vol_profile data is stale (>1h)
+    vp_ts = snapshot.get('vol_profile_ts')
+    if vp_ts:
+        age = time.time() - vp_ts
+        if age > VOL_PROFILE_MAX_AGE_SEC:
+            return triggers
+    else:
+        return triggers  # no timestamp = unknown freshness, skip
 
     poc = snapshot.get('poc')
     vah = snapshot.get('vah')
