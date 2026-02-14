@@ -299,7 +299,81 @@ def _build_context(cur=None, pos=None, snapshot=None):
     except Exception:
         ctx['funding_rate'] = 0
 
+    # Decision history for GPT-mini context
+    try:
+        ctx['decision_history'] = _build_decision_history(cur)
+    except Exception:
+        traceback.print_exc()
+        ctx['decision_history'] = {}
+
     return ctx
+
+
+def _build_decision_history(cur):
+    """Build decision history from DB for GPT-mini context injection."""
+    history = {}
+    # 1) pm_decision_log: 최근 3건
+    cur.execute("""
+        SELECT chosen_action, action_reason, ts, position_side, model_used
+        FROM pm_decision_log WHERE symbol = %s
+        ORDER BY ts DESC LIMIT 3;
+    """, (SYMBOL,))
+    rows = cur.fetchall()
+    if rows:
+        history['recent_decisions'] = [
+            {'action': r[0], 'reason': (r[1] or '')[:100],
+             'ts': str(r[2])[:19], 'position_side': r[3], 'model': r[4]}
+            for r in rows]
+        history['last_action'] = rows[0][0]
+        history['last_position_side'] = rows[0][3]
+
+    # 2) event_trigger_log: 최근 1건
+    cur.execute("""
+        SELECT mode, call_type, claude_result->>'action',
+               claude_result->>'reason_code', ts
+        FROM event_trigger_log WHERE symbol = %s AND claude_called = true
+        ORDER BY ts DESC LIMIT 1;
+    """, (SYMBOL,))
+    row = cur.fetchone()
+    if row:
+        history['last_event'] = {'mode': row[0], 'call_type': row[1],
+            'action': row[2], 'reason_code': (row[3] or '')[:80],
+            'ts': str(row[4])[:19]}
+
+    # 3) execution_queue: 최근 1건
+    cur.execute("""
+        SELECT action_type, direction, reason, status, ts
+        FROM execution_queue WHERE symbol = %s
+        ORDER BY ts DESC LIMIT 1;
+    """, (SYMBOL,))
+    row = cur.fetchone()
+    if row:
+        history['last_execution'] = {'action_type': row[0], 'direction': row[1],
+            'reason': (row[2] or '')[:80], 'status': row[3],
+            'ts': str(row[4])[:19]}
+
+    # 4) 파생 플래그: just_closed (30분 이내 청산), hold_suppress
+    last_exec = history.get('last_execution', {})
+    history['just_closed'] = False
+    if last_exec.get('action_type') in ('CLOSE', 'REVERSE_CLOSE'):
+        from datetime import datetime, timezone, timedelta
+        try:
+            exec_ts = datetime.fromisoformat(last_exec['ts'].replace(' ', 'T'))
+            if not exec_ts.tzinfo:
+                exec_ts = exec_ts.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - exec_ts < timedelta(minutes=30):
+                history['just_closed'] = True
+                history['closed_direction'] = last_exec.get('direction')
+        except Exception:
+            pass
+
+    try:
+        locked, _ = event_lock.check_hold_suppress(SYMBOL)
+        history['hold_suppress_active'] = locked
+    except Exception:
+        history['hold_suppress_active'] = False
+
+    return history
 
 
 def _check_emergency(ctx=None):
@@ -738,6 +812,9 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
 
     # ── HOLD ──
     if action == 'HOLD':
+        pos_label = (pos.get('side') or 'NONE').upper()
+        if not pos.get('side'):
+            _log('position=NONE → HOLD(대기)')
         return ('HOLD', result)
 
     # ── REDUCE ──
@@ -1545,7 +1622,7 @@ def _cycle():
             ex = _get_exchange()
             pos = _fetch_position(ex)
             if pos is None:
-                _log('no position, sleeping')
+                _log('position=NONE → HOLD(대기)')
                 return LOOP_SLOW_SEC
 
             # Position change detection → reset edge + hold tracker

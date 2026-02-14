@@ -77,6 +77,29 @@ WATCH_KEYWORDS_DEFAULT = [
     'tariff', 'cpi', 'fomc', 'powell', 'rate', 'inflation', 'hack',
     'liquidation', 'ban', 'approval']
 
+# ── Relevance filter ──────────────────────────────────────
+
+LIST_ARTICLE_KEYWORDS = {'5선', 'top', 'best', 'list', '추천', '정리',
+                         'roundup', 'picks', 'ranking', '순위'}
+RELEVANCE_MULTIPLIERS = {'HIGH': 1.0, 'MED': 0.5, 'LOW': 0.1}
+
+
+def _classify_relevance(title, category, impact_score):
+    """HIGH / MED / LOW 분류."""
+    title_lower = (title or '').lower()
+    impact = int(impact_score or 0)
+    if any(kw in title_lower for kw in LIST_ARTICLE_KEYWORDS):
+        return 'LOW'
+    if category == 'OTHER' and impact <= 3:
+        return 'LOW'
+    if impact >= 7:
+        return 'HIGH'
+    if category == 'OTHER':
+        return 'MED'
+    if impact >= 5:
+        return 'HIGH'
+    return 'MED'
+
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
@@ -322,13 +345,21 @@ def compute(cur):
 
             # Weight by impact_score for aggregation
             w = float(impact) if impact else 3.0
-            agg_source += f_source * w
-            agg_category += f_category * w
-            agg_recency += f_recency * w
-            agg_reaction += f_reaction * w
-            agg_watchlist += f_watchlist * w
-            agg_weight += w
-            direction_votes_sum += item_dir * w
+
+            # Relevance filter: LOW articles contribute only 10%, MED 50%
+            relevance = _classify_relevance(title, cat, impact)
+            relevance_mult = RELEVANCE_MULTIPLIERS.get(relevance, 1.0)
+            effective_w = w * relevance_mult
+            _log(f'relevance: "{(title or "")[:40]}" cat={cat} impact={impact} '
+                 f'level={relevance} mag={item_mag} eff_w={effective_w:.1f}')
+
+            agg_source += f_source * effective_w
+            agg_category += f_category * effective_w
+            agg_recency += f_recency * effective_w
+            agg_reaction += f_reaction * effective_w
+            agg_watchlist += f_watchlist * effective_w
+            agg_weight += effective_w
+            direction_votes_sum += item_dir * effective_w
 
         # Weighted average factors
         if agg_weight > 0:

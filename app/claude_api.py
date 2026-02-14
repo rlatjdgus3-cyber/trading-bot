@@ -148,6 +148,7 @@ def _build_prompt(ctx=None, snapshot=None):
         f"## Recent News\n"
         f"{json.dumps(ctx.get('news', []), ensure_ascii=False)[:500]}\n\n"
         f"{_build_fact_section(ctx)}\n\n"
+        f"{_build_decision_history_section(ctx)}"
         f"{_build_snapshot_section(snapshot)}"
         f"## Instructions\n"
         f"You are the EXECUTION AUTHORITY. Your decision will be executed immediately.\n"
@@ -170,6 +171,8 @@ def _build_prompt(ctx=None, snapshot=None):
         f"- confidence: 0.0 to 1.0\n"
         f"- ttl_seconds: recommendation validity (30-300)\n"
         f"- reason_code: brief English reason (max 200 chars)\n"
+        f"- Use Decision History: do not claim signal reversal unless history shows prior signal\n"
+        f"- If position is NONE and just_closed, consider re-entry cooldown\n"
     )
     return prompt
 
@@ -194,6 +197,34 @@ def _build_fact_section(ctx=None):
         lines.append(f"- Up/Down: {perf.get('up_count', 0)}/{perf.get('down_count', 0)}")
         lines.append(f"- Best 4h: {perf.get('best_4h', 'N/A')}%, Worst 4h: {perf.get('worst_4h', 'N/A')}%")
     return '\n'.join(lines)
+
+
+def _build_decision_history_section(ctx=None):
+    """Build Decision History section for the prompt (~300-400 chars)."""
+    if not ctx:
+        return ''
+    dh = ctx.get('decision_history', {})
+    if not dh:
+        return ''
+    _log(f'decision_history injected: keys={sorted(dh.keys())}')
+    lines = ['## Decision History']
+    recent = dh.get('recent_decisions', [])
+    if recent:
+        for d in recent[:3]:
+            lines.append(f"- {d.get('ts','?')}: {d.get('action','?')} "
+                         f"(pos={d.get('position_side','none')}, "
+                         f"reason={d.get('reason','?')[:60]})")
+    else:
+        lines.append('- No prior decisions')
+    last_ev = dh.get('last_event', {})
+    if last_ev:
+        lines.append(f"- Last event: {last_ev.get('action','?')} "
+                     f"({last_ev.get('call_type','?')}, {last_ev.get('ts','?')})")
+    if dh.get('just_closed'):
+        lines.append(f"- JUST CLOSED (was {dh.get('closed_direction','?')})")
+    if dh.get('hold_suppress_active'):
+        lines.append('- HOLD suppress lock active')
+    return '\n'.join(lines) + '\n\n'
 
 
 def _build_snapshot_section(snapshot=None):

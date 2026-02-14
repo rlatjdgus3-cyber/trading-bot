@@ -244,6 +244,13 @@ def _kr_action(action: str) -> str:
     return f'{action} ({kr})'
 
 
+def _kr_action_ctx(action: str, pos_side: str = None) -> str:
+    """포지션 상태 인식 액션 변환. NONE+HOLD → 대기, 포지션+HOLD → 유지."""
+    if action == 'HOLD' and (not pos_side or pos_side.upper() in ('NONE', '')):
+        return 'HOLD (대기)'
+    return _kr_action(action)
+
+
 def _kr_trigger(trigger_type: str) -> str:
     """트리거 타입을 한국어로 변환."""
     return TRIGGER_KR.get(trigger_type, trigger_type)
@@ -471,18 +478,19 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     lines = []
 
     # ── [📌 요약] ──
-    lines.append('[📌 요약]')
-    lines.append(f'- 상태: {_kr_action(claude_action)}')
+    ps_side = (pos_state.get('side') or '').upper() if pos_state and pos_state.get('side') else 'NONE'
 
-    if pos_state and pos_state.get('side'):
-        ps_side = (pos_state['side'] or '').upper() or 'NONE'
+    lines.append('[📌 요약]')
+    lines.append(f'- 최종: {_kr_action_ctx(claude_action, ps_side)}')
+
+    if ps_side and ps_side != 'NONE':
         qty = _safe_float(pos_state.get('total_qty'))
         entry = _safe_float(pos_state.get('avg_entry_price'))
         lines.append(f'- 포지션: {ps_side} {qty} BTC @ {_format_price(entry)}')
     else:
         lines.append('- 포지션: 없음')
 
-    lines.append(f'- 신호: {dominant}, stage {stage}, 총점 {total:+.1f}')
+    lines.append(f'- 참조신호: {dominant} stage{stage} (총점 {total:+.1f})')
 
     confidence = parsed.get('confidence')
     reason_code = parsed.get('reason_code', '')
@@ -596,7 +604,7 @@ def format_decision_alert(action, parsed, engine_action, scores, pos_state):
 
     lines = [
         f'[📋 전략 판단]',
-        f'- Claude: {_kr_action(action)}',
+        f'- Claude: {_kr_action_ctx(action, side)}',
         f'- 확신도: {parsed.get("confidence", "?")}',
         f'- 근거: {_kr_reason_code(parsed.get("reason_code", "?"))}',
         f'- 엔진 참조: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}',
