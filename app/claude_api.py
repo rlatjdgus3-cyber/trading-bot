@@ -5,6 +5,7 @@ Uses Anthropic API to analyze sudden market changes and recommend actions.
 Model: claude-sonnet-4-20250514 (~$0.01/call)
 Never raises exceptions — always returns a valid response dict.
 """
+import re
 import sys
 import json
 sys.path.insert(0, '/root/trading-bot/app')
@@ -250,7 +251,7 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
     cooldown_key = f'event_{er_mode.lower()}'
     gate_context = {
         'event_mode': er_mode,
-        'event_hash': event_result.event_hash if event_result else None,
+        'event_hash': getattr(event_result, 'event_hash', None) if event_result else None,
         'trigger_type': ((getattr(event_result, 'triggers', None) or [])[0].get('type', '')
                          if event_result and getattr(event_result, 'triggers', None) else ''),
         'is_emergency': er_mode == 'EMERGENCY',
@@ -289,7 +290,6 @@ def _parse_response(raw=None):
         return dict(FALLBACK_RESPONSE)
     text = raw.strip()
     # Strip markdown backticks (handles ```json with/without newline)
-    import re
     text = re.sub(r'^\s*```(?:json)?\s*\n?', '', text)
     text = re.sub(r'\n?\s*```\s*$', '', text)
     text = text.strip()

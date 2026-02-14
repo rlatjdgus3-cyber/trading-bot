@@ -177,9 +177,12 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
         _log(f'all triggers deduped, returning DEFAULT')
         return EventResult()  # DEFAULT
 
-    # Update timestamps for surviving triggers only
+    # Update timestamps for surviving triggers only + purge expired entries
     for t in surviving:
         _last_trigger_ts[t.get('type', '')] = now
+    expired = [k for k, v in _last_trigger_ts.items() if now - v > AUTO_DEDUP_WINDOW_SEC * 2]
+    for k in expired:
+        del _last_trigger_ts[k]
 
     eh = compute_event_hash(surviving, symbol=symbol, price=price)
     _log(f'EVENT: triggers={[t["type"] for t in surviving]} hash={eh[:12]}')
@@ -322,11 +325,6 @@ def _check_regime_change(snapshot, prev_scores=None) -> list:
     triggers = []
 
     if prev_scores:
-        prev_regime = prev_scores.get('regime_score', 0)
-        # We can't get current regime from snapshot alone; caller passes prev_scores
-        # The actual current scores will be available in context
-        prev_total = prev_scores.get('total_score', 0)
-
         # ATR increase check
         prev_atr = prev_scores.get('atr_14') or prev_scores.get('atr')
         curr_atr = snapshot.get('atr_14')
@@ -473,11 +471,16 @@ def set_emergency_lock(symbol='BTC/USDT:USDT'):
 
 def is_emergency_locked(symbol='BTC/USDT:USDT') -> bool:
     """Check if emergency lock is active."""
+    now = time.time()
     expire = _emergency_lock.get(symbol, 0)
-    if time.time() < expire:
-        remaining = int(expire - time.time())
+    if now < expire:
+        remaining = int(expire - now)
         _log(f'emergency lock ACTIVE ({remaining}s remaining)')
         return True
+    # Purge expired locks
+    expired = [k for k, v in _emergency_lock.items() if now >= v]
+    for k in expired:
+        del _emergency_lock[k]
     return False
 
 

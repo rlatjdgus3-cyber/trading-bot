@@ -1126,14 +1126,14 @@ def _cycle():
                 _log(f'EMERGENCY: triggers={[t["type"] for t in event_result.triggers]}')
                 _handle_emergency_v2(cur, ctx, event_result, snapshot)
                 _prev_scores = ctx.get('scores', {})
-                if snapshot:
+                if snapshot and snapshot.get('atr_14') is not None:
                     _prev_scores['atr_14'] = snapshot.get('atr_14')
                 return LOOP_FAST_SEC
             elif event_result.mode == event_trigger.MODE_EVENT:
                 _log(f'EVENT: triggers={[t["type"] for t in event_result.triggers]}')
                 _handle_event_trigger(cur, ctx, event_result, snapshot)
                 _prev_scores = ctx.get('scores', {})
-                if snapshot:
+                if snapshot and snapshot.get('atr_14') is not None:
                     _prev_scores['atr_14'] = snapshot.get('atr_14')
                 return LOOP_FAST_SEC
             else:
@@ -1203,7 +1203,7 @@ def _cycle():
             # Sync position state
             _sync_position_state(cur, pos)
             _prev_scores = ctx.get('scores', {})
-            if snapshot:
+            if snapshot and snapshot.get('atr_14') is not None:
                 _prev_scores['atr_14'] = snapshot.get('atr_14')
 
         return LOOP_NORMAL_SEC

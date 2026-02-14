@@ -1394,7 +1394,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
 
             if claude_action == 'REDUCE':
                 lines.append(f'REDUCE: {parsed.get("reduce_pct", 0)}%')
-            elif 'OPEN' in claude_action:
+            elif claude_action in ('OPEN_LONG', 'OPEN_SHORT'):
                 lines.append(f'TARGET STAGE: {parsed.get("target_stage", 1)}')
 
             lines.append(f'EXECUTE: {execute_status}')
@@ -1474,6 +1474,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
 
 def _fetch_vol_profile() -> str:
     """Fetch latest volume profile (POC/VAH/VAL) from DB."""
+    conn = None
     try:
         import psycopg2
         conn = psycopg2.connect(
@@ -1493,7 +1494,6 @@ def _fetch_vol_profile() -> str:
                 ORDER BY ts DESC LIMIT 1;
             """)
             row = cur.fetchone()
-        conn.close()
         if row:
             return (f"  POC(주요가격대): ${float(row[0]):,.1f}\n"
                     f"  VAH(상단): ${float(row[1]):,.1f}\n"
@@ -1502,6 +1502,12 @@ def _fetch_vol_profile() -> str:
         return ""
     except Exception:
         return ""
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _ai_general_advisory(text: str) -> str:
