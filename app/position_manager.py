@@ -51,7 +51,7 @@ def _get_build_sha():
         return 'unknown'
 
 BUILD_SHA = _get_build_sha()
-CONFIG_VERSION = '2026.02.14-async-claude-v1'
+CONFIG_VERSION = '2026.02.14-db-ctx-relevance-v2'
 
 
 def _log(msg):

@@ -19,7 +19,7 @@ import report_formatter
 import event_lock
 
 CALLER = 'telegram_cmd_poller'
-CONFIG_VERSION = '2026.02.14-dblock-v1'
+CONFIG_VERSION = '2026.02.14-db-ctx-relevance-v2'
 
 ENV_PATH = "/root/trading-bot/app/telegram_cmd.env"
 ENV_FALLBACKS = [
