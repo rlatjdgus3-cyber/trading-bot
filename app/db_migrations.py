@@ -804,6 +804,31 @@ def ensure_claude_analyses_model_provider(cur):
     _log('ensure_claude_analyses_model_provider done')
 
 
+def ensure_macro_trace(cur):
+    '''Macro trace: BTC reaction after news events for news→strategy pipeline.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.macro_trace (
+            id              BIGSERIAL PRIMARY KEY,
+            news_id         BIGINT NOT NULL,
+            ts_news         TIMESTAMPTZ NOT NULL,
+            btc_price_at    NUMERIC,
+            btc_ret_30m     NUMERIC,
+            btc_ret_2h      NUMERIC,
+            btc_ret_24h     NUMERIC,
+            vol_2h          NUMERIC,
+            vol_baseline    NUMERIC,
+            spike_zscore    NUMERIC,
+            regime_at_time  TEXT,
+            label           TEXT,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(news_id)
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_macro_trace_ts ON macro_trace(ts_news DESC);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_macro_trace_label ON macro_trace(label);')
+    _log('ensure_macro_trace done')
+
+
 def ensure_event_trigger_log(cur):
     '''Event trigger evaluation log.'''
     cur.execute("""
@@ -826,6 +851,66 @@ def ensure_event_trigger_log(cur):
     cur.execute('CREATE INDEX IF NOT EXISTS idx_etl_mode ON event_trigger_log(mode);')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_etl_hash ON event_trigger_log(event_hash);')
     _log('ensure_event_trigger_log done')
+
+
+def ensure_compliance_log(cur):
+    '''Exchange compliance event log — all order validation/rejection tracking.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.compliance_log (
+            id                  BIGSERIAL PRIMARY KEY,
+            ts                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol              TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            event_type          TEXT NOT NULL,
+            order_params        JSONB NOT NULL DEFAULT '{}'::jsonb,
+            compliance_passed   BOOLEAN NOT NULL DEFAULT false,
+            reject_reason       TEXT,
+            exchange_error_code INTEGER,
+            suggested_fix       TEXT,
+            emergency_flag      BOOLEAN NOT NULL DEFAULT false,
+            detail              JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_compliance_ts ON compliance_log(ts);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_compliance_passed ON compliance_log(compliance_passed);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_compliance_error ON compliance_log(exchange_error_code);')
+    _log('ensure_compliance_log done')
+
+
+def ensure_execution_queue_compliance_columns(cur):
+    '''Add compliance tracking columns to execution_queue.'''
+    for col, dtype in (('compliance_passed', 'BOOLEAN'),
+                       ('reject_reason', 'TEXT'),
+                       ('exchange_error_code', 'INTEGER'),
+                       ('suggested_fix', 'TEXT'),
+                       ('emergency_flag', 'BOOLEAN DEFAULT false')):
+        cur.execute(f"""
+            ALTER TABLE execution_queue
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_execution_queue_compliance_columns done')
+
+
+def ensure_exchange_policy_audit(cur):
+    '''Exchange policy audit results — 10-day compliance review.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.exchange_policy_audit (
+            id                          BIGSERIAL PRIMARY KEY,
+            ts                          TIMESTAMPTZ NOT NULL DEFAULT now(),
+            audit_period_start          TIMESTAMPTZ NOT NULL,
+            audit_period_end            TIMESTAMPTZ NOT NULL,
+            total_orders                INTEGER NOT NULL DEFAULT 0,
+            total_rejections            INTEGER NOT NULL DEFAULT 0,
+            rejection_rate              NUMERIC NOT NULL DEFAULT 0,
+            top_errors                  JSONB NOT NULL DEFAULT '[]'::jsonb,
+            rate_limit_events           INTEGER NOT NULL DEFAULT 0,
+            mode_mismatch_events        INTEGER NOT NULL DEFAULT 0,
+            protection_mode_activations INTEGER NOT NULL DEFAULT 0,
+            report_text                 TEXT,
+            detail                      JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_epa_ts ON exchange_policy_audit(ts);')
+    _log('ensure_exchange_policy_audit done')
 
 
 def run_all():
@@ -883,6 +968,13 @@ def run_all():
             ensure_claude_analyses_model_provider(cur)
             # Event trigger log
             ensure_event_trigger_log(cur)
+            # Macro trace for news→strategy pipeline
+            ensure_macro_trace(cur)
+            # Exchange compliance layer
+            ensure_compliance_log(cur)
+            ensure_execution_queue_compliance_columns(cur)
+            # Exchange policy audit
+            ensure_exchange_policy_audit(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

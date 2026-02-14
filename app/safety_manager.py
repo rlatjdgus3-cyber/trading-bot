@@ -83,32 +83,38 @@ def _load_safety_limits(cur):
     }
 
 
-def run_all_checks(cur, target_usdt=0, limits=None):
-    '''Run all safety checks. Returns (ok, reason).'''
+def run_all_checks(cur, target_usdt=0, limits=None, emergency=False):
+    '''Run all safety checks. Returns (ok, reason).
+    When emergency=True, daily/hourly trade limits are BYPASSED.
+    Circuit breaker, daily loss limit, and 70% exposure cap remain active.
+    '''
     if limits is None:
         limits = _load_safety_limits(cur)
 
-    # Daily trade count
-    cur.execute("""
-        SELECT count(*) FROM execution_queue
-        WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'
-          AND status != 'REJECTED';
-    """)
-    daily_count = int(cur.fetchone()[0])
-    if daily_count >= limits['max_daily_trades']:
-        return (False, f"daily trade limit ({daily_count}/{limits['max_daily_trades']})")
+    if emergency:
+        _log('EMERGENCY mode: hourly/daily limits BYPASSED')
+    else:
+        # Daily trade count
+        cur.execute("""
+            SELECT count(*) FROM execution_queue
+            WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'
+              AND status != 'REJECTED';
+        """)
+        daily_count = int(cur.fetchone()[0])
+        if daily_count >= limits['max_daily_trades']:
+            return (False, f"daily trade limit ({daily_count}/{limits['max_daily_trades']})")
 
-    # Hourly trade count
-    cur.execute("""
-        SELECT count(*) FROM execution_queue
-        WHERE ts >= now() - interval '1 hour'
-          AND status != 'REJECTED';
-    """)
-    hourly_count = int(cur.fetchone()[0])
-    if hourly_count >= limits['max_hourly_trades']:
-        return (False, f"hourly trade limit ({hourly_count}/{limits['max_hourly_trades']})")
+        # Hourly trade count
+        cur.execute("""
+            SELECT count(*) FROM execution_queue
+            WHERE ts >= now() - interval '1 hour'
+              AND status != 'REJECTED';
+        """)
+        hourly_count = int(cur.fetchone()[0])
+        if hourly_count >= limits['max_hourly_trades']:
+            return (False, f"hourly trade limit ({hourly_count}/{limits['max_hourly_trades']})")
 
-    # Circuit breaker
+    # Circuit breaker (always active)
     window = limits['circuit_breaker_window_sec']
     cur.execute("""
         SELECT count(*) FROM execution_queue
@@ -118,7 +124,7 @@ def run_all_checks(cur, target_usdt=0, limits=None):
     if recent_count >= limits['circuit_breaker_max_orders']:
         return (False, f"circuit breaker ({recent_count} orders in {window}s)")
 
-    # Daily loss limit
+    # Daily loss limit (always active)
     cur.execute("""
         SELECT COALESCE(sum(realized_pnl), 0) FROM execution_log
         WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'

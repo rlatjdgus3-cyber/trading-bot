@@ -17,11 +17,14 @@ import sys
 import time
 import json
 import traceback
+import urllib.parse
+import urllib.request
 import ccxt
 import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv("/root/trading-bot/app/.env")
+import exchange_compliance as ecl
 
 # ============================================================
 # Constants
@@ -65,6 +68,42 @@ def db_conn():
     conn = psycopg2.connect(**DB)
     conn.autocommit = True
     return conn
+
+
+_tg_config = {}
+
+
+def _load_tg_config():
+    if _tg_config:
+        return _tg_config
+    try:
+        with open('/root/trading-bot/app/telegram_cmd.env') as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    _tg_config[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return _tg_config
+
+
+def _send_telegram(text):
+    cfg = _load_tg_config()
+    token = cfg.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
+    if not token or not chat_id:
+        return
+    try:
+        url = f'https://api.telegram.org/bot{token}/sendMessage'
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id,
+            'text': text,
+            'disable_web_page_preview': 'true'}).encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
 
 
 def exchange():
@@ -339,7 +378,14 @@ def _eq_handle_close(ex, cur, eq_id, direction, pos_side, pos_qty, reason):
         })
         return
 
-    order = place_close_order(ex, pos_side, pos_qty)
+    try:
+        order = place_close_order(ex, pos_side, pos_qty, cur=cur)
+    except Exception as e:
+        log(f"EQ id={eq_id} CLOSE failed: {e}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"compliance/exchange: {e}"})
+        return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "CLOSE", pos_side.upper(), pos_qty, reason,
                      eq_id, pos_side, pos_qty)
@@ -377,7 +423,14 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
         })
         return
 
-    order = place_close_order(ex, pos_side, qty)
+    try:
+        order = place_close_order(ex, pos_side, qty, cur=cur)
+    except Exception as e:
+        log(f"EQ id={eq_id} REDUCE failed: {e}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"compliance/exchange: {e}"})
+        return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REDUCE", pos_side.upper(), qty, reason,
                      eq_id, pos_side, pos_qty)
@@ -390,6 +443,18 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
 
 def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
     """Handle ADD: pyramid add to position."""
+    # Protection mode: block OPEN/ADD
+    pm_ok, pm_reason = ecl.check_protection_mode_for_action('ADD')
+    if not pm_ok:
+        log(f"EQ id={eq_id} ADD blocked by protection mode: {pm_reason}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"protection_mode: {pm_reason}"})
+        report = ecl.format_protection_mode_report()
+        if report:
+            _send_telegram(report)
+        return
+
     usdt = float(target_usdt) if target_usdt else USDT_CAP
     usdt = min(usdt, USDT_CAP)
     if usdt <= 0:
@@ -406,7 +471,14 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
         })
         return
 
-    order, exec_price, amount = place_open_order(ex, dir_upper, usdt)
+    try:
+        order, exec_price, amount = place_open_order(ex, dir_upper, usdt, cur=cur)
+    except Exception as e:
+        log(f"EQ id={eq_id} ADD failed: {e}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"compliance/exchange: {e}"})
+        return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "ADD", dir_upper, amount, reason,
                      eq_id, usdt=usdt, price=exec_price)
@@ -436,7 +508,14 @@ def _eq_handle_reverse_close(ex, cur, eq_id, direction, pos_side, pos_qty, reaso
         })
         return
 
-    order = place_close_order(ex, pos_side, pos_qty)
+    try:
+        order = place_close_order(ex, pos_side, pos_qty, cur=cur)
+    except Exception as e:
+        log(f"EQ id={eq_id} REVERSE_CLOSE failed: {e}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"compliance/exchange: {e}"})
+        return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REVERSE_CLOSE", pos_side.upper(), pos_qty, reason,
                      eq_id, pos_side, pos_qty)
@@ -450,6 +529,18 @@ def _eq_handle_reverse_close(ex, cur, eq_id, direction, pos_side, pos_qty, reaso
 
 def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
     """Handle REVERSE_OPEN: open new position as part of reversal."""
+    # Protection mode: block OPEN/ADD (REVERSE_OPEN = new position)
+    pm_ok, pm_reason = ecl.check_protection_mode_for_action('REVERSE_OPEN')
+    if not pm_ok:
+        log(f"EQ id={eq_id} REVERSE_OPEN blocked by protection mode: {pm_reason}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"protection_mode: {pm_reason}"})
+        report = ecl.format_protection_mode_report()
+        if report:
+            _send_telegram(report)
+        return
+
     usdt = float(target_usdt) if target_usdt else USDT_CAP
     usdt = min(usdt, USDT_CAP)
     if usdt <= 0:
@@ -466,7 +557,14 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
         })
         return
 
-    order, exec_price, amount = place_open_order(ex, dir_upper, usdt)
+    try:
+        order, exec_price, amount = place_open_order(ex, dir_upper, usdt, cur=cur)
+    except Exception as e:
+        log(f"EQ id={eq_id} REVERSE_OPEN failed: {e}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"compliance/exchange: {e}"})
+        return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REVERSE_OPEN", dir_upper, amount, reason,
                      eq_id, usdt=usdt, price=exec_price)
@@ -507,26 +605,158 @@ def get_position(ex):
     return None, 0.0, 0.0, 0.0
 
 
-def place_close_order(ex, side: str, qty: float):
-    """reduceOnly market close."""
+def place_close_order(ex, side: str, qty: float, cur=None):
+    """reduceOnly market close with ECL compliance."""
+    # Compliance validation
+    order_params = {
+        'action': 'SELL' if side == 'long' else 'BUY',
+        'qty': qty,
+        'side': side,
+        'reduce_only': True,
+        'order_type': 'market',
+        'position_qty': qty,
+        'usdt_value': 0,  # close doesn't need notional check
+    }
+    comp = ecl.validate_bybit_compliance(ex, order_params, SYMBOL)
+
+    if not comp.ok:
+        log(f"ECL REJECT close: {comp.reason}")
+        _send_telegram(ecl.format_compliance_rejection_telegram(comp))
+        if cur:
+            ecl.log_compliance_event(
+                cur, 'PRE_ORDER_REJECT', SYMBOL, order_params,
+                compliance_passed=False, reject_reason=comp.reject_reason,
+                suggested_fix=comp.suggested_fix)
+        raise ValueError(f"ECL reject: {comp.reject_reason or comp.reason}")
+
+    final_qty = comp.corrected_qty if comp.corrected_qty is not None else qty
+
     params = {"reduceOnly": True}
-    if side == "long":
-        order = ex.create_market_sell_order(SYMBOL, qty, params)
-    else:
-        order = ex.create_market_buy_order(SYMBOL, qty, params)
-    return order
+    try:
+        if side == "long":
+            order = ex.create_market_sell_order(SYMBOL, final_qty, params)
+        else:
+            order = ex.create_market_buy_order(SYMBOL, final_qty, params)
+        ecl.record_order_sent(SYMBOL, side=side)
+        ecl.record_success(SYMBOL)
+        if cur:
+            ecl.log_compliance_event(
+                cur, 'ORDER_SENT', SYMBOL, order_params,
+                compliance_passed=True,
+                detail={'corrected': comp.was_corrected, 'final_qty': final_qty})
+        return order
+    except Exception as e:
+        error_code, raw_msg = ecl.extract_bybit_error_code(e)
+        error_info = ecl.map_bybit_error(error_code, raw_msg)
+        log(f"BYBIT ERROR close: code={error_code} {error_info['korean_message']}")
+        _send_telegram(ecl.format_rejection_telegram(error_info))
+        ecl.record_error(SYMBOL, error_code=error_code)
+        # Trigger market info refresh on specific errors
+        if ecl.should_refresh_on_error(error_code):
+            ecl.force_refresh_market_info(
+                ex, SYMBOL, reason=f'close error {error_code}')
+        if cur:
+            ecl.log_compliance_event(
+                cur, 'EXCHANGE_ERROR', SYMBOL, order_params,
+                compliance_passed=False,
+                reject_reason=error_info['korean_message'],
+                exchange_error_code=error_code,
+                suggested_fix=error_info['suggested_fix'],
+                detail={'raw_message': raw_msg[:500]})
+        raise
 
 
-def place_open_order(ex, direction: str, usdt_size: float):
-    """Market open order.  direction = 'LONG' or 'SHORT'."""
+def place_open_order(ex, direction: str, usdt_size: float, cur=None):
+    """Market open order with ECL compliance.  direction = 'LONG' or 'SHORT'."""
     ticker = ex.fetch_ticker(SYMBOL)
     price = float(ticker["last"])
     amount = usdt_size / price
-    if direction == "LONG":
-        order = ex.create_market_buy_order(SYMBOL, amount)
-    else:
-        order = ex.create_market_sell_order(SYMBOL, amount)
-    return order, price, amount
+    info = ecl.get_market_info(ex, SYMBOL)
+
+    # Compliance validation
+    order_params = {
+        'action': 'BUY' if direction == 'LONG' else 'SELL',
+        'qty': amount,
+        'price': None,  # market order
+        'side': direction.lower(),
+        'reduce_only': False,
+        'order_type': 'market',
+        'position_qty': 0,
+        'usdt_value': usdt_size,
+    }
+    comp = ecl.validate_bybit_compliance(ex, order_params, SYMBOL)
+
+    if not comp.ok:
+        log(f"ECL REJECT open: {comp.reason}")
+        _send_telegram(ecl.format_compliance_rejection_telegram(comp))
+        if cur:
+            ecl.log_compliance_event(
+                cur, 'PRE_ORDER_REJECT', SYMBOL, order_params,
+                compliance_passed=False, reject_reason=comp.reject_reason,
+                suggested_fix=comp.suggested_fix)
+        raise ValueError(f"ECL reject: {comp.reject_reason or comp.reason}")
+
+    final_amount = comp.corrected_qty if comp.corrected_qty is not None else amount
+
+    try:
+        if direction == "LONG":
+            order = ex.create_market_buy_order(SYMBOL, final_amount)
+        else:
+            order = ex.create_market_sell_order(SYMBOL, final_amount)
+        ecl.record_order_sent(SYMBOL, price=price, side=direction.lower())
+        ecl.record_success(SYMBOL)
+        if cur:
+            ecl.log_compliance_event(
+                cur, 'ORDER_SENT', SYMBOL, order_params,
+                compliance_passed=True,
+                detail={'corrected': comp.was_corrected, 'final_amount': final_amount})
+        return order, price, final_amount
+    except Exception as e:
+        error_code, raw_msg = ecl.extract_bybit_error_code(e)
+        error_info = ecl.map_bybit_error(error_code, raw_msg)
+        log(f"BYBIT ERROR open: code={error_code} {error_info['korean_message']}")
+        _send_telegram(ecl.format_rejection_telegram(error_info))
+        ecl.record_error(SYMBOL, error_code=error_code)
+        # Trigger market info refresh on specific errors
+        if ecl.should_refresh_on_error(error_code):
+            ecl.force_refresh_market_info(
+                ex, SYMBOL, reason=f'open error {error_code}')
+
+        # Auto-correction retry for stepSize/tickSize errors
+        if ecl.is_auto_correctable(error_code) and not comp.was_corrected:
+            log(f"attempting auto-correction for error {error_code}")
+            corrected_amount = ecl.align_qty(final_amount, info['stepSize'])
+            if corrected_amount >= info['minQty'] and corrected_amount != final_amount:
+                try:
+                    if direction == "LONG":
+                        order = ex.create_market_buy_order(SYMBOL, corrected_amount)
+                    else:
+                        order = ex.create_market_sell_order(SYMBOL, corrected_amount)
+                    ecl.record_order_sent(SYMBOL, price=price, side=direction.lower())
+                    ecl.record_success(SYMBOL)
+                    log(f"auto-correction succeeded: {final_amount} -> {corrected_amount}")
+                    if cur:
+                        ecl.log_compliance_event(
+                            cur, 'AUTO_CORRECTED', SYMBOL, order_params,
+                            compliance_passed=True,
+                            detail={'original_qty': final_amount,
+                                    'corrected_qty': corrected_amount,
+                                    'error_code': error_code})
+                    return order, price, corrected_amount
+                except Exception as e2:
+                    log(f"auto-correction retry failed: {e2}")
+                    ec2, _ = ecl.extract_bybit_error_code(e2)
+                    ecl.record_error(SYMBOL, error_code=ec2)
+
+        if cur:
+            ecl.log_compliance_event(
+                cur, 'EXCHANGE_ERROR', SYMBOL, order_params,
+                compliance_passed=False,
+                reject_reason=error_info['korean_message'],
+                exchange_error_code=error_code,
+                suggested_fix=error_info['suggested_fix'],
+                detail={'raw_message': raw_msg[:500]})
+        raise
 
 
 # ============================================================
@@ -538,10 +768,24 @@ def main():
     ex = exchange()
     last_order_ts = 0.0
 
+    # Preload market info for compliance checks
+    try:
+        info = ecl.get_market_info(ex, SYMBOL)
+        log(f"ECL market info: minQty={info['minQty']} stepSize={info['stepSize']} "
+            f"tickSize={info['tickSize']} minNotional={info['minNotional']}")
+    except Exception as e:
+        log(f"ECL market info preload warning: {e}")
+
     conn = db_conn()
     with conn.cursor() as cur:
         ensure_log_table(cur)
         ensure_close_state_table(cur)
+        # Ensure compliance_log table exists
+        try:
+            import db_migrations
+            db_migrations.ensure_compliance_log(cur)
+        except Exception:
+            pass
         audit(cur, "DAEMON_START", SYMBOL, {"pid": os.getpid()})
     conn.close()
 
@@ -591,7 +835,12 @@ def _cycle(ex, _last_order_ts_unused):
                     audit(cur, "STOPLOSS_TRIGGERED", SYMBOL, {
                         "side": side, "qty": qty, "pct": pct, "upnl": upnl,
                     })
-                    order = place_close_order(ex, side, qty)
+                    try:
+                        order = place_close_order(ex, side, qty, cur=cur)
+                    except Exception as e:
+                        log(f"STOPLOSS CLOSE FAILED: {e}")
+                        audit(cur, "STOPLOSS_FAILED", SYMBOL, {"error": str(e)})
+                        return
                     audit(cur, "CLOSE_SENT", SYMBOL, {
                         "reason": "emergency_stoploss",
                         "order_id": order.get("id"),
@@ -612,7 +861,14 @@ def _cycle(ex, _last_order_ts_unused):
                         "decision_id": did, "reason": reason,
                         "side": side, "qty": qty,
                     })
-                    order = place_close_order(ex, side, qty)
+                    try:
+                        order = place_close_order(ex, side, qty, cur=cur)
+                    except Exception as e:
+                        log(f"CLOSE decision id={did} FAILED: {e}")
+                        audit(cur, "CLOSE_FAILED", SYMBOL, {
+                            "decision_id": did, "error": str(e)})
+                        set_last_close_id(cur, did)
+                        continue
                     clear_once_lock(cur, SYMBOL)
                     log(f"CLOSE ORDER SENT: {side} qty={qty} decision_id={did}")
                     _state["last_order_ts"] = time.time()
@@ -697,13 +953,34 @@ def _cycle(ex, _last_order_ts_unused):
                 # do NOT mark processed — retry next cycle
                 return
 
+            # --- Protection mode check for OPEN ---
+            pm_ok, pm_reason = ecl.check_protection_mode_for_action('OPEN')
+            if not pm_ok:
+                log(f"OPEN blocked by protection mode: {pm_reason}")
+                audit(cur, "GUARD_BLOCK", SYMBOL, {
+                    "signal_id": sig_id, "guard": "protection_mode",
+                    "reason": pm_reason,
+                })
+                mark_processed(cur, sig_id)
+                report = ecl.format_protection_mode_report()
+                if report:
+                    _send_telegram(report)
+                return
+
             # --- Execute OPEN ---
             usdt_size = min(float(meta.get("qty", USDT_CAP)), USDT_CAP)
             if usdt_size <= 0:
                 usdt_size = USDT_CAP
 
             log(f"OPEN {direction} signal_id={sig_id} usdt={usdt_size}")
-            order, exec_price, amount = place_open_order(ex, direction, usdt_size)
+            try:
+                order, exec_price, amount = place_open_order(ex, direction, usdt_size, cur=cur)
+            except Exception as e:
+                log(f"OPEN signal_id={sig_id} FAILED: {e}")
+                audit(cur, "OPEN_FAILED", SYMBOL, {
+                    "signal_id": sig_id, "error": str(e)})
+                mark_processed(cur, sig_id)
+                return
 
             set_once_lock(cur, SYMBOL)
             mark_processed(cur, sig_id)
