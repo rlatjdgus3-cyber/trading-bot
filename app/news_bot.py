@@ -12,18 +12,32 @@ FEEDS = [
     # 암호화폐
     ("coindesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
     ("cointelegraph", "https://cointelegraph.com/rss"),
-    # 국제/비즈니스
-    ("reuters", "https://feeds.reuters.com/reuters/businessNews"),
+    # 미국/거시/비즈니스
+    ("bloomberg", "https://feeds.bloomberg.com/markets/news.rss"),
     ("bbc_business", "http://feeds.bbci.co.uk/news/business/rss.xml"),
     ("bbc_world", "http://feeds.bbci.co.uk/news/world/rss.xml"),
-    # 미국 경제 (RSS 제공 시)
-    ("bloomberg", "https://feeds.bloomberg.com/markets/news.rss"),
+    # 미국 주식/경제 (신규)
+    ("cnbc", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147"),
+    ("yahoo_finance", "https://finance.yahoo.com/news/rssconf"),
+    ("investing", "https://www.investing.com/rss/news.rss"),
+    ("marketwatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
 ]
 
 KEYWORDS = [
-    "bitcoin","btc","crypto","etf","sec","fed","fomc","cpi","inflation",
-    "rate","treasury","bond","dollar","nasdaq","war","missile","sanction",
-    "election","trump","hack","exploit","liquidation","bank"
+    # crypto
+    "bitcoin","btc","crypto","etf","sec",
+    # fed/rates
+    "fed","fomc","cpi","inflation","rate","powell","nfp","pce","unemployment","jobs report",
+    # treasury/dollar
+    "treasury","bond","dollar","yields","us10y","dxy",
+    # equities
+    "nasdaq","qqq","spx","sp500","equit","risk-off","risk off",
+    # politics
+    "election","trump","tariff","white house","congress","gop",
+    # geopolitics
+    "war","missile","sanction","china","boj",
+    # crypto-specific
+    "hack","exploit","liquidation","bank","regulation",
 ]
 
 def log(msg):
@@ -68,9 +82,11 @@ def llm_analyze(client, title):
         "title": title,
         "task": "비트코인 선물에 미칠 영향 평가",
         "schema": {
-            "impact_score": "0~10",
+            "impact_score": "0~10 (0=무관, 5=보통, 8+=높음)",
             "direction": "up/down/neutral",
-            "summary_kr": "1~2문장",
+            "category": "WAR/US_POLITICS/FED_RATES/CPI_JOBS/NASDAQ_EQUITIES/REGULATION_SEC_ETF/JAPAN_BOJ/CHINA/FIN_STRESS/CRYPTO_SPECIFIC/OTHER",
+            "impact_path": "예: 금리인상→달러강세→BTC하락",
+            "summary_kr": "한국어 1~2문장",
         }
     }
     resp = client.responses.create(
@@ -82,7 +98,13 @@ def llm_analyze(client, title):
         data = json.loads(text)
         impact = int(data.get("impact_score", 0) or 0)
         direction = (data.get("direction", "neutral") or "neutral").strip()
-        summary = (data.get("summary_kr", "") or "").strip()
+        category = (data.get("category", "OTHER") or "OTHER").strip()
+        impact_path = (data.get("impact_path", "") or "").strip()
+        summary_kr = (data.get("summary_kr", "") or "").strip()
+        # Encode category + impact_path into summary field
+        summary = f"[{direction}] [{category}] {summary_kr}"
+        if impact_path:
+            summary += f" | {impact_path}"
         return impact, direction, summary
     except:
         return 0, "neutral", text[:200]
@@ -181,19 +203,13 @@ def main():
                             continue
 
                     impact, direction, summary = 0, "neutral", ""
-                    try:
-                        from news_scorer_local import should_call_ai
-                        should_ai, local_score = should_call_ai(title)
-                    except Exception:
-                        should_ai = worth_llm(title, active_keywords)
-                        local_score = 0.5 if should_ai else 0.0
-
-                    if client and should_ai:
-                        impact, direction, summary = llm_analyze(client, title)
-                    elif local_score > 0:
-                        impact = int(local_score * 10)
-                        direction = "neutral"
-                        summary = "(local scoring only)"
+                    # All news get GPT-mini classification. Dedup via URL UNIQUE.
+                    if client:
+                        try:
+                            impact, direction, summary = llm_analyze(client, title)
+                        except Exception as llm_err:
+                            log(f"[news_bot] LLM error: {llm_err}")
+                            impact, direction, summary = 0, "neutral", ""
 
                     kw = extract_keywords(title, active_keywords)
 
@@ -206,7 +222,7 @@ def main():
                             source,
                             title,
                             link,
-                            f"[{direction}] {summary}",
+                            summary if summary else f"[{direction}]",
                             int(impact),
                             kw if kw else None,
                         ))

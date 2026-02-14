@@ -222,8 +222,8 @@ def _keyword_fallback(text: str) -> dict:
                 "cooldown_key": "news_analysis", "priority": "normal", "_fallback": True}
 
     if "뉴스" in t or "news" in t:
-        return {"intent": "news", "route": "local", "local_query_type": "news_summary",
-                "cooldown_key": "news", "priority": "normal", "_fallback": True}
+        return {"intent": "news", "route": "claude",
+                "cooldown_key": "news_analysis", "priority": "normal", "_fallback": True}
 
     if any(x in t for x in ["포지션", "position", "포지"]):
         return {"intent": "status", "route": "local", "local_query_type": "position_info",

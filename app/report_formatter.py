@@ -171,6 +171,138 @@ def _format_pnl(pnl):
     return f'{p:+.4f} USDT'
 
 
+# ── 뉴스 분석 리포트 ──────────────────────────────────────
+
+CATEGORY_KR = {
+    'WAR': '전쟁/지정학',
+    'US_POLITICS': '미국 정치',
+    'FED_RATES': 'Fed/금리',
+    'CPI_JOBS': 'CPI/고용',
+    'NASDAQ_EQUITIES': '나스닥/주식',
+    'REGULATION_SEC_ETF': '규제/SEC/ETF',
+    'JAPAN_BOJ': '일본/BOJ',
+    'CHINA': '중국',
+    'FIN_STRESS': '금융 스트레스',
+    'CRYPTO_SPECIFIC': '크립토',
+    'OTHER': '기타',
+}
+
+MACRO_CATEGORIES = {
+    'FED_RATES', 'CPI_JOBS', 'NASDAQ_EQUITIES', 'US_POLITICS',
+    'WAR', 'JAPAN_BOJ', 'CHINA', 'FIN_STRESS',
+}
+CRYPTO_CATEGORIES = {'CRYPTO_SPECIFIC', 'REGULATION_SEC_ETF'}
+
+
+def _parse_news_category(summary: str) -> str:
+    """Extract category tag from summary field like '[up] [FED_RATES] ...'."""
+    if not summary:
+        return 'OTHER'
+    import re
+    # Find all bracket tags (case-insensitive)
+    tags = re.findall(r'\[([A-Za-z_]+)\]', summary)
+    direction_tags = {'up', 'down', 'neutral'}
+    for tag in tags:
+        if tag.lower() in direction_tags:
+            continue  # skip direction tags
+        # Must be a category tag (uppercase convention)
+        if tag in CATEGORY_KR:
+            return tag
+    return 'OTHER'
+
+
+def _parse_news_direction(summary: str) -> str:
+    """Extract direction from summary field."""
+    if not summary:
+        return ''
+    sl = summary.lower()
+    if sl.startswith('[up]') or sl.startswith('[bullish]'):
+        return '상승'
+    elif sl.startswith('[down]') or sl.startswith('[bearish]'):
+        return '하락'
+    elif sl.startswith('[neutral]'):
+        return '중립'
+    return ''
+
+
+def _parse_impact_path(summary: str) -> str:
+    """Extract impact_path from summary (after '|')."""
+    if not summary or '|' not in summary:
+        return ''
+    return summary.split('|', 1)[1].strip()
+
+
+def format_news_analysis(macro_news, crypto_news, news_score,
+                         news_guarded, score_trace):
+    """뉴스 분석 한국어 리포트 포매팅.
+
+    macro_news: list of dicts (미국/거시 뉴스)
+    crypto_news: list of dicts (크립토 뉴스)
+    news_score: int (news_event_score)
+    news_guarded: bool
+    score_trace: str (영향 요약)
+    """
+    lines = []
+
+    # Macro section
+    lines.append('[미국/거시 Top3]')
+    if not macro_news:
+        lines.append('- 최근 6시간 거시 뉴스 없음')
+    else:
+        for i, n in enumerate(macro_news[:3], 1):
+            impact = _safe_int(n.get('impact_score'))
+            title = (n.get('title') or '')[:80]
+            source = n.get('source', '')
+            ts = (n.get('ts') or '')[:16]
+            summary = n.get('summary', '')
+            direction = _parse_news_direction(summary)
+            category = _parse_news_category(summary)
+            cat_kr = CATEGORY_KR.get(category, category)
+            impact_path = _parse_impact_path(summary)
+
+            dir_str = f' / {direction}' if direction else ''
+            lines.append(f'{i}) ({impact}/10) {title}')
+            lines.append(f'   {source} / {ts} / {cat_kr}{dir_str}')
+            if impact_path:
+                lines.append(f'   {impact_path}')
+
+    lines.append('')
+
+    # Crypto section
+    lines.append('[크립토 Top3]')
+    if not crypto_news:
+        lines.append('- 최근 6시간 크립토 뉴스 없음')
+    else:
+        for i, n in enumerate(crypto_news[:3], 1):
+            impact = _safe_int(n.get('impact_score'))
+            title = (n.get('title') or '')[:80]
+            source = n.get('source', '')
+            ts = (n.get('ts') or '')[:16]
+            summary = n.get('summary', '')
+            direction = _parse_news_direction(summary)
+            impact_path = _parse_impact_path(summary)
+
+            dir_str = f' / {direction}' if direction else ''
+            lines.append(f'{i}) ({impact}/10) {title}')
+            lines.append(f'   {source} / {ts}{dir_str}')
+            if impact_path:
+                lines.append(f'   {impact_path}')
+
+    lines.append('')
+
+    # Score impact section
+    lines.append('[이번 결정에 반영]')
+    lines.append(f'- news_event_score: {_safe_float(news_score):+.0f}')
+    if news_guarded:
+        lines.append('- 뉴스 가드 적용됨')
+    if score_trace:
+        lines.append(f'- {score_trace}')
+    else:
+        lines.append('- 뉴스→결정: 변경 없음')
+
+    return '\n'.join(lines)
+
+
 # ── 전략 보고 ────────────────────────────────────────────
 
 def format_strategy_report(claude_action, parsed, engine_action, engine_reason,

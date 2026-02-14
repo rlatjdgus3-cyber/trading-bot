@@ -227,80 +227,156 @@ def _ai_advisory(intent: dict, text: str, no_fallback: bool = False,
         return (_ai_general_advisory(claude_prompt), "gpt-4o-mini")
 
 
+def _fetch_categorized_news():
+    """DB에서 최근 6시간 enriched 뉴스를 카테고리별로 분리하여 반환.
+    Returns (macro_news, crypto_news) — each a list of dicts.
+    """
+    macro_news = []
+    crypto_news = []
+    conn = None
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME", "trading"),
+            user=os.getenv("DB_USER", "bot"),
+            password=os.getenv("DB_PASS", "botpass"),
+            connect_timeout=10,
+            options="-c statement_timeout=30000",
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT title, source, impact_score, summary,
+                       to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr,
+                       keywords
+                FROM news
+                WHERE ts >= now() - interval '6 hours'
+                  AND impact_score > 0
+                ORDER BY impact_score DESC, ts DESC
+                LIMIT 30;
+            """)
+            rows = cur.fetchall()
+
+        for r in rows:
+            item = {
+                'title': r[0] or '',
+                'source': r[1] or '',
+                'impact_score': int(r[2]) if r[2] else 0,
+                'summary': r[3] or '',
+                'ts': r[4] or '',
+                'keywords': list(r[5]) if r[5] else [],
+            }
+            cat = report_formatter._parse_news_category(item['summary'])
+            if cat in report_formatter.CRYPTO_CATEGORIES:
+                crypto_news.append(item)
+            elif cat in report_formatter.MACRO_CATEGORIES:
+                macro_news.append(item)
+            else:
+                # OTHER: classify by source
+                if item['source'] in ('coindesk', 'cointelegraph'):
+                    crypto_news.append(item)
+                else:
+                    macro_news.append(item)
+    except Exception as e:
+        _log(f'_fetch_categorized_news error: {e}')
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return (macro_news[:5], crypto_news[:5])
+
+
 def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
-    """News analysis. Claude only for high-impact news (or USER/EMERGENCY). Returns (text, provider)."""
+    """News analysis with categorized DB news. Always uses AI. Returns (text, provider)."""
     no_fallback = call_type in ('USER', 'EMERGENCY')
-    parts = []
 
-    # Recent news (broader window)
-    news = local_query_executor.execute("news_summary", "최근 6시간 뉴스 10개")
-    parts.append(f"최근 뉴스:\n{news[:800]}")
+    # Fetch categorized news from DB
+    macro_news, crypto_news = _fetch_categorized_news()
 
-    # High impact news if any
-    high = _check_news_importance()
-    if high:
-        high_lines = []
-        for n in high[:3]:
-            high_lines.append(
-                f"- [{n['impact_score']}/10] {n['title']}\n  {n.get('summary', '')}")
-        parts.append(f"고영향 뉴스:\n" + "\n".join(high_lines))
+    # Build news block for prompt
+    news_parts = []
+    if macro_news:
+        macro_lines = ['[미국/거시 뉴스]']
+        for i, n in enumerate(macro_news[:3], 1):
+            macro_lines.append(
+                f"{i}. [{n['impact_score']}/10] {n['title']}\n   {n.get('summary', '')}")
+        news_parts.append('\n'.join(macro_lines))
+    if crypto_news:
+        crypto_lines = ['[크립토 뉴스]']
+        for i, n in enumerate(crypto_news[:3], 1):
+            crypto_lines.append(
+                f"{i}. [{n['impact_score']}/10] {n['title']}\n   {n.get('summary', '')}")
+        news_parts.append('\n'.join(crypto_lines))
 
-    # Indicators + price
+    if not news_parts:
+        news_block = '(최근 6시간 AI 분석 뉴스 없음)'
+    else:
+        news_block = '\n\n'.join(news_parts)
+
+    # Indicators + score + position
     ind = local_query_executor.execute("indicator_snapshot")
-    parts.append(f"지표:\n{ind}")
-
-    # Score
     score = local_query_executor.execute("score_summary")
-    parts.append(f"스코어:\n{score}")
-
-    # Position
     pos = local_query_executor.execute("position_info")
-    parts.append(f"포지션:\n{pos}")
 
     prompt = (
         f"당신은 비트코인 선물 트레이딩 뉴스 분석가입니다.\n"
-        f"아래 제공된 실시간 데이터만 사용하여 분석하세요.\n\n"
+        f"아래 제공된 실시간 데이터만 사용하여 한국어로 분석하세요.\n\n"
         f"사용자 요청: {text}\n\n"
-        f"=== 실시간 데이터 ===\n" + "\n\n".join(parts) + "\n\n"
-        "=== 분석 요청 ===\n"
-        "1. 각 뉴스의 BTC 선물 영향 방향/크기 평가\n"
-        "2. 종합 시나리오 (상승/하락/횡보)\n"
-        "3. 현재 포지션 기준 대응 포인트\n"
+        f"=== 최근 뉴스 (카테고리별 Top3) ===\n{news_block}\n\n"
+        f"=== 지표 ===\n{ind}\n\n"
+        f"=== 스코어 ===\n{score}\n\n"
+        f"=== 포지션 ===\n{pos}\n\n"
+        "=== 분석 요청 (한국어 전략 리포트) ===\n"
+        "1. 미국/거시 뉴스 핵심 요약 (영향 방향 + 크기)\n"
+        "2. 크립토 뉴스 핵심 요약\n"
+        "3. 종합 시나리오 (상승/하락/횡보)\n"
+        "4. 현재 포지션 기준 대응 포인트\n"
         "800자 이내."
     )
 
-    # Claude for high-impact news or USER/EMERGENCY; GPT-mini otherwise
-    if high or no_fallback:
-        ck = 'user_tg_news_claude' if no_fallback else 'auto_tg_news_claude'
-        gate_ctx = {
-            'intent': 'news',
-            'high_news': bool(high),
-            'impact_score': max((n.get('impact_score', 0) for n in high), default=0) if high else 0,
-            'source': 'openclaw' if no_fallback else 'telegram',
-        }
-        gate = 'high_news' if high else 'telegram'
-        result, meta = _call_claude_advisory(
-            prompt, gate=gate, cooldown_key=ck,
-            context=gate_ctx, call_type=call_type)
-        meta['call_type'] = call_type
-        if meta.get('fallback_used'):
-            provider = 'claude(denied)' if no_fallback else 'gpt-4o-mini'
+    # Always try Claude first, fallback to GPT-mini with same prompt
+    ck = 'user_tg_news_claude' if no_fallback else 'auto_tg_news_claude'
+    gate_ctx = {
+        'intent': 'news',
+        'high_news': bool(macro_news or crypto_news),
+        'impact_score': max(
+            (n.get('impact_score', 0) for n in (macro_news + crypto_news)),
+            default=0),
+        'source': 'openclaw' if no_fallback else 'telegram',
+    }
+    gate = 'high_news' if (macro_news or crypto_news) else 'telegram'
+    result, meta = _call_claude_advisory(
+        prompt, gate=gate, cooldown_key=ck,
+        context=gate_ctx, call_type=call_type)
+    meta['call_type'] = call_type
+
+    if meta.get('fallback_used'):
+        if no_fallback:
+            provider = 'claude(denied)'
         else:
-            cost = meta.get('estimated_cost_usd', 0)
-            provider = f'anthropic (${cost:.4f})'
+            # GPT-mini fallback with same Korean report prompt
+            _log('news: Claude denied → GPT-mini fallback')
+            start_ms = int(time.time() * 1000)
+            result = _call_gpt_advisory(prompt)
+            elapsed = int(time.time() * 1000) - start_ms
+            meta = {'model': 'gpt-4o-mini', 'model_provider': 'openai',
+                    'api_latency_ms': elapsed, 'fallback_used': True,
+                    'call_type': call_type}
+            provider = 'gpt-4o-mini'
     else:
-        _log('news: no high-impact → GPT-mini (Claude skipped)')
-        start_ms = int(time.time() * 1000)
-        result = _call_gpt_advisory(prompt)
-        elapsed = int(time.time() * 1000) - start_ms
-        meta = {'model': 'gpt-4o-mini', 'model_provider': 'openai',
-                'api_latency_ms': elapsed, 'fallback_used': False,
-                'call_type': call_type}
-        provider = 'gpt-4o-mini'
+        cost = meta.get('estimated_cost_usd', 0)
+        provider = f'anthropic (${cost:.4f})'
 
     _save_advisory('news_advisory',
-                   {'user_text': text, 'news': news[:800], 'indicators': ind,
-                    'score': score, 'position': pos},
+                   {'user_text': text,
+                    'macro_news': [n['title'] for n in macro_news[:3]],
+                    'crypto_news': [n['title'] for n in crypto_news[:3]],
+                    'indicators': ind, 'score': score, 'position': pos},
                    result, meta)
     return (result, provider)
 
@@ -1651,11 +1727,9 @@ def handle_command(text: str) -> str:
         qtype = intent.get("local_query_type", "status_full")
 
         if intent.get("intent") == "news":
-            high = _check_news_importance()
-            if high:
-                _log("news upgrade → claude gate (high impact detected)")
-                news_result, news_provider = _ai_news_advisory(t, high)
-                return news_result + _footer(intent_name, "claude", news_provider)
+            _log("news route=local → AI analysis forced")
+            news_result, news_provider = _ai_news_claude_advisory(t, call_type='AUTO')
+            return news_result + _footer(intent_name, "claude", news_provider)
 
         return local_query_executor.execute(qtype, original_text=t) + _footer(intent_name, "local", "local")
 
