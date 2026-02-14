@@ -202,7 +202,7 @@ def _process_order(ex, cur, row):
     # Update raw response
     cur.execute("""
         UPDATE execution_log SET raw_fetch_response = %s::jsonb WHERE id = %s;
-    """, (json.dumps(fetched, default=str)[:5000], eid))
+    """, (json.dumps(fetched, default=str), eid))
 
     if fx_status == 'canceled':
         _handle_canceled(cur, eid, order_id, order_type, direction, signal_id)

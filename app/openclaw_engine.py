@@ -15,6 +15,7 @@ import traceback
 
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[openclaw_engine]'
+CALLER = 'openclaw_gateway'
 
 DIRECTIVE_TYPES = {
     'WATCH_KEYWORDS',
@@ -426,6 +427,21 @@ def _handle_analysis_request(conn, params, directive_id=None, source='telegram')
             cooldown_key=f'openclaw_analysis_{topic}',
             context={'intent': 'analysis_request', 'topic': topic, 'source': 'openclaw'},
             max_tokens=500, call_type=ct)
+
+        # Log Claude call for caller attribution
+        try:
+            import event_lock as _el
+            _el.log_claude_call(
+                caller=CALLER, gate_type='openclaw', call_type=ct,
+                model_used=result.get('model'),
+                input_tokens=result.get('input_tokens', 0),
+                output_tokens=result.get('output_tokens', 0),
+                estimated_cost=result.get('estimated_cost_usd', 0),
+                latency_ms=result.get('api_latency_ms', 0),
+                allowed=not result.get('fallback_used', False),
+                deny_reason=result.get('gate_reason') if result.get('fallback_used') else None)
+        except Exception:
+            pass
 
         if result.get('fallback_used'):
             return {

@@ -6,6 +6,7 @@ Receives natural language → GPT Router → local/claude/none → response.
 import os
 import sys
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -15,6 +16,10 @@ import gpt_router
 import local_query_executor
 import emergency_detector
 import report_formatter
+import event_lock
+
+CALLER = 'telegram_cmd_poller'
+CONFIG_VERSION = '2026.02.14-dblock-v1'
 
 ENV_PATH = "/root/trading-bot/app/telegram_cmd.env"
 ENV_FALLBACKS = [
@@ -78,7 +83,7 @@ def tg_api_call(token: str, method: str, params: dict) -> dict:
 
 def send_message(token: str, chat_id: int, text: str) -> None:
     chunks = []
-    s = text or ""
+    s = report_formatter.sanitize_telegram_text(text or "")
     while len(s) > 3800:
         chunks.append(s[:3800])
         s = s[3800:]
@@ -135,7 +140,7 @@ def _check_news_importance():
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, title, impact_score, summary
+                SELECT id, title, impact_score, summary, title_ko
                 FROM public.news
                 WHERE ts >= now() - interval '1 hour'
                   AND impact_score >= 7
@@ -146,7 +151,8 @@ def _check_news_importance():
         conn.close()
         if rows:
             return [
-                {"id": r[0], "title": r[1], "impact_score": r[2], "summary": r[3]}
+                {"id": r[0], "title": r[1], "impact_score": r[2], "summary": r[3],
+                 "title_ko": r[4] if len(r) > 4 else None}
                 for r in rows
             ]
         return None
@@ -159,8 +165,9 @@ def _ai_news_advisory(text: str, high_news: list) -> tuple:
     """고영향 뉴스에 대한 AI 분석 (Claude OK — emergency-adjacent). Returns (text, provider)."""
     news_lines = []
     for n in high_news[:3]:
+        display_title = n.get('title_ko') or n['title']
         news_lines.append(
-            f"- [{n['impact_score']}/10] {n['title']}\n  {n.get('summary', '')}"
+            f"- [{n['impact_score']}/10] {display_title}\n  {n.get('summary', '')}"
         )
     news_block = "\n".join(news_lines)
 
@@ -270,7 +277,7 @@ def _fetch_categorized_news():
             cur.execute("""
                 SELECT id, title, source, impact_score, summary,
                        to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr,
-                       keywords, url
+                       keywords, url, title_ko
                 FROM news
                 WHERE ts >= now() - interval '6 hours'
                   AND impact_score > 0
@@ -285,7 +292,7 @@ def _fetch_categorized_news():
             direction = report_formatter._parse_news_direction(summary_raw)
             impact_path = report_formatter._parse_impact_path(summary_raw)
             # Extract Korean summary (strip tags)
-            import re
+    
             summary_kr = re.sub(r'^\[.*?\]\s*', '', summary_raw)
             summary_kr = re.sub(r'^\[.*?\]\s*', '', summary_kr)  # second tag
             if '|' in summary_kr:
@@ -294,6 +301,7 @@ def _fetch_categorized_news():
             item = {
                 'id': r[0],
                 'title': r[1] or '',
+                'title_ko': r[8] if len(r) > 8 and r[8] else None,
                 'source': r[2] or '',
                 'impact_score': int(r[3]) if r[3] else 0,
                 'summary': summary_raw,
@@ -362,8 +370,8 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO',
         bull = stats.get('bullish', 0)
         bear = stats.get('bearish', 0)
         high = stats.get('high_impact', 0)
-        macro_titles = [n.get('title', '')[:60] for n in data.get('macro_news', [])[:3]]
-        crypto_titles = [n.get('title', '')[:60] for n in data.get('crypto_news', [])[:3]]
+        macro_titles = [(n.get('title_ko') or n.get('title', ''))[:60] for n in data.get('macro_news', [])[:3]]
+        crypto_titles = [(n.get('title_ko') or n.get('title', ''))[:60] for n in data.get('crypto_news', [])[:3]]
         scores = data.get('scores', {})
 
         summary_prompt = (
@@ -435,7 +443,7 @@ def _parse_ai_summary_json(text):
         return {}
     try:
         # Try to extract JSON from response
-        import re
+
         # Find JSON block
         match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
         if match:
@@ -526,11 +534,11 @@ def _check_auto_trading_active(cur=None):
     import test_utils
     test = test_utils.load_test_mode()
     if not test_utils.is_test_active(test):
-        return (False, 'test mode inactive')
+        return (False, '테스트 모드 비활성')
 
     # Gate 2: LIVE_TRADING env
     if os.getenv('LIVE_TRADING') != 'YES_I_UNDERSTAND':
-        return (False, 'LIVE_TRADING not set')
+        return (False, 'LIVE_TRADING 미설정')
 
     # Gate 3: trade_switch DB
     try:
@@ -561,9 +569,9 @@ def _check_auto_trading_active(cur=None):
                     except Exception:
                         pass
         if not row or not row[0]:
-            return (False, 'trade_switch disabled')
+            return (False, '매매 스위치 비활성')
     except Exception as e:
-        return (False, f'trade_switch check error: {e}')
+        return (False, f'매매 스위치 확인 오류: {e}')
 
     return (True, 'auto-trading active')
 
@@ -618,7 +626,7 @@ def _fetch_news_summary(cur):
     try:
         cur.execute("""
             SELECT title, source, impact_score, summary, ts,
-                   keywords
+                   keywords, title_ko
             FROM news
             WHERE ts >= now() - interval '6 hours'
               AND impact_score IS NOT NULL
@@ -633,6 +641,7 @@ def _fetch_news_summary(cur):
             'summary': r[3] or '',
             'ts': str(r[4]) if r[4] else '',
             'keywords': list(r[5]) if r[5] else [],
+            'title_ko': r[6] if len(r) > 6 and r[6] else None,
         } for r in rows]
     except Exception as e:
         _log(f'_fetch_news_summary error: {e}')
@@ -1028,7 +1037,6 @@ def _format_market_data(price, ctx):
 
 def _parse_claude_action(ai_text: str) -> str:
     """Claude 응답에서 '최종 ACTION: XXX' 패턴을 파싱. 없으면 빈 문자열."""
-    import re
     m = re.search(r'최종\s*ACTION\s*[:\s]\s*(HOLD|ADD|REDUCE|CLOSE|REVERSE)', ai_text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -1077,7 +1085,7 @@ def _build_execution_prompt(scores, pos_state, strategy_ctx, snapshot, user_text
         news_lines = ['=== 최근 뉴스 ===']
         for i, n in enumerate(news_items[:5], 1):
             imp = n.get('impact_score', 0)
-            title = n.get('title', '?')[:80]
+            title = (n.get('title_ko') or n.get('title', '?'))[:80]
             summary = n.get('summary', '')[:100]
             news_lines.append(f'{i}. [{imp}/10] {title}')
             if summary:
@@ -1370,7 +1378,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                 _ex = _get_exchange()
                 snapshot = _ms.build_and_validate(_ex, cur, STRATEGY_SYMBOL)
             except _ms.SnapshotError as e:
-                return (f'REALTIME DATA NOT AVAILABLE -- STRATEGY ABORTED\n{e}', 'error')
+                return (f'⚠️ 실시간 데이터 불가 — 전략 중단\n{e}', 'error')
 
             # Phase 1: Score + position + context + news (Claude input)
             scores = score_engine.compute_total(cur=cur)
@@ -1565,6 +1573,20 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
         gate=gate, prompt=prompt, cooldown_key=cooldown_key,
         context=context, max_tokens=max_tokens, call_type=call_type)
 
+    # Log Claude call to DB for caller attribution
+    try:
+        event_lock.log_claude_call(
+            caller=CALLER, gate_type=gate, call_type=call_type,
+            model_used=result.get('model'),
+            input_tokens=result.get('input_tokens', 0),
+            output_tokens=result.get('output_tokens', 0),
+            estimated_cost=result.get('estimated_cost_usd', 0),
+            latency_ms=result.get('api_latency_ms', 0),
+            allowed=not result.get('fallback_used', False),
+            deny_reason=result.get('gate_reason') if result.get('fallback_used') else None)
+    except Exception:
+        pass
+
     if result.get('fallback_used'):
         if no_fallback:
             reason = result.get('gate_reason', 'unknown')
@@ -1713,7 +1735,7 @@ def _handle_directive_command(dtype, params):
     conn = _get_db_conn()
     try:
         result = openclaw_engine.execute_directive(conn, dtype, params, source='telegram')
-        return result.get('message', 'Directive processed')
+        return result.get('message', '지시 처리 완료')
     finally:
         try:
             conn.close()
@@ -1747,7 +1769,7 @@ def _handle_directive_intent(intent, text):
         if parsed:
             result = openclaw_engine.execute_directive(
                 conn, parsed['dtype'], parsed['params'], source='telegram')
-            return (result.get('message', 'Directive processed'), 'local')
+            return (result.get('message', '지시 처리 완료'), 'local')
         return ('무엇을 변경하시겠어요?\n'
                 '예시: "리스크 보수적으로", "trump 감시 추가", "시스템 점검"', 'local')
     finally:
@@ -1784,7 +1806,7 @@ def _format_command_result(action, eq_id, parsed, pos, scores):
         lines.append(f"포지션: {pos['side']} qty={pos.get('total_qty', 0)}")
     if action == 'REDUCE' and parsed.get('percent'):
         lines.append(f"축소: {parsed['percent']}%")
-    lines.append(f"Score: {scores.get('total_score', 0):+.1f}")
+    lines.append(f"스코어: {scores.get('total_score', 0):+.1f}")
     return '\n'.join(lines)
 
 
@@ -1943,7 +1965,6 @@ def _handle_nl_command(parsed, text):
 
 def _extract_keywords_from_text(text):
     """Extract potential keywords from natural language text."""
-    import re
     t = text.lower()
     # Remove common verb/particle phrases (longer first to avoid partial matches)
     for w in ['추가해줘', '삭제해줘', '해제해줘', '등록해줘', '제거해줘',

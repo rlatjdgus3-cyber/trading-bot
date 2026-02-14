@@ -336,7 +336,8 @@ def _call_claude_inner(gate, prompt, cooldown_key, context, max_tokens,
     # Gate check
     check = request(gate, cooldown_key, context, call_type=call_type)
     if not check['allowed']:
-        _log(f'DENIED gate={gate} key={cooldown_key} call_type={call_type} reason={check["reason"]}')
+        caller = (context or {}).get('caller', 'unknown')
+        _log(f'DENIED gate={gate} key={cooldown_key} call_type={call_type} caller={caller} reason={check["reason"]}')
         return {'fallback_used': True, 'gate_reason': check['reason'],
                 'text': '', 'model': CLAUDE_MODEL,
                 'budget_remaining': check.get('budget_remaining', {}),
@@ -368,8 +369,9 @@ def _call_claude_inner(gate, prompt, cooldown_key, context, max_tokens,
                               cooldown_key, call_type=call_type, context=context)
         _save_state(state)
 
+        caller = (context or {}).get('caller', 'unknown')
         _log(f'OK gate={gate} key={cooldown_key} call_type={call_type} '
-             f'in={input_tokens} out={output_tokens} '
+             f'caller={caller} in={input_tokens} out={output_tokens} '
              f'latency={elapsed_ms}ms')
 
         return {
@@ -525,6 +527,7 @@ def compact_context(context: dict) -> dict:
 
 def get_daily_cost_report() -> str:
     """Generate daily cost report string for telegram."""
+    import report_formatter
     state = _load_state()
     today = _today()
     month = _this_month()
@@ -541,19 +544,15 @@ def get_daily_cost_report() -> str:
     user_c = ctc.get(CALL_TYPE_USER, 0)
     emerg_c = ctc.get(CALL_TYPE_EMERGENCY, 0)
 
-    lines = [
-        '=== Claude Gate Report ===',
-        f'Date: {today}',
-        f'Daily calls: {daily_calls}/{DAILY_CALL_LIMIT}',
-        f'Daily cost: ${daily_cost:.4f}/${DAILY_COST_LIMIT}',
-        f'Monthly cost: ${monthly_cost:.4f}/${MONTHLY_COST_LIMIT}',
-        f'Call types: AUTO={auto_c} USER={user_c} EMERGENCY={emerg_c}',
-    ]
+    error_remaining = int(error_until - now) if now < error_until else 0
 
-    if now < error_until:
-        lines.append(f'ERROR BLOCK: {int(error_until - now)}s remaining')
-
-    return '\n'.join(lines)
+    return report_formatter.format_daily_cost_report(
+        today=today,
+        daily_calls=daily_calls, daily_limit=DAILY_CALL_LIMIT,
+        daily_cost=daily_cost, daily_cost_limit=DAILY_COST_LIMIT,
+        monthly_cost=monthly_cost, monthly_cost_limit=MONTHLY_COST_LIMIT,
+        auto_c=auto_c, user_c=user_c, emerg_c=emerg_c,
+        error_remaining=error_remaining)
 
 
 # ── budget notification ──────────────────────────────────
@@ -574,7 +573,9 @@ def _notify_budget_exceeded(state: dict, reason: str):
 
         import urllib.parse
         import urllib.request
-        text = f'[claude_gate] Budget exceeded: {reason}\n{get_daily_cost_report()}'
+        import report_formatter
+        text = report_formatter.sanitize_telegram_text(
+            report_formatter.format_budget_exceeded(reason, get_daily_cost_report()))
         url = f'https://api.telegram.org/bot{token}/sendMessage'
         data = urllib.parse.urlencode({
             'chat_id': chat_id,

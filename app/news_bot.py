@@ -87,6 +87,7 @@ def llm_analyze(client, title):
             "category": "WAR/US_POLITICS/FED_RATES/CPI_JOBS/NASDAQ_EQUITIES/REGULATION_SEC_ETF/JAPAN_BOJ/CHINA/FIN_STRESS/CRYPTO_SPECIFIC/OTHER",
             "impact_path": "예: 금리인상→달러강세→BTC하락",
             "summary_kr": "한국어 1~2문장",
+            "title_ko": "뉴스 제목 한국어 번역",
         }
     }
     resp = client.responses.create(
@@ -101,13 +102,17 @@ def llm_analyze(client, title):
         category = (data.get("category", "OTHER") or "OTHER").strip()
         impact_path = (data.get("impact_path", "") or "").strip()
         summary_kr = (data.get("summary_kr", "") or "").strip()
+        title_ko = (data.get("title_ko", "") or "").strip()
+        if not title_ko:
+            # fallback: use first sentence of summary_kr
+            title_ko = summary_kr.split('.')[0] if summary_kr else ""
         # Encode category + impact_path into summary field
         summary = f"[{direction}] [{category}] {summary_kr}"
         if impact_path:
             summary += f" | {impact_path}"
-        return impact, direction, summary
+        return impact, direction, summary, title_ko
     except:
-        return 0, "neutral", text[:200]
+        return 0, "neutral", text[:200], ""
 
 def ensure_table(db):
     """
@@ -125,7 +130,8 @@ def ensure_table(db):
           url TEXT UNIQUE,
           summary TEXT,
           impact_score INT,
-          keywords TEXT[]
+          keywords TEXT[],
+          title_ko TEXT
         );
         """)
         db.commit()
@@ -134,23 +140,24 @@ def db_news_summary(db, minutes=60, limit=20) -> str:
     with db.cursor() as cur:
         cur.execute("""
             WITH recent AS (
-              SELECT id, ts, source, COALESCE(impact_score,0) AS impact_score, title, url
+              SELECT id, ts, source, COALESCE(impact_score,0) AS impact_score,
+                     COALESCE(title_ko, title, '(제목 없음)') AS display_title, url
               FROM public.news
               WHERE ts >= now() - (%s || ' minutes')::interval
               ORDER BY id DESC
               LIMIT %s
             )
             SELECT
-              '📰 DB News (last ' || %s || 'm) count=' || (SELECT count(*) FROM recent) || E'\n'
+              '📰 DB 뉴스 (최근 ' || %s || '분) 건수=' || (SELECT count(*) FROM recent) || E'\n'
               || COALESCE(string_agg(
                   '• [' || to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') || ' KST] '
                   || '(' || impact_score || ') '
-                  || COALESCE(title,'(no title)') || E'\n  ' || COALESCE(url,'')
-                , E'\n'), '• (none)')
+                  || display_title || E'\n  ' || COALESCE(url,'')
+                , E'\n'), '• (없음)')
             FROM recent;
         """, (str(minutes), int(limit), str(minutes)))
         row = cur.fetchone()
-        return (row[0] if row and row[0] else "📰 DB News\n• (none)")
+        return (row[0] if row and row[0] else "📰 DB 뉴스\n• (없음)")
 
 def run_summary_once():
     db = psycopg2.connect(DATABASE_URL, connect_timeout=10, options="-c statement_timeout=30000")
@@ -202,21 +209,21 @@ def main():
                         if cur.fetchone():
                             continue
 
-                    impact, direction, summary = 0, "neutral", ""
+                    impact, direction, summary, title_ko = 0, "neutral", "", ""
                     # All news get GPT-mini classification. Dedup via URL UNIQUE.
                     if client:
                         try:
-                            impact, direction, summary = llm_analyze(client, title)
+                            impact, direction, summary, title_ko = llm_analyze(client, title)
                         except Exception as llm_err:
                             log(f"[news_bot] LLM error: {llm_err}")
-                            impact, direction, summary = 0, "neutral", ""
+                            impact, direction, summary, title_ko = 0, "neutral", "", ""
 
                     kw = extract_keywords(title, active_keywords)
 
                     with db.cursor() as cur:
                         cur.execute("""
-                            INSERT INTO public.news(source, title, url, summary, impact_score, keywords)
-                            VALUES (%s,%s,%s,%s,%s,%s)
+                            INSERT INTO public.news(source, title, url, summary, impact_score, keywords, title_ko)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s)
                             ON CONFLICT (url) DO NOTHING
                         """, (
                             source,
@@ -225,6 +232,7 @@ def main():
                             summary if summary else f"[{direction}]",
                             int(impact),
                             kw if kw else None,
+                            title_ko if title_ko else None,
                         ))
                     db.commit()
                     inserted += 1

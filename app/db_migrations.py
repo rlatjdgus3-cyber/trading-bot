@@ -890,6 +890,76 @@ def ensure_execution_queue_compliance_columns(cur):
     _log('ensure_execution_queue_compliance_columns done')
 
 
+def ensure_event_lock(cur):
+    '''DB-based event dedup lock — replaces in-memory dedup across all processes.
+    key = symbol:trigger_type:price_bucket, ttl-based expiry.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.event_lock (
+            id          BIGSERIAL PRIMARY KEY,
+            lock_key    TEXT NOT NULL UNIQUE,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            expires_at  TIMESTAMPTZ NOT NULL,
+            caller      TEXT NOT NULL DEFAULT 'unknown',
+            lock_type   TEXT NOT NULL DEFAULT 'event',
+            detail      JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_event_lock_key ON event_lock(lock_key);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_event_lock_expires ON event_lock(expires_at);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_event_lock_type ON event_lock(lock_type);')
+    _log('ensure_event_lock done')
+
+
+def ensure_hold_consecutive(cur):
+    '''Track consecutive HOLD results per symbol for suppress_lock generation.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.hold_consecutive (
+            symbol          TEXT PRIMARY KEY,
+            consecutive_count INTEGER NOT NULL DEFAULT 0,
+            last_trigger_types TEXT[] NOT NULL DEFAULT '{}',
+            last_caller     TEXT,
+            last_action     TEXT,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """)
+    _log('ensure_hold_consecutive done')
+
+
+def ensure_claude_call_log(cur):
+    '''Per-call log with caller attribution for cost/frequency tracking.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.claude_call_log (
+            id              BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+            caller          TEXT NOT NULL,
+            gate_type       TEXT NOT NULL,
+            call_type       TEXT NOT NULL DEFAULT 'AUTO',
+            model_used      TEXT,
+            input_tokens    INTEGER DEFAULT 0,
+            output_tokens   INTEGER DEFAULT 0,
+            estimated_cost  NUMERIC(8,6) DEFAULT 0,
+            latency_ms      INTEGER DEFAULT 0,
+            event_hash      TEXT,
+            trigger_types   TEXT[],
+            action_result   TEXT,
+            allowed         BOOLEAN NOT NULL DEFAULT true,
+            deny_reason     TEXT,
+            detail          JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_ccl_ts ON claude_call_log(ts);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_ccl_caller ON claude_call_log(caller);')
+    _log('ensure_claude_call_log done')
+
+
+def ensure_news_title_ko(cur):
+    '''Add title_ko column to news table for Korean translation.'''
+    cur.execute("""
+        ALTER TABLE public.news ADD COLUMN IF NOT EXISTS title_ko TEXT;
+    """)
+    _log('ensure_news_title_ko done')
+
+
 def ensure_exchange_policy_audit(cur):
     '''Exchange policy audit results — 10-day compliance review.'''
     cur.execute("""
@@ -973,8 +1043,14 @@ def run_all():
             # Exchange compliance layer
             ensure_compliance_log(cur)
             ensure_execution_queue_compliance_columns(cur)
+            # News title_ko for Korean translation
+            ensure_news_title_ko(cur)
             # Exchange policy audit
             ensure_exchange_policy_audit(cur)
+            # DB-based event dedup lock (replaces in-memory dedup)
+            ensure_event_lock(cur)
+            ensure_hold_consecutive(cur)
+            ensure_claude_call_log(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
