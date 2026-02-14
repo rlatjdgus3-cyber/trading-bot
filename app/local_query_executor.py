@@ -58,7 +58,8 @@ def execute(query_type=None, original_text=None):
         'volatility_summary': _volatility_summary,
         'position_info': _position_info,
         'score_summary': _score_summary,
-        'db_health': _db_health}
+        'db_health': _db_health,
+        'claude_audit': _claude_audit}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -405,6 +406,99 @@ def _db_health(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'DB 상태 조회 실패: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _claude_audit(_text=None):
+    """Claude API 사용량 감사 리포트."""
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            lines = ['🧠 Claude 사용량 감사']
+            lines.append('━━━━━━━━━━━━━━━━━━')
+
+            # Today's stats from claude_call_log
+            cur.execute("""
+                SELECT count(*),
+                       coalesce(sum(estimated_cost), 0),
+                       coalesce(sum(input_tokens), 0),
+                       coalesce(sum(output_tokens), 0)
+                FROM claude_call_log
+                WHERE ts >= date_trunc('day', now() AT TIME ZONE 'Asia/Seoul');
+            """)
+            row = cur.fetchone()
+            today_calls = row[0] or 0
+            today_cost = float(row[1] or 0)
+            today_input = row[2] or 0
+            today_output = row[3] or 0
+            lines.append(f'\n[오늘 사용량]')
+            lines.append(f'  호출: {today_calls}건 | 비용: ${today_cost:.4f}')
+            lines.append(f'  입력 토큰: {today_input:,} | 출력 토큰: {today_output:,}')
+
+            # By gate_type today
+            cur.execute("""
+                SELECT gate_type, count(*), coalesce(sum(estimated_cost), 0)
+                FROM claude_call_log
+                WHERE ts >= date_trunc('day', now() AT TIME ZONE 'Asia/Seoul')
+                GROUP BY gate_type ORDER BY count(*) DESC;
+            """)
+            gate_rows = cur.fetchall()
+            if gate_rows:
+                lines.append(f'\n[게이트별 분류]')
+                for gr in gate_rows:
+                    lines.append(f'  {gr[0] or "?"}: {gr[1]}건 (${float(gr[2]):.4f})')
+
+            # Monthly stats
+            cur.execute("""
+                SELECT count(*),
+                       coalesce(sum(estimated_cost), 0)
+                FROM claude_call_log
+                WHERE ts >= date_trunc('month', now());
+            """)
+            row = cur.fetchone()
+            month_calls = row[0] or 0
+            month_cost = float(row[1] or 0)
+            lines.append(f'\n[이번 달 누적]')
+            lines.append(f'  호출: {month_calls}건 | 비용: ${month_cost:.4f}')
+
+            # Budget remaining (from claude_gate)
+            try:
+                import claude_gate
+                lines.append(f'\n[예산 한도]')
+                lines.append(f'  일일 호출 한도: {claude_gate.DAILY_CALL_LIMIT}')
+                lines.append(f'  일일 비용 한도: ${claude_gate.DAILY_COST_LIMIT}')
+                lines.append(f'  월간 비용 한도: ${claude_gate.MONTHLY_COST_LIMIT}')
+                remaining_calls = max(0, claude_gate.DAILY_CALL_LIMIT - today_calls)
+                remaining_cost = max(0, claude_gate.DAILY_COST_LIMIT - today_cost)
+                lines.append(f'  남은 호출: {remaining_calls}건 | 남은 비용: ${remaining_cost:.2f}')
+            except Exception:
+                pass
+
+            # Recent 5 calls
+            cur.execute("""
+                SELECT to_char(ts AT TIME ZONE 'Asia/Seoul', 'HH24:MI'),
+                       gate_type, call_type,
+                       action_result, estimated_cost
+                FROM claude_call_log
+                ORDER BY ts DESC LIMIT 5;
+            """)
+            recent = cur.fetchall()
+            if recent:
+                lines.append(f'\n[최근 호출 5건]')
+                for r in recent:
+                    cost_str = f'${float(r[4]):.4f}' if r[4] else '$0'
+                    lines.append(f'  {r[0]} {r[1] or "?"}/{r[2] or "?"} '
+                                 f'→ {r[3] or "?"} ({cost_str})')
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'Claude 감사 조회 실패: {e}'
     finally:
         if conn:
             try:

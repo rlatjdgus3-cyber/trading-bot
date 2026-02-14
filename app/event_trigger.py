@@ -33,7 +33,7 @@ MODE_EMERGENCY = 'EMERGENCY'
 MODE_USER = 'USER'
 
 # ── price spike thresholds (return %) ──────────────────────
-PRICE_SPIKE_1M_PCT = 0.8
+PRICE_SPIKE_1M_PCT = 1.0
 PRICE_SPIKE_5M_PCT = 1.8
 PRICE_SPIKE_15M_PCT = 3.0
 
@@ -63,7 +63,7 @@ BOX_RET_5M_SUPPRESS_PCT = 1.0
 
 # ── dedup ──────────────────────────────────────────────────
 AUTO_DEDUP_WINDOW_SEC = 300    # 5 min (per-type trigger dedup)
-EVENT_HASH_DEDUP_SEC = 1800    # 30 min (same event_hash dedup)
+EVENT_HASH_DEDUP_SEC = 900     # 15 min (same event_hash dedup)
 EMERGENCY_LOCK_SEC = 180       # 3 min lock after emergency execution
 MIN_ORDER_QTY_BTC = 0.001     # Bybit BTC/USDT:USDT minimum
 
@@ -78,7 +78,7 @@ EVENT_CLAUDE_MIN_CONFIDENCE = 0.75  # trigger confidence threshold
 ASYNC_CLAUDE_COOLDOWN_SEC = 1800       # 30분 쿨다운
 ASYNC_CLAUDE_RET_5M_THRESHOLD = 1.0    # 조건A: |ret_5m| >= 1.0%
 ASYNC_CLAUDE_CONFIDENCE_THRESHOLD = 70  # 조건A: GPT confidence < 70
-ASYNC_CLAUDE_BAR_15M_THRESHOLD = 1.0   # 조건B: 각 봉 >= 1.0%
+ASYNC_CLAUDE_BAR_15M_CUMULATIVE = 1.5  # 조건B: 누적 >=1.5% (같은 방향)
 ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD = 40  # 조건C: |news_event_score| >= 40
 
 # ── Telegram throttle ────────────────────────────────────
@@ -106,11 +106,16 @@ _event_hash_history = {}       # {event_hash: timestamp}
 _telegram_event_ts = {}        # {trigger_type_key: timestamp}
 
 # ── HOLD repeat suppression (§3) ────────────────────────
+HOLD_REPEAT_LIMIT = 3             # N consecutive HOLDs → lock
+HOLD_LOCK_SEC = 900               # 15-min lock after N consecutive HOLDs
+
 _last_hold_state = {
     'action': None,            # last Claude action ('HOLD', 'CLOSE', etc.)
     'trigger_types': [],       # sorted event types that triggered the call
     'position_side': None,     # position side at time of action
     'position_qty': 0,         # position qty at time of action
+    'consecutive_holds': 0,    # count of consecutive HOLD results
+    'lock_until': 0,           # timestamp when hold lock expires
 }
 
 # ── edge detection state ──────────────────────────────────
@@ -156,24 +161,58 @@ def record_claude_result(action, trigger_types, position):
 
     Called after every Claude call (EVENT mode) to track
     whether the same HOLD + event combo should be suppressed.
+    After N consecutive HOLDs (same triggers+position), enters 15-min lock.
     """
+    sorted_types = sorted(trigger_types) if trigger_types else []
+    cur_side = position.get('side') if position else None
+    cur_qty = position.get('qty', 0) if position else 0
+
+    if action == 'HOLD':
+        # Check if same context as previous
+        same_context = (
+            _last_hold_state['action'] == 'HOLD'
+            and sorted_types == _last_hold_state['trigger_types']
+            and cur_side == _last_hold_state['position_side']
+            and cur_qty == _last_hold_state['position_qty']
+        )
+        if same_context:
+            _last_hold_state['consecutive_holds'] += 1
+        else:
+            _last_hold_state['consecutive_holds'] = 1
+
+        # After N consecutive HOLDs, apply 15-min lock
+        if _last_hold_state['consecutive_holds'] >= HOLD_REPEAT_LIMIT:
+            _last_hold_state['lock_until'] = time.time() + HOLD_LOCK_SEC
+            _log(f'HOLD loop lock ACTIVATED: {_last_hold_state["consecutive_holds"]} '
+                 f'consecutive HOLDs → {HOLD_LOCK_SEC}s lock')
+    else:
+        _last_hold_state['consecutive_holds'] = 0
+
     _last_hold_state['action'] = action
-    _last_hold_state['trigger_types'] = sorted(trigger_types) if trigger_types else []
-    _last_hold_state['position_side'] = position.get('side') if position else None
-    _last_hold_state['position_qty'] = position.get('qty', 0) if position else 0
+    _last_hold_state['trigger_types'] = sorted_types
+    _last_hold_state['position_side'] = cur_side
+    _last_hold_state['position_qty'] = cur_qty
     _log(f'recorded claude result: action={action} '
-         f'types={_last_hold_state["trigger_types"]} '
-         f'side={_last_hold_state["position_side"]}')
+         f'types={sorted_types} side={cur_side} '
+         f'consecutive_holds={_last_hold_state["consecutive_holds"]}')
 
 
 def is_hold_repeat(trigger_types, position) -> bool:
     """Check if this would be a duplicate HOLD call (§3).
 
     Skip if:
-      last_claude_action == "HOLD"
-      AND position side+qty unchanged
-      AND same event type(s)
+      1. HOLD loop lock active (N consecutive HOLDs → 15min lock)
+      2. last_claude_action == "HOLD" AND same triggers+position
     """
+    # Check HOLD loop lock first
+    now = time.time()
+    lock_until = _last_hold_state.get('lock_until', 0)
+    if lock_until > now:
+        remaining = int(lock_until - now)
+        _log(f'HOLD loop LOCKED: {remaining}s remaining '
+             f'(consecutive={_last_hold_state["consecutive_holds"]})')
+        return True
+
     if _last_hold_state['action'] != 'HOLD':
         return False
     # Position changed?
@@ -197,6 +236,8 @@ def reset_hold_state():
     _last_hold_state['trigger_types'] = []
     _last_hold_state['position_side'] = None
     _last_hold_state['position_qty'] = 0
+    _last_hold_state['consecutive_holds'] = 0
+    _last_hold_state['lock_until'] = 0
 
 
 # ── EVENT Claude escalation gate ─────────────────────────
@@ -299,11 +340,17 @@ def need_claude(snapshot, mini_result, scores) -> tuple:
             and confidence is not None and confidence < ASYNC_CLAUDE_CONFIDENCE_THRESHOLD):
         return True, f'condition_A (ret_5m={ret_5m:.2f}%, confidence={confidence})'
 
-    # ── 조건B: 15분봉 3개 연속 ±1.0% 이상 ──
+    # ── 조건B: 15분봉 3개 같은 방향 + 누적 >=1.5% ──
     bar_15m = snapshot.get('bar_15m_returns', []) if snapshot else []
-    if len(bar_15m) >= 3 and all(
-            abs(b) >= ASYNC_CLAUDE_BAR_15M_THRESHOLD for b in bar_15m):
-        return True, f'condition_B (bar_15m={bar_15m})'
+    if len(bar_15m) >= 3:
+        last3 = bar_15m[:3]
+        all_positive = all(b > 0 for b in last3)
+        all_negative = all(b < 0 for b in last3)
+        if all_positive or all_negative:
+            cumulative = abs(sum(last3))
+            if cumulative >= ASYNC_CLAUDE_BAR_15M_CUMULATIVE:
+                direction = 'up' if all_positive else 'down'
+                return True, f'condition_B ({direction} cumulative={cumulative:.2f}%, bar_15m={last3})'
 
     # ── 조건C: |news_event_score| >= 40 ──
     news_score = scores.get('news_event_score', 0) if scores else 0
@@ -840,7 +887,7 @@ def compute_event_hash(triggers, symbol='BTC/USDT:USDT', price=None) -> str:
         key_parts.append(part)
     types_str = '|'.join(key_parts)
     price_band = int(price / 500) * 500 if price else 0
-    minute_bucket = int(time.time() / 1800)  # 30-min bucket for hash dedup
+    minute_bucket = int(time.time() / 900)  # 15-min bucket for hash dedup
     raw = f'{symbol}:{types_str}:{price_band}:{minute_bucket}'
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 

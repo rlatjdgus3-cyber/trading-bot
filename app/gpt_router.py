@@ -41,7 +41,7 @@ COMMAND_INTENTS = (
 QUESTION_INTENTS = (
     "status", "price", "indicators", "news_analysis", "strategy",
     "emergency", "score", "report", "health", "errors",
-    "volatility", "db_health", "general")
+    "volatility", "db_health", "claude_audit", "general")
 
 # Legacy mapping: new QUESTION intent → (route, local_query_type)
 QUESTION_ROUTE_MAP = {
@@ -57,6 +57,7 @@ QUESTION_ROUTE_MAP = {
     'errors': ('local', 'recent_errors'),
     'volatility': ('local', 'volatility_summary'),
     'db_health': ('local', 'db_health'),
+    'claude_audit': ('local', 'claude_audit'),
     'general': ('none', ''),
 }
 
@@ -92,6 +93,7 @@ SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/Engl
 - errors: 에러 로그
 - volatility: 변동성 요약
 - db_health: DB 상태/테이블 점검
+- claude_audit: Claude API 사용량/비용 감사
 - general: 기타 질문
 
 ## Output JSON (ONLY valid JSON, no text)
@@ -371,6 +373,12 @@ def _keyword_fallback(text: str) -> dict:
                 "confidence": 0.7, "_fallback": True})
 
     # ── QUESTION intents ────────────────────────────────────
+    # claude_audit must be checked BEFORE db_health/status
+    if any(x in t for x in ["claude_audit", "claude 사용량", "클로드 사용량", "클로드 비용",
+                             "claude 비용", "api 사용량", "ai 비용", "ai 사용"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "claude_audit",
+                "confidence": 0.8, "_fallback": True})
+
     # db_health must be checked BEFORE status (because "디비상태" contains "상태")
     if any(x in t for x in ["db_health", "디비상태", "db상태", "데이터베이스", "테이블 점검",
                              "디비 점검", "db 점검", "db health"]):

@@ -118,7 +118,8 @@ HELP_TEXT = (
     "  트럼프 감시 키워드 추가해\n"
     "  시스템 점검해줘\n\n"
     "🔧 백업 슬래시 명령\n"
-    "  /help /status /health /db_health /force /detail /debug\n"
+    "  /help /status /health /db_health /claude_audit\n"
+    "  /force /detail /debug\n"
 )
 
 # ── news importance check & AI news advisory ─────────────
@@ -1475,14 +1476,28 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
 
             # Phase 3: JSON parsing + claude_failed 감지
             if ai_meta.get('fallback_used'):
-                parsed = dict(claude_api.FALLBACK_RESPONSE)
+                # Strategy route: Claude 거부 시 GPT fallback 차단 → ABORT
+                _log('strategy: Claude denied → ABORT (GPT fallback blocked)')
+                parsed = dict(claude_api.ABORT_RESPONSE)
                 parsed['fallback_used'] = True
+                claude_failed = True
+                claude_action = 'ABORT'
+                final_action = 'HOLD'  # ABORT = 실행 없음
+
+                result = ('⚠️ 전략 분석 불가 — Claude 미사용\n'
+                          f'사유: {ai_meta.get("gate_reason", "쿨다운/예산")}\n'
+                          f'엔진 판단: {engine_action}\n'
+                          '※ 전략 분석은 Claude 전용입니다. 잠시 후 재시도하세요.')
+                _save_advisory('strategy_advisory',
+                               {'user_text': text, 'abort': True,
+                                'gate_reason': ai_meta.get('gate_reason', '')},
+                               result, ai_meta)
+                return (result, 'claude(denied)')
             else:
                 parsed = claude_api._parse_response(ai_text)
 
             claude_action = parsed.get('action', 'HOLD')
-            claude_failed = (ai_meta.get('fallback_used')
-                             or parsed.get('reason_code') == 'API_CALL_FAILED')
+            claude_failed = parsed.get('reason_code') == 'API_CALL_FAILED'
 
             # Engine이 항상 최종 action. Claude는 리스크 파라미터만 참고.
             final_action = engine_action
@@ -1890,6 +1905,7 @@ NL_LOCAL_MAP = {
     'report': 'daily_report',
     'volatility': 'volatility_summary',
     'db_health': 'db_health',
+    'claude_audit': 'claude_audit',
 }
 
 
@@ -2135,6 +2151,11 @@ def handle_command(text: str) -> str:
     if t in ('/db_health', '/dbhealth', 'db_health'):
         return local_query_executor.execute('db_health') + \
             _footer('db_health', 'local', 'local')
+
+    # /claude_audit — Claude API usage audit (no GPT cost)
+    if t in ('/claude_audit', '/claude', '/ai_cost', 'claude_audit'):
+        return local_query_executor.execute('claude_audit') + \
+            _footer('claude_audit', 'local', 'local')
 
     # /force — cooldown bypass, Claude forced
     if t == '/force' or t.startswith('/force '):
