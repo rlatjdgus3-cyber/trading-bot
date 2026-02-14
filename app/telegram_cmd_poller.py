@@ -229,10 +229,13 @@ def _ai_advisory(intent: dict, text: str, no_fallback: bool = False,
 
 def _fetch_categorized_news():
     """DB에서 최근 6시간 enriched 뉴스를 카테고리별로 분리하여 반환.
-    Returns (macro_news, crypto_news) — each a list of dicts.
+    Returns (macro_news, crypto_news, stats) — stats는 집계 통계 dict.
     """
     macro_news = []
     crypto_news = []
+    stats = {'total': 0, 'enriched': 0, 'high_impact': 0,
+             'bullish': 0, 'bearish': 0, 'neutral': 0,
+             'categories': {}}
     conn = None
     try:
         import psycopg2
@@ -247,34 +250,72 @@ def _fetch_categorized_news():
         )
         conn.autocommit = True
         with conn.cursor() as cur:
+            # Aggregate stats
+            cur.execute("""
+                SELECT count(*) AS total,
+                       count(*) FILTER (WHERE impact_score > 0) AS enriched,
+                       count(*) FILTER (WHERE impact_score >= 7) AS high_impact,
+                       count(*) FILTER (WHERE summary ILIKE '[up]%') AS bullish,
+                       count(*) FILTER (WHERE summary ILIKE '[down]%') AS bearish,
+                       count(*) FILTER (WHERE summary ILIKE '[neutral]%') AS neutral_cnt
+                FROM news
+                WHERE ts >= now() - interval '6 hours';
+            """)
+            sr = cur.fetchone()
+            if sr:
+                stats['total'] = sr[0] or 0
+                stats['enriched'] = sr[1] or 0
+                stats['high_impact'] = sr[2] or 0
+                stats['bullish'] = sr[3] or 0
+                stats['bearish'] = sr[4] or 0
+                stats['neutral'] = sr[5] or 0
+
+            # Top news per category
             cur.execute("""
                 SELECT title, source, impact_score, summary,
                        to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr,
-                       keywords
+                       keywords, url
                 FROM news
                 WHERE ts >= now() - interval '6 hours'
                   AND impact_score > 0
                 ORDER BY impact_score DESC, ts DESC
-                LIMIT 30;
+                LIMIT 50;
             """)
             rows = cur.fetchall()
 
         for r in rows:
+            summary_raw = r[3] or ''
+            cat = report_formatter._parse_news_category(summary_raw)
+            direction = report_formatter._parse_news_direction(summary_raw)
+            impact_path = report_formatter._parse_impact_path(summary_raw)
+            # Extract Korean summary (strip tags)
+            import re
+            summary_kr = re.sub(r'^\[.*?\]\s*', '', summary_raw)
+            summary_kr = re.sub(r'^\[.*?\]\s*', '', summary_kr)  # second tag
+            if '|' in summary_kr:
+                summary_kr = summary_kr.split('|', 1)[0].strip()
+
             item = {
                 'title': r[0] or '',
                 'source': r[1] or '',
                 'impact_score': int(r[2]) if r[2] else 0,
-                'summary': r[3] or '',
+                'summary': summary_raw,
+                'summary_kr': summary_kr,
+                'direction': direction,
+                'category': cat,
+                'category_kr': report_formatter.CATEGORY_KR.get(cat, cat),
+                'impact_path': impact_path,
                 'ts': r[4] or '',
                 'keywords': list(r[5]) if r[5] else [],
             }
-            cat = report_formatter._parse_news_category(item['summary'])
+            # Category count
+            stats['categories'][cat] = stats['categories'].get(cat, 0) + 1
+
             if cat in report_formatter.CRYPTO_CATEGORIES:
                 crypto_news.append(item)
             elif cat in report_formatter.MACRO_CATEGORIES:
                 macro_news.append(item)
             else:
-                # OTHER: classify by source
                 if item['source'] in ('coindesk', 'cointelegraph'):
                     crypto_news.append(item)
                 else:
@@ -288,7 +329,7 @@ def _fetch_categorized_news():
             except Exception:
                 pass
 
-    return (macro_news[:5], crypto_news[:5])
+    return (macro_news[:7], crypto_news[:7], stats)
 
 
 def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
@@ -296,27 +337,53 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
     no_fallback = call_type in ('USER', 'EMERGENCY')
 
     # Fetch categorized news from DB
-    macro_news, crypto_news = _fetch_categorized_news()
+    macro_news, crypto_news, stats = _fetch_categorized_news()
 
-    # Build news block for prompt
+    # ── Build structured news block ──
+    def _format_news_item(i, n):
+        dir_icon = {'상승': '+', '하락': '-', '중립': '~'}.get(n.get('direction', ''), '?')
+        line = f"{i}. ({dir_icon}) [{n['impact_score']}/10] {n['title']}"
+        line += f"\n   출처: {n['source']} | {n['ts']} | {n.get('category_kr', '')}"
+        if n.get('summary_kr'):
+            line += f"\n   요약: {n['summary_kr'][:120]}"
+        if n.get('impact_path'):
+            line += f"\n   영향경로: {n['impact_path']}"
+        return line
+
     news_parts = []
+
+    # Sentiment overview
+    b, br, n_cnt = stats['bullish'], stats['bearish'], stats['neutral']
+    total = stats['total']
+    high = stats['high_impact']
+    sentiment_ratio = f"상승 {b}건 / 하락 {br}건 / 중립 {n_cnt}건"
+    cat_dist = ', '.join(
+        f"{report_formatter.CATEGORY_KR.get(c, c)} {cnt}건"
+        for c, cnt in sorted(stats['categories'].items(), key=lambda x: -x[1])[:6]
+    )
+    news_parts.append(
+        f"[뉴스 센티먼트 요약 (최근 6시간)]\n"
+        f"총 {total}건 수집, AI 분석 {stats['enriched']}건, 고영향(7+) {high}건\n"
+        f"방향: {sentiment_ratio}\n"
+        f"카테고리: {cat_dist}"
+    )
+
     if macro_news:
-        macro_lines = ['[미국/거시 뉴스]']
-        for i, n in enumerate(macro_news[:3], 1):
-            macro_lines.append(
-                f"{i}. [{n['impact_score']}/10] {n['title']}\n   {n.get('summary', '')}")
+        macro_lines = [f'[미국/거시 뉴스 Top {min(len(macro_news), 5)}]']
+        for i, n in enumerate(macro_news[:5], 1):
+            macro_lines.append(_format_news_item(i, n))
         news_parts.append('\n'.join(macro_lines))
+
     if crypto_news:
-        crypto_lines = ['[크립토 뉴스]']
-        for i, n in enumerate(crypto_news[:3], 1):
-            crypto_lines.append(
-                f"{i}. [{n['impact_score']}/10] {n['title']}\n   {n.get('summary', '')}")
+        crypto_lines = [f'[크립토 뉴스 Top {min(len(crypto_news), 5)}]']
+        for i, n in enumerate(crypto_news[:5], 1):
+            crypto_lines.append(_format_news_item(i, n))
         news_parts.append('\n'.join(crypto_lines))
 
-    if not news_parts:
-        news_block = '(최근 6시간 AI 분석 뉴스 없음)'
-    else:
-        news_block = '\n\n'.join(news_parts)
+    if not macro_news and not crypto_news:
+        news_parts.append('(최근 6시간 AI 분석 뉴스 없음)')
+
+    news_block = '\n\n'.join(news_parts)
 
     # Indicators + score + position
     ind = local_query_executor.execute("indicator_snapshot")
@@ -324,32 +391,54 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
     pos = local_query_executor.execute("position_info")
 
     prompt = (
-        f"당신은 비트코인 선물 트레이딩 뉴스 분석가입니다.\n"
-        f"아래 제공된 실시간 데이터만 사용하여 한국어로 분석하세요.\n\n"
+        f"당신은 비트코인 선물 전문 뉴스 분석가입니다.\n"
+        f"아래 실시간 데이터만 사용하여 심층 한국어 분석 리포트를 작성하세요.\n"
+        f"추측이 아닌 데이터 기반으로만 분석하세요.\n\n"
         f"사용자 요청: {text}\n\n"
-        f"=== 최근 뉴스 (카테고리별 Top3) ===\n{news_block}\n\n"
-        f"=== 지표 ===\n{ind}\n\n"
-        f"=== 스코어 ===\n{score}\n\n"
+        f"=== 뉴스 데이터 ===\n{news_block}\n\n"
+        f"=== 기술 지표 ===\n{ind}\n\n"
+        f"=== 스코어 엔진 ===\n{score}\n\n"
         f"=== 포지션 ===\n{pos}\n\n"
-        "=== 분석 요청 (한국어 전략 리포트) ===\n"
-        "1. 미국/거시 뉴스 핵심 요약 (영향 방향 + 크기)\n"
-        "2. 크립토 뉴스 핵심 요약\n"
-        "3. 종합 시나리오 (상승/하락/횡보)\n"
-        "4. 현재 포지션 기준 대응 포인트\n"
-        "800자 이내."
+        "=== 분석 리포트 작성 지침 ===\n"
+        "아래 6개 섹션을 모두 포함하여 작성하세요:\n\n"
+        "1. 시장 센티먼트 진단\n"
+        "   - 상승/하락 뉴스 비율 해석\n"
+        "   - 고영향 뉴스의 주요 테마와 방향성\n"
+        "   - 현재 뉴스 흐름이 BTC에 미치는 총체적 압력 (강한 하락/약한 하락/중립/약한 상승/강한 상승)\n\n"
+        "2. 미국/거시 뉴스 심층 분석\n"
+        "   - 주요 뉴스별 BTC 영향 경로 (예: S&P500 약세→위험자산 회피→BTC 하방 압력)\n"
+        "   - 카테고리별 영향 요약 (금리, 주식, 정치, 지정학 등)\n"
+        "   - 가장 주시해야 할 매크로 리스크\n\n"
+        "3. 크립토 뉴스 심층 분석\n"
+        "   - 주요 뉴스별 영향 경로\n"
+        "   - 규제/ETF/해킹 등 카테고리별 요약\n"
+        "   - 크립토 자체 모멘텀 판단\n\n"
+        "4. 기술 지표 + 뉴스 크로스 분석\n"
+        "   - 기술 지표와 뉴스 방향이 일치하는지, 괴리가 있는지\n"
+        "   - 스코어 엔진 상태와 뉴스 센티먼트 비교\n\n"
+        "5. 종합 시나리오 (확률 부여)\n"
+        "   - 상승 시나리오: 조건 + 목표가 + 확률\n"
+        "   - 하락 시나리오: 조건 + 지지선 + 확률\n"
+        "   - 횡보 시나리오: 조건 + 레인지 + 확률\n\n"
+        "6. 포지션 대응 전략\n"
+        "   - 현재 포지션 기준 구체적 대응 (익절/손절/추가진입 레벨)\n"
+        "   - 뉴스 모니터링 포인트 (어떤 뉴스가 나오면 행동 변경)\n"
+        "   - 리스크 등급 (낮음/보통/높음/심각)\n\n"
+        "2000자 이상 상세히 작성. Markdown 형식 사용. 6개 섹션 모두 반드시 포함."
     )
 
     # Always try Claude first, fallback to GPT-mini with same prompt
     ck = 'user_tg_news_claude' if no_fallback else 'auto_tg_news_claude'
+    all_news = macro_news + crypto_news
     gate_ctx = {
         'intent': 'news',
-        'high_news': bool(macro_news or crypto_news),
+        'high_news': bool(all_news),
         'impact_score': max(
-            (n.get('impact_score', 0) for n in (macro_news + crypto_news)),
+            (n.get('impact_score', 0) for n in all_news),
             default=0),
         'source': 'openclaw' if no_fallback else 'telegram',
     }
-    gate = 'high_news' if (macro_news or crypto_news) else 'telegram'
+    gate = 'high_news' if all_news else 'telegram'
     result, meta = _call_claude_advisory(
         prompt, gate=gate, cooldown_key=ck,
         context=gate_ctx, call_type=call_type)
@@ -362,7 +451,7 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             # GPT-mini fallback with same Korean report prompt
             _log('news: Claude denied → GPT-mini fallback')
             start_ms = int(time.time() * 1000)
-            result = _call_gpt_advisory(prompt)
+            result = _call_gpt_advisory(prompt, max_tokens=2500)
             elapsed = int(time.time() * 1000) - start_ms
             meta = {'model': 'gpt-4o-mini', 'model_provider': 'openai',
                     'api_latency_ms': elapsed, 'fallback_used': True,
@@ -374,8 +463,9 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
 
     _save_advisory('news_advisory',
                    {'user_text': text,
-                    'macro_news': [n['title'] for n in macro_news[:3]],
-                    'crypto_news': [n['title'] for n in crypto_news[:3]],
+                    'macro_news': [n['title'] for n in macro_news[:5]],
+                    'crypto_news': [n['title'] for n in crypto_news[:5]],
+                    'stats': stats,
                     'indicators': ind, 'score': score, 'position': pos},
                    result, meta)
     return (result, provider)
@@ -1454,7 +1544,7 @@ def _ai_general_advisory(text: str) -> str:
 def _call_claude_advisory(prompt: str, gate: str = 'telegram',
                           cooldown_key: str = '', context: dict = None,
                           call_type: str = 'AUTO',
-                          max_tokens: int = 800) -> tuple:
+                          max_tokens: int = 2500) -> tuple:
     """Call Claude via gate. Falls back to GPT on denial (unless USER/EMERGENCY).
     call_type: AUTO/USER/EMERGENCY controls cooldown/budget bypass and fallback.
     Returns (text_response, metadata_dict).
@@ -1494,7 +1584,7 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
             })
         _log(f"Claude gate denied ({result.get('gate_reason', '?')}) — fallback to GPT")
         start_ms = int(time.time() * 1000)
-        gpt_text = _call_gpt_advisory(prompt)
+        gpt_text = _call_gpt_advisory(prompt, max_tokens=max_tokens)
         elapsed = int(time.time() * 1000) - start_ms
         return (gpt_text, {
             'model': 'gpt-4o-mini(claude-fallback)',
@@ -1517,21 +1607,22 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
         'call_type': call_type,
     })
 
-def _call_gpt_advisory(prompt: str, provider_override: str = "") -> str:
+def _call_gpt_advisory(prompt: str, provider_override: str = "",
+                       max_tokens: int = 1500) -> str:
     """Single GPT call for advisory. Never trades."""
     try:
         from openai import OpenAI
         key = os.getenv("OPENAI_API_KEY", "")
         if not key:
             return "⚠️ OPENAI_API_KEY 미설정. 로컬 조회만 가능합니다."
-        client = OpenAI(api_key=key, timeout=15)
+        client = OpenAI(api_key=key, timeout=30)
         resp = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
+            max_tokens=max_tokens,
             temperature=0.3,
         )
-        return resp.choices[0].message.content.strip()[:3500]
+        return resp.choices[0].message.content.strip()[:4500]
     except Exception as e:
         return f"⚠️ AI 분석 실패: {e}\n로컬 조회는 정상 작동합니다."
 
