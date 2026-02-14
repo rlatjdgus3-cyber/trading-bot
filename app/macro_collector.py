@@ -134,7 +134,18 @@ def _store_prices(conn, prices):
                 stored += 1
             except Exception as e:
                 _log(f'store {source_name} error: {e}')
-    conn.commit()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    try:
+        conn.commit()
+    except Exception as e:
+        _log(f'commit error: {e}')
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     return stored
 
 

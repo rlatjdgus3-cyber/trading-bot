@@ -13,7 +13,7 @@ Cost control:
   - EVENT Claude gated by 4 conditions (confidence, ret_5m, vol_spike, level break)
   - EVENT Claude cooldown: 15 min minimum
   - EVENT Claude daily cap: 20 calls/day
-  - event_hash dedupe: 30 min window
+  - event_hash dedupe: 15 min window
   - Telegram throttle: same event type max once per 10 min
 """
 import hashlib
@@ -99,7 +99,7 @@ _event_claude_state = {
     'cap_notified': False,     # Telegram cap notification sent today
 }
 
-# ── event_hash 30-min dedup ──────────────────────────────
+# ── event_hash 15-min dedup ──────────────────────────────
 _event_hash_history = {}       # {event_hash: timestamp}
 
 # ── Telegram event throttle ──────────────────────────────
@@ -168,17 +168,8 @@ def record_claude_result(action, trigger_types, position):
     cur_qty = position.get('qty', 0) if position else 0
 
     if action == 'HOLD':
-        # Check if same context as previous
-        same_context = (
-            _last_hold_state['action'] == 'HOLD'
-            and sorted_types == _last_hold_state['trigger_types']
-            and cur_side == _last_hold_state['position_side']
-            and cur_qty == _last_hold_state['position_qty']
-        )
-        if same_context:
-            _last_hold_state['consecutive_holds'] += 1
-        else:
-            _last_hold_state['consecutive_holds'] = 1
+        # 컨텍스트 무관하게 모든 HOLD를 카운트 (트리거 변경 시에도 누적)
+        _last_hold_state['consecutive_holds'] += 1
 
         # After N consecutive HOLDs, apply 15-min lock
         if _last_hold_state['consecutive_holds'] >= HOLD_REPEAT_LIMIT:
@@ -186,6 +177,7 @@ def record_claude_result(action, trigger_types, position):
             _log(f'HOLD loop lock ACTIVATED: {_last_hold_state["consecutive_holds"]} '
                  f'consecutive HOLDs → {HOLD_LOCK_SEC}s lock')
     else:
+        # 비-HOLD 액션(REDUCE/CLOSE 등)이면 카운터 리셋
         _last_hold_state['consecutive_holds'] = 0
 
     _last_hold_state['action'] = action
@@ -400,7 +392,7 @@ def is_cap_notified() -> bool:
     return _event_claude_state['cap_notified']
 
 
-# ── event_hash 30-min dedup ──────────────────────────────
+# ── event_hash 15-min dedup ──────────────────────────────
 
 def check_event_hash_dedup(event_hash) -> bool:
     """Check if event_hash was seen within 30-min window.
@@ -936,7 +928,7 @@ def is_duplicate_emergency_action(symbol, action, direction) -> bool:
 
 
 def check_dedup(event_hash, state) -> bool:
-    """Check if event_hash was seen within 30-min dedup window.
+    """Check if event_hash was seen within 15-min dedup window.
     Returns True if duplicate (should skip), False if new.
     """
     if not event_hash:

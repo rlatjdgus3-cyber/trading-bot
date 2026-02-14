@@ -375,7 +375,7 @@ def _keyword_fallback(text: str) -> dict:
     # ── QUESTION intents ────────────────────────────────────
     # claude_audit must be checked BEFORE db_health/status
     if any(x in t for x in ["claude_audit", "claude 사용량", "클로드 사용량", "클로드 비용",
-                             "claude 비용", "api 사용량", "ai 비용", "ai 사용"]):
+                             "claude 비용", "api 사용량", "ai 비용", "ai 사용량"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "claude_audit",
                 "confidence": 0.8, "_fallback": True})
 
