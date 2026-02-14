@@ -54,6 +54,11 @@ _exchange = None
 _tables_ensured = False
 _prev_scores = {}  # Previous cycle scores for regime change detection
 
+# ── HOLD repeat suppression ──────────────────────────────
+_recent_claude_actions = []
+CONSECUTIVE_HOLD_LIMIT = 3
+_prev_position_side = None
+
 
 def _get_exchange():
     global _exchange
@@ -474,10 +479,12 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     """Handle event trigger → Claude analysis → action execution."""
     import claude_api
     import save_claude_analysis
+    import event_trigger as _et
 
     trigger_types = [t.get('type', '?') for t in event_result.triggers]
-    _send_telegram(report_formatter.format_event_pre_alert(
-        trigger_types, event_result.mode))
+    if _et.should_send_telegram_event(trigger_types):
+        _send_telegram(report_formatter.format_event_pre_alert(
+            trigger_types, event_result.mode))
 
     try:
         result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
@@ -513,6 +520,18 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
              f'fallback={result.get("fallback_used")} '
              f'gate_reason={result.get("gate_reason", "")}')
         return 'ABORT'
+
+    # ── Price context validation ──
+    import market_snapshot as _ms
+    mentioned_price = result.get('price') or result.get('entry_price') or result.get('target_price')
+    if mentioned_price and snapshot:
+        price_ok, price_reason = _ms.validate_price_mention(mentioned_price, snapshot)
+        if not price_ok:
+            _log(f'INVALID PRICE CONTEXT – STRATEGY REJECTED: {price_reason}')
+            trigger_types = [t.get('type', '?') for t in event_result.triggers]
+            _send_telegram(report_formatter.format_event_post_alert(
+                trigger_types, 'HOLD (price rejected)', result))
+            return 'HOLD'
 
     # Save claude analysis
     try:
@@ -617,6 +636,96 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     return 'HOLD'
 
 
+def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=None):
+    """Handle event trigger via GPT-4o-mini (cost fallback). Returns action taken."""
+    import claude_api
+    import save_claude_analysis
+    import event_trigger as _et
+
+    trigger_types = [t.get('type', '?') for t in event_result.triggers]
+
+    # Telegram throttle: only send pre-alert if not throttled
+    if _et.should_send_telegram_event(trigger_types):
+        _send_telegram(report_formatter.format_event_pre_alert(
+            trigger_types, event_result.mode) + '\n(GPT-mini)')
+
+    try:
+        result = claude_api.event_trigger_analysis_mini(ctx, snapshot, event_result)
+    except Exception:
+        traceback.print_exc()
+        result = claude_api.ABORT_RESPONSE.copy()
+        result['fallback_used'] = True
+
+    # Log to event_trigger_log
+    try:
+        cur.execute("""
+            INSERT INTO event_trigger_log
+                (symbol, mode, triggers, event_hash, snapshot_ts, snapshot_price,
+                 claude_called, claude_result, call_type, dedup_blocked)
+            VALUES (%s, %s, %s::jsonb, %s, to_timestamp(%s), %s, %s, %s::jsonb, %s, %s)
+        """, (
+            SYMBOL,
+            event_result.mode,
+            json.dumps(event_result.triggers, default=str),
+            event_result.event_hash,
+            snapshot.get('snapshot_ts') if snapshot else None,
+            snapshot.get('price') if snapshot else None,
+            True,
+            json.dumps(result, default=str, ensure_ascii=False)[:5000],
+            'AUTO_MINI',
+            False,
+        ))
+    except Exception:
+        traceback.print_exc()
+
+    if result.get('aborted') or result.get('fallback_used'):
+        _log(f'event mini analysis skipped: aborted={result.get("aborted")} '
+             f'fallback={result.get("fallback_used")}')
+        return 'ABORT'
+
+    # Save analysis
+    try:
+        save_claude_analysis.save_analysis(
+            cur, kind='event_trigger_mini',
+            input_packet=ctx,
+            output=result,
+            event_id=None,
+            similar_events=[])
+    except Exception:
+        traceback.print_exc()
+
+    action = result.get('action') or result.get('recommended_action', 'HOLD')
+
+    # GPT-mini safety: only allow HOLD and REDUCE (conservative)
+    if action not in ('HOLD', 'REDUCE'):
+        _log(f'GPT-mini action {action} downgraded to HOLD (safety)')
+        action = 'HOLD'
+
+    if action == 'HOLD':
+        return 'HOLD'
+
+    if action == 'REDUCE':
+        pos = ctx.get('position', {})
+        pos_side = (pos.get('side') or '').upper()
+        pos_qty = pos.get('qty', 0)
+        reduce_pct = result.get('reduce_pct', 25)  # conservative default
+        reduce_qty = pos_qty * reduce_pct / 100
+        if reduce_qty < _et.MIN_ORDER_QTY_BTC:
+            _log(f'GPT-mini REDUCE blocked: qty {reduce_qty:.4f} < min')
+            return 'HOLD'
+        _enqueue_action(
+            cur, 'REDUCE', pos_side,
+            reduce_pct=reduce_pct,
+            reason=f'event_mini_{trigger_types[0] if trigger_types else "unknown"}',
+            priority=4)
+        if _et.should_send_telegram_event(trigger_types):
+            _send_telegram(report_formatter.format_event_post_alert(
+                trigger_types, 'REDUCE (mini)', result))
+        return 'REDUCE'
+
+    return 'HOLD'
+
+
 def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     """Handle emergency via Claude API (snapshot-based). Returns action taken."""
     trigger_types = [t.get('type', '?') for t in event_result.triggers]
@@ -717,6 +826,21 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
              f'fallback={result.get("fallback_used")}')
         return 'ABORT'
 
+    # ── Price context validation ──
+    import market_snapshot as _ms
+    mentioned_price = result.get('price') or result.get('entry_price') or result.get('target_price')
+    if mentioned_price and snapshot:
+        price_ok, price_reason = _ms.validate_price_mention(mentioned_price, snapshot)
+        if not price_ok:
+            _log(f'INVALID PRICE CONTEXT – STRATEGY REJECTED: {price_reason}')
+            action = 'HOLD'
+            result['price_validation_failed'] = True
+            result['price_validation_reason'] = price_reason
+            _send_telegram(report_formatter.format_emergency_post_alert(
+                primary_trigger.get('type', 'event_emergency'),
+                'HOLD (price rejected)', result))
+            return 'HOLD'
+
     action = result.get('action') or result.get('recommended_action', 'HOLD')
     pos = ctx.get('position', {})
     reason_info = ', '.join(result.get('reason_bullets', [])[:2]) or result.get('reason_code', '')
@@ -749,6 +873,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
             reduce_pct=reduce_pct,
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
+            emergency_mode=True,
             priority=2)
         if eq_id:
             _et.set_emergency_lock(SYMBOL)
@@ -768,6 +893,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
             target_qty=pos.get('qty'),
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
+            emergency_mode=True,
             priority=1)
         if eq_id:
             _et.set_emergency_lock(SYMBOL)
@@ -794,6 +920,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
             target_usdt=target_usdt,
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
+            emergency_mode=True,
             priority=2)
         if eq_id:
             _et.set_emergency_lock(SYMBOL)
@@ -812,6 +939,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
             cur, pos,
             reason=f'emergency_{primary_trigger.get("type", "unknown")}',
             emergency_id=eid,
+            emergency_mode=True,
             priority=1)
         if eq_id:
             _et.set_emergency_lock(SYMBOL)
@@ -947,7 +1075,9 @@ def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
             _log(f'duplicate {action_type} {direction} blocked (already pending in queue)')
             return None
 
-    (ok, reason) = safety_manager.run_all_checks(cur, kwargs.get('target_usdt', 0))
+    emergency = kwargs.get('emergency_mode', False)
+    (ok, reason) = safety_manager.run_all_checks(
+        cur, kwargs.get('target_usdt', 0), emergency=emergency)
     if not ok and action_type == 'ADD':
         _log(f'safety block: {reason}')
         _send_telegram(f'[주문 거부] - 사유: {reason}')
@@ -975,13 +1105,15 @@ def _enqueue_reverse(cur=None, pos=None, **kwargs):
     '''Enqueue a 2-step reverse: REVERSE_CLOSE then REVERSE_OPEN.'''
     current_side = pos.get('side', '').upper()
     new_side = 'SHORT' if current_side == 'LONG' else 'LONG'
+    em = kwargs.get('emergency_mode', False)
     close_id = _enqueue_action(
         cur, 'REVERSE_CLOSE', current_side,
         target_qty=pos.get('qty'),
         priority=kwargs.get('priority', 2),
         reason=kwargs.get('reason', 'reverse'),
         emergency_id=kwargs.get('emergency_id'),
-        pm_decision_id=kwargs.get('pm_decision_id'))
+        pm_decision_id=kwargs.get('pm_decision_id'),
+        emergency_mode=em)
     if close_id:
         _enqueue_action(
             cur, 'REVERSE_OPEN', new_side,
@@ -989,6 +1121,7 @@ def _enqueue_reverse(cur=None, pos=None, **kwargs):
             reason=kwargs.get('reason', 'reverse'),
             emergency_id=kwargs.get('emergency_id'),
             pm_decision_id=kwargs.get('pm_decision_id'),
+            emergency_mode=em,
             meta={'depends_on': close_id})
     return close_id
 
@@ -1058,6 +1191,28 @@ def _log_decision(cur=None, ctx=None, action=None, reason=None,
         return None
 
 
+def _record_claude_action(action):
+    """Record recent Claude action for HOLD repeat detection."""
+    _recent_claude_actions.append(action)
+    if len(_recent_claude_actions) > CONSECUTIVE_HOLD_LIMIT + 1:
+        _recent_claude_actions.pop(0)
+
+
+def _should_skip_claude_call(position):
+    """Return True if last N actions were all HOLD and position unchanged."""
+    if len(_recent_claude_actions) < CONSECUTIVE_HOLD_LIMIT:
+        return False
+    recent = _recent_claude_actions[-CONSECUTIVE_HOLD_LIMIT:]
+    return all(a == 'HOLD' for a in recent)
+
+
+def _reset_hold_tracker(reason=''):
+    """Clear HOLD tracker (called on position change or non-HOLD action)."""
+    _recent_claude_actions.clear()
+    if reason:
+        _log(f'hold tracker RESET ({reason})')
+
+
 def _cycle():
     '''One position management cycle. Returns sleep seconds.'''
     global _prev_scores
@@ -1084,6 +1239,15 @@ def _cycle():
                 _log('no position, sleeping')
                 return LOOP_SLOW_SEC
 
+            # Position change detection → reset edge + hold tracker
+            global _prev_position_side
+            current_side = pos.get('side') if pos else None
+            if _prev_position_side is not None and current_side != _prev_position_side:
+                import event_trigger as _et_reset
+                _et_reset.reset_edge_state(f'position: {_prev_position_side}->{current_side}')
+                _reset_hold_tracker(f'position: {_prev_position_side}->{current_side}')
+            _prev_position_side = current_side
+
             # Phase 1: Real-time snapshot build
             import market_snapshot
             import event_trigger
@@ -1106,14 +1270,83 @@ def _cycle():
             # Phase 4: Mode-based handling
             if event_result.mode == event_trigger.MODE_EMERGENCY:
                 _log(f'EMERGENCY: triggers={[t["type"] for t in event_result.triggers]}')
-                _handle_emergency_v2(cur, ctx, event_result, snapshot)
+                em_action = _handle_emergency_v2(cur, ctx, event_result, snapshot)
+                _record_claude_action(em_action)
+                em_types = [t['type'] for t in event_result.triggers]
+                event_trigger.record_claude_result(em_action, em_types, pos)
+                if em_action and em_action != 'HOLD':
+                    _reset_hold_tracker(f'emergency action: {em_action}')
                 _prev_scores = ctx.get('scores', {})
                 if snapshot and snapshot.get('atr_14') is not None:
                     _prev_scores['atr_14'] = snapshot.get('atr_14')
                 return LOOP_FAST_SEC
             elif event_result.mode == event_trigger.MODE_EVENT:
-                _log(f'EVENT: triggers={[t["type"] for t in event_result.triggers]}')
-                _handle_event_trigger(cur, ctx, event_result, snapshot)
+                _trigger_types = [t['type'] for t in event_result.triggers]
+                stats = event_trigger.get_event_claude_stats()
+                _log(f'EVENT: triggers={_trigger_types} '
+                     f'claude_budget={stats["daily_count"]}/{stats["daily_cap"]}')
+
+                # ── Pre-filters (skip entirely) ──
+                _suppress_reason = None
+
+                # event_hash 30-min dedup
+                if event_trigger.check_event_hash_dedup(event_result.event_hash):
+                    _suppress_reason = 'dedupe'
+                # §3: HOLD repeat prevention
+                elif event_trigger.is_hold_repeat(_trigger_types, pos):
+                    _suppress_reason = 'hold_repeat'
+                # Consecutive HOLD limit
+                elif _should_skip_claude_call(pos):
+                    _suppress_reason = 'consecutive_hold'
+
+                if _suppress_reason:
+                    _log(f'EVENT suppressed: reason={_suppress_reason} '
+                         f'triggers={_trigger_types}')
+                    if event_trigger.should_send_telegram_event(
+                            _trigger_types + ['_suppress']):
+                        _send_telegram(
+                            f'EVENT suppressed: reason={_suppress_reason} '
+                            f'triggers={_trigger_types}')
+                    _prev_scores = ctx.get('scores', {})
+                    if snapshot and snapshot.get('atr_14') is not None:
+                        _prev_scores['atr_14'] = snapshot.get('atr_14')
+                    return LOOP_FAST_SEC
+
+                # Record event_hash for dedup
+                event_trigger.record_event_hash(event_result.event_hash)
+
+                # ── Claude vs GPT-mini routing ──
+                use_claude, gate_reason = event_trigger.should_use_claude_for_event(
+                    snapshot, event_result.triggers)
+
+                if use_claude:
+                    _log(f'EVENT → Claude (gate passed: {gate_reason})')
+                    ev_action = _handle_event_trigger(cur, ctx, event_result, snapshot)
+                    event_trigger.record_event_claude_call()
+                else:
+                    _log(f'EVENT → GPT-mini (gate denied: {gate_reason})')
+                    if event_trigger.should_send_telegram_event(
+                            _trigger_types + ['_gate']):
+                        _send_telegram(
+                            f'EVENT suppressed: reason=cooldown '
+                            f'triggers={_trigger_types} → GPT-mini')
+                    # Daily cap notification (once per day)
+                    if 'daily_cap' in gate_reason and not event_trigger.is_cap_notified():
+                        _send_telegram(
+                            '[EVENT] Claude 일일 상한 초과 → GPT-mini로 대체')
+                        event_trigger.mark_cap_notified()
+                    ev_action = _handle_event_trigger_mini(
+                        cur, ctx, event_result, snapshot)
+
+                _record_claude_action(ev_action)
+                event_trigger.record_claude_result(ev_action, _trigger_types, pos)
+                if ev_action and ev_action != 'HOLD':
+                    _reset_hold_tracker(f'event action: {ev_action}')
+
+                # Telegram throttle for event notifications
+                if not event_trigger.should_send_telegram_event(_trigger_types):
+                    _log(f'EVENT telegram throttled (10min)')
+
                 _prev_scores = ctx.get('scores', {})
                 if snapshot and snapshot.get('atr_14') is not None:
                     _prev_scores['atr_14'] = snapshot.get('atr_14')
@@ -1125,6 +1358,10 @@ def _cycle():
             # Run decision engine (DEFAULT mode)
             (action, reason) = _decide(ctx)
             _log(f'decision: {action} - {reason}')
+
+            # Non-HOLD score_engine action → reset hold tracker
+            if action != 'HOLD':
+                _reset_hold_tracker(f'default action: {action}')
 
             # Log decision
             dec_id = _log_decision(cur, ctx, action, reason,

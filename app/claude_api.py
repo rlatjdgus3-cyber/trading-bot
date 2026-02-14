@@ -281,6 +281,78 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
     return parsed
 
 
+def event_trigger_analysis_mini(context_packet=None, snapshot=None, event_result=None):
+    """EVENT analysis via GPT-4o-mini (cost fallback when Claude gate denied).
+
+    Same prompt structure as event_trigger_analysis, same response parsing.
+    Cost: ~$0.0003/call vs ~$0.01/call for Claude.
+    """
+    import market_snapshot
+    valid, reason = market_snapshot.validate_snapshot(snapshot)
+    if not valid:
+        return {**ABORT_RESPONSE, 'abort_reason': reason}
+
+    ctx = context_packet or {}
+    import claude_gate
+
+    ctx_compact = claude_gate.compact_context(ctx)
+    prompt = _build_prompt(ctx_compact, snapshot=snapshot)
+
+    if event_result:
+        trigger_lines = []
+        for t in (event_result.triggers if hasattr(event_result, 'triggers') else []):
+            trigger_lines.append(f"  - {t.get('type', '?')}: value={t.get('value', '?')} "
+                                 f"threshold={t.get('threshold', '?')}")
+        if trigger_lines:
+            prompt += f"\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
+
+    er_mode = getattr(event_result, 'mode', 'EVENT') if event_result else 'EVENT'
+
+    import os
+    import time as _time
+    api_key = os.getenv('OPENAI_API_KEY', '')
+    if not api_key:
+        _log('GPT-mini fallback: no OPENAI_API_KEY')
+        return {**FALLBACK_RESPONSE, 'fallback_used': True, 'model': 'gpt-4o-mini',
+                'call_type': 'AUTO_MINI'}
+
+    start_ms = int(_time.time() * 1000)
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, timeout=15)
+        resp = client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=500,
+            temperature=0.0,
+        )
+        elapsed_ms = int(_time.time() * 1000) - start_ms
+        text = resp.choices[0].message.content.strip() if resp.choices else ''
+        input_tokens = resp.usage.prompt_tokens if resp.usage else 0
+        output_tokens = resp.usage.completion_tokens if resp.usage else 0
+
+        _log(f'GPT-mini OK: in={input_tokens} out={output_tokens} '
+             f'latency={elapsed_ms}ms')
+
+        parsed = _parse_response(text)
+        parsed['fallback_used'] = False
+        parsed['api_latency_ms'] = elapsed_ms
+        parsed['input_tokens'] = input_tokens
+        parsed['output_tokens'] = output_tokens
+        parsed['estimated_cost_usd'] = (input_tokens * 0.15 + output_tokens * 0.6) / 1_000_000
+        parsed['gate_type'] = 'event_trigger_mini'
+        parsed['model'] = 'gpt-4o-mini'
+        parsed['call_type'] = 'AUTO_MINI'
+        return parsed
+
+    except Exception as e:
+        elapsed_ms = int(_time.time() * 1000) - start_ms
+        _log(f'GPT-mini error: {e} latency={elapsed_ms}ms')
+        return {**FALLBACK_RESPONSE, 'fallback_used': True,
+                'model': 'gpt-4o-mini', 'api_latency_ms': elapsed_ms,
+                'call_type': 'AUTO_MINI'}
+
+
 VALID_ACTIONS = {'HOLD', 'OPEN_LONG', 'OPEN_SHORT', 'REDUCE', 'CLOSE', 'REVERSE'}
 
 

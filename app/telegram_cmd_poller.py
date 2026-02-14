@@ -95,29 +95,25 @@ def _log(msg):
 # ── help text ────────────────────────────────────────────
 
 HELP_TEXT = (
-    "🦅 OpenClaw 콘솔 (GPT Router)\n"
+    "🦅 OpenClaw 콘솔\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "📌 명령어\n"
-    "  /help      도움말\n"
-    "  /status    봇 상태\n"
-    "  /health    서비스 상태\n"
-    "  /audit     시스템 감사\n"
-    "  /risk MODE 리스크 모드 (conservative/normal/aggressive)\n"
-    "  /keywords  워치 키워드 목록/관리\n"
-    "  /force     쿨다운 무시 + Claude 강제 전략 분석\n"
-    "  /debug     디버그 모드 토글 (on/off)\n"
-    "\n"
-    "💬 자연어 예시\n"
-    "  상태 보여줘\n"
-    "  BTC 지금 얼마야?\n"
-    "  RSI랑 포지션 보여줘\n"
-    "  최근 30분 뉴스\n"
-    "  오늘 매매전략 잡아줘\n"
-    "  급변 후 방향성 분석해줘\n"
-    "  손절 원인 분석해줘\n"
-    "  키워드에 trump 추가해\n"
+    "💬 자연어로 무엇이든 말씀하세요!\n\n"
+    "📌 거래 명령 예시\n"
+    "  롱 포지션 청산해\n"
+    "  롱 25% 줄여\n"
+    "  숏으로 테스트 들어가\n"
+    "  트레이딩 일시정지\n\n"
+    "📊 조회/분석 예시\n"
+    "  지금 BTC 어떤 상태야?\n"
+    "  최근 뉴스 영향 분석해줘\n"
+    "  RSI랑 이치모쿠 보여줘\n"
+    "  오늘 매매 전략 추천\n\n"
+    "⚙ 설정 명령 예시\n"
     "  리스크 보수적으로 바꿔\n"
-    "  시스템 점검해줘\n"
+    "  트럼프 감시 키워드 추가해\n"
+    "  시스템 점검해줘\n\n"
+    "🔧 백업 슬래시 명령\n"
+    "  /help /status /health /force /detail /debug\n"
 )
 
 # ── news importance check & AI news advisory ─────────────
@@ -255,9 +251,9 @@ def _fetch_categorized_news():
                 SELECT count(*) AS total,
                        count(*) FILTER (WHERE impact_score > 0) AS enriched,
                        count(*) FILTER (WHERE impact_score >= 7) AS high_impact,
-                       count(*) FILTER (WHERE summary ILIKE '[up]%') AS bullish,
-                       count(*) FILTER (WHERE summary ILIKE '[down]%') AS bearish,
-                       count(*) FILTER (WHERE summary ILIKE '[neutral]%') AS neutral_cnt
+                       count(*) FILTER (WHERE summary ILIKE '[up]%%') AS bullish,
+                       count(*) FILTER (WHERE summary ILIKE '[down]%%') AS bearish,
+                       count(*) FILTER (WHERE summary ILIKE '[neutral]%%') AS neutral_cnt
                 FROM news
                 WHERE ts >= now() - interval '6 hours';
             """)
@@ -270,9 +266,9 @@ def _fetch_categorized_news():
                 stats['bearish'] = sr[4] or 0
                 stats['neutral'] = sr[5] or 0
 
-            # Top news per category
+            # Top news per category (with id for macro_trace)
             cur.execute("""
-                SELECT title, source, impact_score, summary,
+                SELECT id, title, source, impact_score, summary,
                        to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr,
                        keywords, url
                 FROM news
@@ -284,7 +280,7 @@ def _fetch_categorized_news():
             rows = cur.fetchall()
 
         for r in rows:
-            summary_raw = r[3] or ''
+            summary_raw = r[4] or ''
             cat = report_formatter._parse_news_category(summary_raw)
             direction = report_formatter._parse_news_direction(summary_raw)
             impact_path = report_formatter._parse_impact_path(summary_raw)
@@ -296,17 +292,18 @@ def _fetch_categorized_news():
                 summary_kr = summary_kr.split('|', 1)[0].strip()
 
             item = {
-                'title': r[0] or '',
-                'source': r[1] or '',
-                'impact_score': int(r[2]) if r[2] else 0,
+                'id': r[0],
+                'title': r[1] or '',
+                'source': r[2] or '',
+                'impact_score': int(r[3]) if r[3] else 0,
                 'summary': summary_raw,
                 'summary_kr': summary_kr,
                 'direction': direction,
                 'category': cat,
                 'category_kr': report_formatter.CATEGORY_KR.get(cat, cat),
                 'impact_path': impact_path,
-                'ts': r[4] or '',
-                'keywords': list(r[5]) if r[5] else [],
+                'ts': r[5] or '',
+                'keywords': list(r[6]) if r[6] else [],
             }
             # Category count
             stats['categories'][cat] = stats['categories'].get(cat, 0) + 1
@@ -332,143 +329,129 @@ def _fetch_categorized_news():
     return (macro_news[:7], crypto_news[:7], stats)
 
 
-def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO') -> tuple:
-    """News analysis with categorized DB news. Always uses AI. Returns (text, provider)."""
+def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO',
+                             detail: bool = False) -> tuple:
+    """News→strategy integrated report. AI = 1-line summary only. Returns (text, provider)."""
     no_fallback = call_type in ('USER', 'EMERGENCY')
+    conn = None
+    try:
+        import psycopg2
+        import news_strategy_report
+        import macro_trace_computer
 
-    # Fetch categorized news from DB
-    macro_news, crypto_news, stats = _fetch_categorized_news()
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME", "trading"),
+            user=os.getenv("DB_USER", "bot"),
+            password=os.getenv("DB_PASS", "botpass"),
+            connect_timeout=10,
+            options="-c statement_timeout=30000",
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # 1. Compute pending macro_traces
+            macro_trace_computer.compute_pending_traces(cur)
 
-    # ── Build structured news block ──
-    def _format_news_item(i, n):
-        dir_icon = {'상승': '+', '하락': '-', '중립': '~'}.get(n.get('direction', ''), '?')
-        line = f"{i}. ({dir_icon}) [{n['impact_score']}/10] {n['title']}"
-        line += f"\n   출처: {n['source']} | {n['ts']} | {n.get('category_kr', '')}"
-        if n.get('summary_kr'):
-            line += f"\n   요약: {n['summary_kr'][:120]}"
-        if n.get('impact_path'):
-            line += f"\n   영향경로: {n['impact_path']}"
-        return line
+            # 2. Build report data
+            data = news_strategy_report.build_report_data(
+                cur, max_news=5 if detail else 3, detail=detail)
 
-    news_parts = []
+        # 3. AI: 1-line summary + risk only (500 tokens)
+        stats = data.get('stats', {})
+        bull = stats.get('bullish', 0)
+        bear = stats.get('bearish', 0)
+        high = stats.get('high_impact', 0)
+        macro_titles = [n.get('title', '')[:60] for n in data.get('macro_news', [])[:3]]
+        crypto_titles = [n.get('title', '')[:60] for n in data.get('crypto_news', [])[:3]]
+        scores = data.get('scores', {})
 
-    # Sentiment overview
-    b, br, n_cnt = stats['bullish'], stats['bearish'], stats['neutral']
-    total = stats['total']
-    high = stats['high_impact']
-    sentiment_ratio = f"상승 {b}건 / 하락 {br}건 / 중립 {n_cnt}건"
-    cat_dist = ', '.join(
-        f"{report_formatter.CATEGORY_KR.get(c, c)} {cnt}건"
-        for c, cnt in sorted(stats['categories'].items(), key=lambda x: -x[1])[:6]
-    )
-    news_parts.append(
-        f"[뉴스 센티먼트 요약 (최근 6시간)]\n"
-        f"총 {total}건 수집, AI 분석 {stats['enriched']}건, 고영향(7+) {high}건\n"
-        f"방향: {sentiment_ratio}\n"
-        f"카테고리: {cat_dist}"
-    )
+        summary_prompt = (
+            f"BTC 선물 뉴스 요약 JSON을 생성하세요.\n"
+            f"뉴스: 상승 {bull}건, 하락 {bear}건, 고영향 {high}건\n"
+            f"거시 뉴스: {'; '.join(macro_titles)}\n"
+            f"크립토: {'; '.join(crypto_titles)}\n"
+            f"총점: {scores.get('total', 0):+.1f}, regime: {scores.get('regime', 0):+.0f}\n\n"
+            "JSON만 출력 (다른 텍스트 없이):\n"
+            '{"one_liner": "결론 1줄 (한국어, 40자 이내)",'
+            ' "risk_level": "낮음/보통/높음/심각 중 1개",'
+            ' "watch_items": ["모니터링 항목 2-3개"],'
+            ' "next_check": "다음 체크 시점"}'
+        )
 
-    if macro_news:
-        macro_lines = [f'[미국/거시 뉴스 Top {min(len(macro_news), 5)}]']
-        for i, n in enumerate(macro_news[:5], 1):
-            macro_lines.append(_format_news_item(i, n))
-        news_parts.append('\n'.join(macro_lines))
+        ck = 'user_tg_news_summary' if no_fallback else 'auto_tg_news_summary'
+        all_news = data.get('macro_news', []) + data.get('crypto_news', [])
+        gate_ctx = {
+            'intent': 'news',
+            'high_news': bool(all_news),
+            'impact_score': max(
+                (n.get('impact_score', 0) for n in all_news), default=0),
+        }
+        gate = 'high_news' if all_news else 'telegram'
+        ai_result, meta = _call_claude_advisory(
+            summary_prompt, gate=gate, cooldown_key=ck,
+            context=gate_ctx, call_type=call_type, max_tokens=500)
+        meta['call_type'] = call_type
 
-    if crypto_news:
-        crypto_lines = [f'[크립토 뉴스 Top {min(len(crypto_news), 5)}]']
-        for i, n in enumerate(crypto_news[:5], 1):
-            crypto_lines.append(_format_news_item(i, n))
-        news_parts.append('\n'.join(crypto_lines))
-
-    if not macro_news and not crypto_news:
-        news_parts.append('(최근 6시간 AI 분석 뉴스 없음)')
-
-    news_block = '\n\n'.join(news_parts)
-
-    # Indicators + score + position
-    ind = local_query_executor.execute("indicator_snapshot")
-    score = local_query_executor.execute("score_summary")
-    pos = local_query_executor.execute("position_info")
-
-    prompt = (
-        f"당신은 비트코인 선물 전문 뉴스 분석가입니다.\n"
-        f"아래 실시간 데이터만 사용하여 심층 한국어 분석 리포트를 작성하세요.\n"
-        f"추측이 아닌 데이터 기반으로만 분석하세요.\n\n"
-        f"사용자 요청: {text}\n\n"
-        f"=== 뉴스 데이터 ===\n{news_block}\n\n"
-        f"=== 기술 지표 ===\n{ind}\n\n"
-        f"=== 스코어 엔진 ===\n{score}\n\n"
-        f"=== 포지션 ===\n{pos}\n\n"
-        "=== 분석 리포트 작성 지침 ===\n"
-        "아래 6개 섹션을 모두 포함하여 작성하세요:\n\n"
-        "1. 시장 센티먼트 진단\n"
-        "   - 상승/하락 뉴스 비율 해석\n"
-        "   - 고영향 뉴스의 주요 테마와 방향성\n"
-        "   - 현재 뉴스 흐름이 BTC에 미치는 총체적 압력 (강한 하락/약한 하락/중립/약한 상승/강한 상승)\n\n"
-        "2. 미국/거시 뉴스 심층 분석\n"
-        "   - 주요 뉴스별 BTC 영향 경로 (예: S&P500 약세→위험자산 회피→BTC 하방 압력)\n"
-        "   - 카테고리별 영향 요약 (금리, 주식, 정치, 지정학 등)\n"
-        "   - 가장 주시해야 할 매크로 리스크\n\n"
-        "3. 크립토 뉴스 심층 분석\n"
-        "   - 주요 뉴스별 영향 경로\n"
-        "   - 규제/ETF/해킹 등 카테고리별 요약\n"
-        "   - 크립토 자체 모멘텀 판단\n\n"
-        "4. 기술 지표 + 뉴스 크로스 분석\n"
-        "   - 기술 지표와 뉴스 방향이 일치하는지, 괴리가 있는지\n"
-        "   - 스코어 엔진 상태와 뉴스 센티먼트 비교\n\n"
-        "5. 종합 시나리오 (확률 부여)\n"
-        "   - 상승 시나리오: 조건 + 목표가 + 확률\n"
-        "   - 하락 시나리오: 조건 + 지지선 + 확률\n"
-        "   - 횡보 시나리오: 조건 + 레인지 + 확률\n\n"
-        "6. 포지션 대응 전략\n"
-        "   - 현재 포지션 기준 구체적 대응 (익절/손절/추가진입 레벨)\n"
-        "   - 뉴스 모니터링 포인트 (어떤 뉴스가 나오면 행동 변경)\n"
-        "   - 리스크 등급 (낮음/보통/높음/심각)\n\n"
-        "2000자 이상 상세히 작성. Markdown 형식 사용. 6개 섹션 모두 반드시 포함."
-    )
-
-    # Always try Claude first, fallback to GPT-mini with same prompt
-    ck = 'user_tg_news_claude' if no_fallback else 'auto_tg_news_claude'
-    all_news = macro_news + crypto_news
-    gate_ctx = {
-        'intent': 'news',
-        'high_news': bool(all_news),
-        'impact_score': max(
-            (n.get('impact_score', 0) for n in all_news),
-            default=0),
-        'source': 'openclaw' if no_fallback else 'telegram',
-    }
-    gate = 'high_news' if all_news else 'telegram'
-    result, meta = _call_claude_advisory(
-        prompt, gate=gate, cooldown_key=ck,
-        context=gate_ctx, call_type=call_type)
-    meta['call_type'] = call_type
-
-    if meta.get('fallback_used'):
-        if no_fallback:
-            provider = 'claude(denied)'
-        else:
-            # GPT-mini fallback with same Korean report prompt
-            _log('news: Claude denied → GPT-mini fallback')
+        if meta.get('fallback_used') and not no_fallback:
+            _log('news summary: Claude denied -> GPT-mini fallback')
             start_ms = int(time.time() * 1000)
-            result = _call_gpt_advisory(prompt, max_tokens=2500)
+            ai_result = _call_gpt_advisory(summary_prompt, max_tokens=500)
             elapsed = int(time.time() * 1000) - start_ms
             meta = {'model': 'gpt-4o-mini', 'model_provider': 'openai',
                     'api_latency_ms': elapsed, 'fallback_used': True,
                     'call_type': call_type}
             provider = 'gpt-4o-mini'
-    else:
-        cost = meta.get('estimated_cost_usd', 0)
-        provider = f'anthropic (${cost:.4f})'
+        elif meta.get('fallback_used'):
+            provider = 'claude(denied)'
+        else:
+            cost = meta.get('estimated_cost_usd', 0)
+            provider = f'anthropic (${cost:.4f})'
 
-    _save_advisory('news_advisory',
-                   {'user_text': text,
-                    'macro_news': [n['title'] for n in macro_news[:5]],
-                    'crypto_news': [n['title'] for n in crypto_news[:5]],
-                    'stats': stats,
-                    'indicators': ind, 'score': score, 'position': pos},
-                   result, meta)
-    return (result, provider)
+        # 4. Parse AI JSON result into data
+        ai_summary = _parse_ai_summary_json(ai_result)
+        data['ai_summary'] = ai_summary
+
+        # 5. Format with fixed template
+        result = report_formatter.format_news_strategy_report(data, detail=detail)
+
+        _save_advisory('news_advisory',
+                       {'user_text': text,
+                        'macro_news': [n['title'] for n in data.get('macro_news', [])[:5]],
+                        'crypto_news': [n['title'] for n in data.get('crypto_news', [])[:5]],
+                        'stats': stats},
+                       result, meta)
+        return (result, provider)
+
+    except Exception as e:
+        _log(f'_ai_news_claude_advisory error: {e}')
+        import traceback
+        traceback.print_exc()
+        return (f'⚠️ 뉴스 분석 오류: {e}', 'error')
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _parse_ai_summary_json(text):
+    """Parse AI JSON response for 1-line summary. Graceful fallback."""
+    if not text:
+        return {}
+    try:
+        # Try to extract JSON from response
+        import re
+        # Find JSON block
+        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(text)
+    except Exception:
+        # Fallback: use raw text as one_liner
+        clean = text.strip()[:100]
+        return {'one_liner': clean} if clean else {}
 
 
 def _ai_emergency_advisory(text: str, call_type: str = 'USER') -> tuple:
@@ -1679,8 +1662,8 @@ def _save_advisory(kind, input_packet, response_text, metadata):
 
 # ── directive helpers ──────────────────────────────────────
 
-def _get_directive_conn():
-    """Get a DB connection for directive execution."""
+def _get_db_conn():
+    """Get a DB connection. Unified helper for all DB operations."""
     import psycopg2
     conn = psycopg2.connect(
         host=os.getenv('DB_HOST', 'localhost'),
@@ -1693,6 +1676,11 @@ def _get_directive_conn():
     )
     conn.autocommit = True
     return conn
+
+
+def _get_directive_conn():
+    """Get a DB connection for directive execution. (Legacy alias)"""
+    return _get_db_conn()
 
 
 def _handle_directive_command(dtype, params):
@@ -1736,12 +1724,235 @@ def _handle_directive_intent(intent, text):
             result = openclaw_engine.execute_directive(
                 conn, parsed['dtype'], parsed['params'], source='telegram')
             return (result.get('message', 'Directive processed'), 'local')
-        return ('Could not parse directive. Try: /audit, /risk <mode>, /keywords', 'local')
+        return ('무엇을 변경하시겠어요?\n'
+                '예시: "리스크 보수적으로", "trump 감시 추가", "시스템 점검"', 'local')
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+# ── NL-first handler functions ────────────────────────────
+
+TRADE_INTENTS = {'close_position', 'reduce_position', 'open_long',
+                 'open_short', 'reverse_position'}
+
+
+def _format_command_result(action, eq_id, parsed, pos, scores):
+    """Format trade command execution result."""
+    lines = [f"✅ {action} 명령 접수 (eq#{eq_id})"]
+    if pos.get('side'):
+        lines.append(f"포지션: {pos['side']} qty={pos.get('total_qty', 0)}")
+    if action == 'REDUCE' and parsed.get('percent'):
+        lines.append(f"축소: {parsed['percent']}%")
+    lines.append(f"Score: {scores.get('total_score', 0):+.1f}")
+    return '\n'.join(lines)
+
+
+def _execute_trade_command(parsed, text):
+    """Execute trade COMMAND intent. Returns response string."""
+    import score_engine
+
+    intent = parsed.get('intent')
+    test_mode = parsed.get('test_mode', False)
+    percent = parsed.get('percent')
+    use_claude = parsed.get('use_claude', False)
+
+    # 1. use_claude → delegate to Claude strategy pipeline
+    if use_claude:
+        result, provider = _ai_strategy_advisory(text, call_type='USER')
+        return result + _footer('strategy', 'claude', provider, call_type='USER')
+
+    # 2. Safety check: auto-trading active?
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
+            if not auto_ok and not test_mode:
+                return (
+                    f"⚠️ 자동매매 비활성: {auto_reason}\n"
+                    f"💡 테스트 모드로 실행하려면: \"{text} 테스트\"\n"
+                    f"💡 또는: /force {text}"
+                ) + _footer(intent, 'blocked', 'local')
+
+            # 3. Position + scores
+            pos = _fetch_position_state(cur)
+            scores = score_engine.compute_total(cur=cur)
+
+            # 4. Map intent to action
+            action_map = {
+                'close_position': 'CLOSE',
+                'reduce_position': 'REDUCE',
+                'open_long': 'OPEN_LONG',
+                'open_short': 'OPEN_SHORT',
+                'reverse_position': 'REVERSE',
+            }
+            action = action_map[intent]
+
+            # 5. Validation
+            side = pos.get('side', '')
+            if action == 'CLOSE' and not side:
+                return "포지션이 없어 청산할 수 없습니다." + _footer(intent, 'local', 'local')
+            if action == 'REDUCE' and not side:
+                return "포지션이 없어 축소할 수 없습니다." + _footer(intent, 'local', 'local')
+            if action == 'REVERSE' and not side:
+                return "포지션이 없어 반전할 수 없습니다." + _footer(intent, 'local', 'local')
+
+            # 6. Direct execution
+            parsed_action = {
+                'action': action,
+                'reduce_pct': percent or 30,
+                'reason_code': f'user_nl_{intent}',
+                'confidence': parsed.get('confidence', 0.8),
+            }
+
+            # Build snapshot
+            snapshot = None
+            try:
+                import market_snapshot as _ms
+                _ex = _get_exchange()
+                snapshot = _ms.build_and_validate(_ex, cur, STRATEGY_SYMBOL)
+            except Exception:
+                pass
+
+            eq_id = _enqueue_claude_action(cur, parsed_action, pos, scores, snapshot)
+            if eq_id:
+                _send_enqueue_alert(eq_id, action, parsed_action, pos)
+                return _format_command_result(action, eq_id, parsed, pos, scores) + \
+                    _footer(intent, 'execute', 'local')
+            else:
+                return (
+                    f"⚠️ {action} 안전 체크 차단\n"
+                    f"💡 /force 로 강제 실행 가능"
+                ) + _footer(intent, 'blocked', 'local')
+    finally:
+        conn.close()
+
+
+def _toggle_trading(parsed, text):
+    """Toggle auto-trading on/off via trade_switch DB."""
+    t_lower = text.lower()
+    if any(x in t_lower for x in ['정지', '멈춰', 'stop', 'pause', '끄', 'off']):
+        enable = False
+    elif any(x in t_lower for x in ['재개', '시작', 'start', 'resume', '켜', 'on']):
+        enable = True
+    else:
+        enable = False  # default: pause
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trade_switch SET enabled = %s "
+                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
+                (enable,))
+        state_str = "재개" if enable else "일시정지"
+        return f"자동매매 {state_str} 완료" + _footer('toggle_trading', 'local', 'local')
+    finally:
+        conn.close()
+
+
+def _handle_nl_command(parsed, text):
+    """Handle NL COMMAND type. Dispatches by intent."""
+    intent = parsed.get('intent', '')
+
+    # Trade commands
+    if intent in TRADE_INTENTS:
+        return _execute_trade_command(parsed, text)
+
+    # Config commands
+    if intent == 'set_risk_mode':
+        mode = parsed.get('mode') or 'normal'
+        return _handle_directive_command('RISK_MODE', {'mode': mode}) + \
+            _footer('set_risk_mode', 'local', 'local')
+
+    if intent == 'add_keywords':
+        kws = parsed.get('keywords') or []
+        if not kws:
+            # Try to extract keywords from text
+            kws = _extract_keywords_from_text(text)
+        return _handle_directive_command('WATCH_KEYWORDS',
+            {'action': 'add', 'keywords': kws}) + \
+            _footer('add_keywords', 'local', 'local')
+
+    if intent == 'remove_keywords':
+        kws = parsed.get('keywords') or []
+        if not kws:
+            kws = _extract_keywords_from_text(text)
+        return _handle_directive_command('WATCH_KEYWORDS',
+            {'action': 'remove', 'keywords': kws}) + \
+            _footer('remove_keywords', 'local', 'local')
+
+    if intent == 'list_keywords':
+        return _handle_directive_command('WATCH_KEYWORDS',
+            {'action': 'list', 'keywords': []}) + \
+            _footer('list_keywords', 'local', 'local')
+
+    if intent == 'toggle_trading':
+        return _toggle_trading(parsed, text)
+
+    if intent == 'run_audit':
+        return _handle_directive_command('AUDIT', {}) + \
+            _footer('run_audit', 'local', 'local')
+
+    # Fallback: treat as QUESTION
+    return _handle_nl_question(parsed, text)
+
+
+def _extract_keywords_from_text(text):
+    """Extract potential keywords from natural language text."""
+    import re
+    t = text.lower()
+    # Remove common verbs/particles
+    for w in ['추가', '삭제', '해제', '등록', '제거', '감시', '키워드',
+              '워치', '해줘', '해', '하', '좀', '에', '를', '을', '강화']:
+        t = t.replace(w, ' ')
+    parts = [p.strip() for p in re.split(r'[\s/,]+', t) if p.strip() and len(p.strip()) >= 2]
+    return parts
+
+
+def _handle_nl_question(parsed, text):
+    """Handle NL QUESTION type. Dispatches by intent."""
+    intent = parsed.get('intent', 'general')
+    use_claude = parsed.get('use_claude', False)
+
+    LOCAL_MAP = {
+        'status': 'status_full',
+        'price': 'btc_price',
+        'indicators': 'indicator_snapshot',
+        'score': 'score_summary',
+        'health': 'health_check',
+        'errors': 'recent_errors',
+        'report': 'daily_report',
+        'volatility': 'volatility_summary',
+    }
+
+    # 1. News → news report pipeline
+    if intent == 'news_analysis':
+        result, provider = _ai_news_claude_advisory(text, call_type='AUTO')
+        return result + _footer('news_analysis', 'claude', provider)
+
+    # 2. Strategy or use_claude → Claude strategy pipeline
+    if intent == 'strategy' or use_claude:
+        call_type = 'USER' if use_claude else 'AUTO'
+        result, provider = _ai_strategy_advisory(text, call_type=call_type)
+        return result + _footer('strategy', 'claude', provider, call_type=call_type)
+
+    # 3. Emergency
+    if intent == 'emergency':
+        result, provider = _ai_emergency_advisory(text, call_type='USER')
+        return result + _footer('emergency', 'claude', provider, call_type='USER')
+
+    # 4. Local queries
+    if intent in LOCAL_MAP:
+        qtype = LOCAL_MAP[intent]
+        return local_query_executor.execute(qtype, original_text=text) + \
+            _footer(intent, 'local', 'local')
+
+    # 5. General → GPT-mini
+    result = _ai_general_advisory(text)
+    return result + _footer('general', 'gpt', 'gpt-4o-mini')
 
 
 # ── main command handler ─────────────────────────────────
@@ -1759,34 +1970,20 @@ def _footer(intent_name: str, route: str, provider: str,
 def handle_command(text: str) -> str:
     t = (text or "").strip()
 
-    # 1. Direct commands — zero GPT cost
+    # Phase 0: Minimal direct commands (no GPT cost)
     if t in ("/help", "help"):
         return HELP_TEXT + _footer("help", "direct", "local")
-    if t in ("/health", "health"):
-        return local_query_executor.execute("health_check") + _footer("health", "local", "local")
-    if t in ("/status", "status"):
-        return local_query_executor.execute("status_full") + _footer("status", "local", "local")
 
-    # 1b. Directive commands
-    if t == '/audit' or t == 'audit':
-        return _handle_directive_command('AUDIT', {}) + _footer('audit', 'local', 'local')
-    if t.startswith('/risk '):
-        mode = t.split(' ', 1)[1].strip()
-        return _handle_directive_command('RISK_MODE', {'mode': mode}) + _footer('risk', 'local', 'local')
-    if t.startswith('/keywords'):
-        args_text = t[len('/keywords'):].strip()
-        return _handle_directive_command('WATCH_KEYWORDS', _parse_kw_args(args_text)) + _footer('keywords', 'local', 'local')
-
-    # 1c. /debug — toggle debug mode
-    if t == '/debug on':
-        return report_formatter.set_debug_mode(True)
-    if t == '/debug off':
-        return report_formatter.set_debug_mode(False)
-    if t == '/debug':
+    # /debug — toggle debug mode (no GPT cost)
+    if t.startswith('/debug'):
+        if t == '/debug on':
+            return report_formatter.set_debug_mode(True)
+        if t == '/debug off':
+            return report_formatter.set_debug_mode(False)
         state = 'ON' if report_formatter.is_debug_on() else 'OFF'
         return f'디버그 모드: {state}\n사용법: /debug on 또는 /debug off'
 
-    # 1d. /force — cooldown bypass, Claude forced, no fallback
+    # /force — cooldown bypass, Claude forced
     if t == '/force' or t.startswith('/force '):
         force_text = t[len('/force'):].strip() or '지금 BTC 전략 분석해줘'
         _log(f'/force command: call_type=USER, text={force_text[:50]}')
@@ -1796,53 +1993,33 @@ def handle_command(text: str) -> str:
         return ai_result + _footer('force_strategy', 'claude', ai_provider,
                                    call_type='USER', bypass=True)
 
-    # 2. GPT Router — classify intent
+    # /detail — expanded news report
+    if t == '/detail' or t.startswith('/detail '):
+        detail_text = t[len('/detail'):].strip() or '뉴스 상세 분석'
+        _log(f'/detail command: detail=True')
+        detail_result, detail_provider = _ai_news_claude_advisory(
+            detail_text, call_type='AUTO', detail=True)
+        return detail_result + _footer('detail', 'claude', detail_provider)
+
+    # Phase 1: NL parser (always runs)
     try:
-        intent = gpt_router.classify_intent(t)
+        parsed = gpt_router.classify_intent(t)
     except Exception:
-        intent = gpt_router._keyword_fallback(t)
+        parsed = gpt_router._keyword_fallback(t)
 
-    route = intent.get("route", "none")
-    intent_name = intent.get("intent", "other")
-    _log(f"intent={intent_name} route={route} "
-         f"local_qtype={intent.get('local_query_type','')} "
-         f"fallback={intent.get('_fallback', False)} "
-         f"budget_exceeded={intent.get('_budget_exceeded', False)}")
+    msg_type = parsed.get("type", "QUESTION")
+    intent = parsed.get("intent", "general")
+    _log(f"type={msg_type} intent={intent} "
+         f"confidence={parsed.get('confidence', '?')} "
+         f"fallback={parsed.get('_fallback', False)} "
+         f"budget_exceeded={parsed.get('_budget_exceeded', False)}")
 
-    # 3. Cooldown hit — OpenClaw (route=claude) bypasses dedup
-    if intent.get("_cooldown_hit") and route != "claude":
-        return "⏳ 동일 요청이 최근에 처리되었습니다. 잠시 후 다시 시도해주세요."
+    # Phase 2: COMMAND → execution flow
+    if msg_type == "COMMAND":
+        return _handle_nl_command(parsed, t)
 
-    # 4. Route: local (NO AI) — but news may upgrade to claude
-    if route == "local":
-        qtype = intent.get("local_query_type", "status_full")
-
-        if intent.get("intent") == "news":
-            _log("news route=local → AI analysis forced")
-            news_result, news_provider = _ai_news_claude_advisory(t, call_type='AUTO')
-            return news_result + _footer(intent_name, "claude", news_provider)
-
-        return local_query_executor.execute(qtype, original_text=t) + _footer(intent_name, "local", "local")
-
-    # 4b. Route: directive
-    if intent_name == "directive":
-        if route == "local" and intent.get("local_query_type") == "audit":
-            return _handle_directive_command('AUDIT', {}) + _footer('directive', 'local', 'local')
-        dir_result, dir_provider = _handle_directive_intent(intent, t)
-        return dir_result + _footer('directive', 'local', dir_provider)
-
-    # 5. Route: claude → gate-controlled (Claude only, no GPT fallback)
-    if route == "claude":
-        ai_result, ai_provider = _ai_advisory(intent, t, no_fallback=True)
-        return ai_result + _footer(intent_name, "claude", ai_provider,
-                                   call_type='USER', bypass=True)
-
-    # 6. Route: none / other
-    return (
-        "무엇을 도와드릴까요?\n"
-        "예시: 상태, 뉴스, 포지션, BTC 가격, 전략 분석, 에러 확인\n"
-        "/help 로 전체 목록을 볼 수 있습니다."
-    ) + _footer("none", "none", "local")
+    # Phase 3: QUESTION → information/analysis flow
+    return _handle_nl_question(parsed, t)
 
 # ── main loop (unchanged) ────────────────────────────────
 

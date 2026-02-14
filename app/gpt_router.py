@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_TOKENS = 150
+MAX_TOKENS = 300
 TEMPERATURE = 0.0
 
 STATE_FILE = "/root/trading-bot/app/.gpt_router_state.json"
@@ -30,35 +30,92 @@ VALID_INTENTS = ("status", "chart", "news", "strategy", "emergency",
 VALID_ROUTES = ("local", "claude", "none")
 VALID_PRIORITIES = ("low", "normal", "high")
 
-SYSTEM_PROMPT = """You are a trading bot command router. Classify the user's Korean or English message into structured JSON.
+# ── NL-first type/intent constants ────────────────────────
+VALID_TYPES = ("COMMAND", "QUESTION")
 
-Available intents:
-- status: Bot status, position info, PnL, trade switch state
-- chart: Price queries, technical indicator queries (RSI, ATR, MA, BB, Ichimoku, volume)
-- news: News summary, recent news, news list
-- strategy: Strategy recommendations, market analysis, scenario planning
-- emergency: Crash analysis, stop-loss post-mortem, extreme volatility response
-- debug: Error logs, service health, system diagnostics
-- report: Daily/equity reports, performance summary
-- directive: System configuration changes. Keywords, risk mode, analysis request, pipeline tuning, audit.
-- other: Unrecognized or general conversation
+COMMAND_INTENTS = (
+    "close_position", "reduce_position", "open_long", "open_short",
+    "reverse_position", "set_risk_mode", "add_keywords", "remove_keywords",
+    "list_keywords", "toggle_trading", "run_audit")
 
-Routing rules:
-- "local": Data fetchable from DB/API without AI. Use for: status, positions, prices, indicators, health, news list, errors, reports, volatility stats.
-- "claude": Complex analysis requiring AI reasoning. Use for: strategy analysis, crash analysis, stop-loss post-mortem, high-impact news interpretation, system directives (keyword changes, risk mode, analysis requests).
-- "none": Greetings, irrelevant, or blocked requests.
+QUESTION_INTENTS = (
+    "status", "price", "indicators", "news_analysis", "strategy",
+    "emergency", "score", "report", "health", "errors",
+    "volatility", "general")
 
-local_query_type (only when route=local):
-  status_full, health_check, btc_price, news_summary, equity_report, daily_report,
-  recent_errors, indicator_snapshot, volatility_summary, position_info, score_summary
+# Legacy mapping: new QUESTION intent → (route, local_query_type)
+QUESTION_ROUTE_MAP = {
+    'status': ('local', 'status_full'),
+    'price': ('local', 'btc_price'),
+    'indicators': ('local', 'indicator_snapshot'),
+    'news_analysis': ('claude', ''),
+    'strategy': ('claude', ''),
+    'emergency': ('claude', ''),
+    'score': ('local', 'score_summary'),
+    'report': ('local', 'daily_report'),
+    'health': ('local', 'health_check'),
+    'errors': ('local', 'recent_errors'),
+    'volatility': ('local', 'volatility_summary'),
+    'general': ('none', ''),
+}
 
-CRITICAL RULES:
-- Trading is done by local strategy only. Telegram NEVER executes trades.
-- AI only advises/analyzes.
-- If user asks for multiple things (e.g. "RSI and position"), pick the most relevant local_query_type.
+SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/English message into structured JSON.
 
-Respond ONLY with valid JSON (no markdown, no explanation):
-{"intent":"...","route":"...","local_query_type":"...","claude_prompt":"...","cooldown_key":"...","priority":"..."}"""
+## type classification
+- COMMAND: User wants to EXECUTE an action (trade, config change, toggle)
+- QUESTION: User wants INFORMATION (analysis, status, price, news)
+
+## COMMAND intents
+- close_position: 포지션 전체 청산 ("롱 청산해", "포지션 닫아")
+- reduce_position: 포지션 일부 축소 ("25% 줄여", "반만 정리")
+- open_long: 롱 진입 ("롱 들어가", "매수 진입")
+- open_short: 숏 진입 ("숏 들어가", "매도 진입")
+- reverse_position: 포지션 반전 ("롱에서 숏으로 전환")
+- set_risk_mode: 리스크 모드 변경 ("보수적으로", "공격적으로")
+- add_keywords: 감시 키워드 추가 ("트럼프 감시 추가")
+- remove_keywords: 감시 키워드 삭제 ("트럼프 감시 해제")
+- list_keywords: 감시 키워드 목록 ("키워드 뭐 있어?")
+- toggle_trading: 자동매매 ON/OFF ("트레이딩 일시정지", "매매 재개")
+- run_audit: 시스템 감사 ("시스템 점검해줘")
+
+## QUESTION intents
+- status: 봇/포지션 상태
+- price: BTC 가격 조회
+- indicators: RSI, ATR, BB, Ichimoku 등 지표
+- news_analysis: 뉴스 분석/해석
+- strategy: 매매 전략/시나리오
+- emergency: 급변/급락/손절 분석
+- score: 스코어 엔진 결과
+- report: 일간/자본 리포트
+- health: 서비스 상태
+- errors: 에러 로그
+- volatility: 변동성 요약
+- general: 기타 질문
+
+## Output JSON (ONLY valid JSON, no text)
+{
+  "type": "COMMAND" or "QUESTION",
+  "intent": "one of the intents above",
+  "symbol": "BTC",
+  "percent": null or number,
+  "mode": null or "conservative"/"normal"/"aggressive",
+  "keywords": null or ["keyword1", "keyword2"],
+  "urgency": "normal" or "high",
+  "use_claude": true/false,
+  "needs_confirmation": true/false,
+  "test_mode": false,
+  "confidence": 0.0-1.0,
+  "reason": "brief reason for classification"
+}
+
+## Rules
+- ALWAYS classify. Never return empty or error.
+- 거래 요청은 반드시 type=COMMAND.
+- "오픈클로우에게" or "Claude에게" → use_claude=true.
+- 퍼센트 미지정 시 percent=null (시스템이 기본값 사용).
+- close/reverse/open은 needs_confirmation=true.
+- "테스트"/"시뮬" 포함 시 test_mode=true.
+"""
 
 
 def _load_state() -> dict:
@@ -130,8 +187,40 @@ def _increment_budget(state: dict):
     state["daily_calls"] = {today: daily.get(today, 0) + 1}
 
 
+def _add_legacy_fields(result: dict) -> dict:
+    """Add backward-compatible route/local_query_type fields from new type/intent."""
+    msg_type = result.get('type', 'QUESTION')
+    intent = result.get('intent', 'general')
+
+    if msg_type == 'COMMAND':
+        # COMMAND intents route to 'local' for directive-style, 'claude' for trades
+        if intent in ('close_position', 'reduce_position', 'open_long',
+                       'open_short', 'reverse_position'):
+            result.setdefault('route', 'claude')
+        else:
+            result.setdefault('route', 'local')
+        result.setdefault('local_query_type', '')
+        # Map old intent for backward compat
+        if intent in ('set_risk_mode', 'add_keywords', 'remove_keywords',
+                       'list_keywords', 'run_audit'):
+            result.setdefault('_legacy_intent', 'directive')
+        else:
+            result.setdefault('_legacy_intent', 'strategy')
+    else:
+        route, lqt = QUESTION_ROUTE_MAP.get(intent, ('none', ''))
+        result.setdefault('route', route)
+        result.setdefault('local_query_type', lqt)
+        result.setdefault('_legacy_intent', intent)
+
+    result.setdefault('priority', 'high' if result.get('urgency') == 'high' else 'normal')
+    result.setdefault('cooldown_key', intent)
+    result.setdefault('claude_prompt', '')
+    return result
+
+
 def classify_intent(text: str) -> dict:
-    """Main entry. Returns intent dict. Falls back to keywords on any failure."""
+    """Main entry. Returns intent dict with type/intent fields.
+    Falls back to keywords on any failure."""
     state = _load_state()
 
     allowed, is_gear2 = _check_budget(state)
@@ -157,21 +246,40 @@ def classify_intent(text: str) -> dict:
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         result = json.loads(raw)
 
-        result.setdefault("intent", "other")
-        if result["intent"] not in VALID_INTENTS:
-            result["intent"] = "other"
-        result.setdefault("route", "none")
-        if result["route"] not in VALID_ROUTES:
-            result["route"] = "none"
-        result.setdefault("priority", "normal")
-        if result["priority"] not in VALID_PRIORITIES:
-            result["priority"] = "normal"
-        result.setdefault("local_query_type", "")
-        result.setdefault("claude_prompt", "")
-        result.setdefault("cooldown_key", result["intent"])
+        # Validate type
+        result.setdefault("type", "QUESTION")
+        if result["type"] not in VALID_TYPES:
+            result["type"] = "QUESTION"
+
+        # Validate intent against type
+        result.setdefault("intent", "general")
+        msg_type = result["type"]
+        if msg_type == "COMMAND":
+            if result["intent"] not in COMMAND_INTENTS:
+                result["intent"] = "general"
+                result["type"] = "QUESTION"
+        else:
+            if result["intent"] not in QUESTION_INTENTS:
+                result["intent"] = "general"
+
+        # Ensure defaults for new fields
+        result.setdefault("symbol", "BTC")
+        result.setdefault("percent", None)
+        result.setdefault("mode", None)
+        result.setdefault("keywords", None)
+        result.setdefault("urgency", "normal")
+        result.setdefault("use_claude", False)
+        result.setdefault("needs_confirmation", False)
+        result.setdefault("test_mode", False)
+        result.setdefault("confidence", 0.8)
+        result.setdefault("reason", "")
+
+        # Add legacy fields for backward compatibility
+        _add_legacy_fields(result)
 
         ck = result.get("cooldown_key", result["intent"])
-        if result["route"] == "claude" and _check_cooldown(
+        route = result.get("route", "none")
+        if route == "claude" and _check_cooldown(
                 ck, state, gear2=is_gear2, intent=result["intent"]):
             result["_cooldown_hit"] = True
 
@@ -184,80 +292,132 @@ def classify_intent(text: str) -> dict:
 
 
 def _keyword_fallback(text: str) -> dict:
-    """Simplified keyword matching as fallback. Never calls any API."""
+    """Simplified keyword matching as fallback. Never calls any API.
+    Returns NL-first format (type/intent) with legacy fields."""
     t = (text or "").strip().lower()
 
+    # ── COMMAND: trade intents ──────────────────────────────
+    if any(x in t for x in ["청산", "닫아", "close"]) and any(x in t for x in [
+            "포지션", "롱", "숏", "전체", "position", "long", "short", "해", "해줘"]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "close_position",
+                "needs_confirmation": True, "confidence": 0.7, "_fallback": True})
+
+    if any(x in t for x in ["줄여", "축소", "reduce", "정리"]) and not any(
+            x in t for x in ["분석", "뉴스"]):
+        import re
+        m = re.search(r'(\d+)\s*%', t)
+        pct = int(m.group(1)) if m else None
+        return _add_legacy_fields({"type": "COMMAND", "intent": "reduce_position",
+                "percent": pct, "needs_confirmation": True, "confidence": 0.7,
+                "_fallback": True})
+
+    has_entry = any(x in t for x in ["진입", "들어가", "열어", "open", "entry"])
+    if any(x in t for x in ["숏", "short", "매도"]) and has_entry:
+        test = "테스트" in t or "시뮬" in t or "dry" in t
+        return _add_legacy_fields({"type": "COMMAND", "intent": "open_short",
+                "needs_confirmation": True, "test_mode": test, "confidence": 0.7,
+                "_fallback": True})
+    if any(x in t for x in ["롱", "long", "매수"]) and has_entry:
+        test = "테스트" in t or "시뮬" in t or "dry" in t
+        return _add_legacy_fields({"type": "COMMAND", "intent": "open_long",
+                "needs_confirmation": True, "test_mode": test, "confidence": 0.7,
+                "_fallback": True})
+
+    if any(x in t for x in ["반전", "전환", "reverse", "뒤집"]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "reverse_position",
+                "needs_confirmation": True, "confidence": 0.7, "_fallback": True})
+
+    if any(x in t for x in ["일시정지", "멈춰", "stop", "pause", "정지"]) and any(
+            x in t for x in ["트레이딩", "매매", "자동", "trading", "봇", ""]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "toggle_trading",
+                "confidence": 0.7, "_fallback": True})
+    if any(x in t for x in ["재개", "시작", "resume", "켜"]) and any(
+            x in t for x in ["트레이딩", "매매", "자동", "trading", "봇", ""]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "toggle_trading",
+                "confidence": 0.7, "_fallback": True})
+
+    # ── COMMAND: config/directive intents ────────────────────
+    if any(x in t for x in ["키워드", "워치", "감시", "keyword", "watch"]):
+        if any(x in t for x in ["삭제", "해제", "제거", "remove"]):
+            return _add_legacy_fields({"type": "COMMAND", "intent": "remove_keywords",
+                    "confidence": 0.7, "_fallback": True})
+        if any(x in t for x in ["추가", "add", "등록", "강화"]):
+            return _add_legacy_fields({"type": "COMMAND", "intent": "add_keywords",
+                    "confidence": 0.7, "_fallback": True})
+        return _add_legacy_fields({"type": "COMMAND", "intent": "list_keywords",
+                "confidence": 0.7, "_fallback": True})
+
+    if any(x in t for x in ["리스크", "risk", "위험모드"]):
+        mode = None
+        if any(x in t for x in ["보수", "conservative"]):
+            mode = "conservative"
+        elif any(x in t for x in ["공격", "aggressive"]):
+            mode = "aggressive"
+        elif any(x in t for x in ["노멀", "normal", "보통"]):
+            mode = "normal"
+        return _add_legacy_fields({"type": "COMMAND", "intent": "set_risk_mode",
+                "mode": mode, "confidence": 0.7, "_fallback": True})
+
+    if any(x in t for x in ["감사", "audit", "오딧", "시스템점검", "점검"]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "run_audit",
+                "confidence": 0.7, "_fallback": True})
+
+    # ── QUESTION intents ────────────────────────────────────
     if any(x in t for x in ["상태", "status", "스테이터스", "잘 돌아", "돌아가"]):
-        return {"intent": "status", "route": "local", "local_query_type": "status_full",
-                "cooldown_key": "status", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "status",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["헬스", "health", "건강", "서비스 상태"]):
-        return {"intent": "debug", "route": "local", "local_query_type": "health_check",
-                "cooldown_key": "health", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "health",
+                "confidence": 0.8, "_fallback": True})
 
     if ("비트코인" in t or "btc" in t) and any(x in t for x in ["얼마", "가격", "시세", "현재가"]):
-        return {"intent": "chart", "route": "local", "local_query_type": "btc_price",
-                "cooldown_key": "btc_price", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "price",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["스코어", "score", "점수", "종합점수", "뉴스점수", "뉴스스코어"]):
-        return {"intent": "chart", "route": "local", "local_query_type": "score_summary",
-                "cooldown_key": "score", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "score",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["rsi", "atr", "ma", "볼린저", "이치모쿠", "지표", "indicator"]):
-        return {"intent": "chart", "route": "local", "local_query_type": "indicator_snapshot",
-                "cooldown_key": "indicator", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "indicators",
+                "confidence": 0.8, "_fallback": True})
 
-    # emergency/strategy → claude
     if any(x in t for x in ["긴급", "급변", "급락", "급등", "손절", "stop.?loss"]):
-        return {"intent": "emergency", "route": "claude",
-                "cooldown_key": "emergency", "priority": "high", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "emergency",
+                "urgency": "high", "confidence": 0.8, "_fallback": True})
 
-    if any(x in t for x in ["전략", "strategy", "대응", "시나리오", "매매"]):
-        return {"intent": "strategy", "route": "claude",
-                "cooldown_key": "strategy", "priority": "normal", "_fallback": True}
+    if any(x in t for x in ["전략", "strategy", "대응", "시나리오"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "strategy",
+                "confidence": 0.8, "_fallback": True})
 
-    # 뉴스 + 분석 키워드 → claude
-    if ("뉴스" in t or "news" in t) and any(x in t for x in ["분석", "해석", "영향", "중요", "analysis"]):
-        return {"intent": "news", "route": "claude",
-                "cooldown_key": "news_analysis", "priority": "normal", "_fallback": True}
-
-    if "뉴스" in t or "news" in t:
-        return {"intent": "news", "route": "claude",
-                "cooldown_key": "news_analysis", "priority": "normal", "_fallback": True}
+    if ("뉴스" in t or "news" in t):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "news_analysis",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["포지션", "position", "포지"]):
-        return {"intent": "status", "route": "local", "local_query_type": "position_info",
-                "cooldown_key": "position", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "status",
+                "confidence": 0.7, "_fallback": True})
 
     if any(x in t for x in ["에러", "error", "오류", "장애"]):
-        return {"intent": "debug", "route": "local", "local_query_type": "recent_errors",
-                "cooldown_key": "errors", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "errors",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["리포트", "report", "보고", "일간"]):
-        return {"intent": "report", "route": "local", "local_query_type": "daily_report",
-                "cooldown_key": "report", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "report",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["변동", "volatil", "볼라"]):
-        return {"intent": "chart", "route": "local", "local_query_type": "volatility_summary",
-                "cooldown_key": "volatility", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "volatility",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["equity", "자본", "잔고"]):
-        return {"intent": "report", "route": "local", "local_query_type": "equity_report",
-                "cooldown_key": "equity", "priority": "normal", "_fallback": True}
+        return _add_legacy_fields({"type": "QUESTION", "intent": "report",
+                "confidence": 0.7, "_fallback": True})
 
-    # directive keywords
-    if any(x in t for x in ["키워드", "워치", "감시", "keyword", "watch"]):
-        return {"intent": "directive", "route": "claude",
-                "cooldown_key": "directive_kw", "priority": "normal", "_fallback": True}
-    if any(x in t for x in ["리스크", "risk", "위험모드", "보수", "공격"]):
-        return {"intent": "directive", "route": "claude",
-                "cooldown_key": "directive_risk", "priority": "normal", "_fallback": True}
-    if any(x in t for x in ["감사", "audit", "오딧", "시스템점검"]):
-        return {"intent": "directive", "route": "local", "local_query_type": "audit",
-                "cooldown_key": "directive_audit", "priority": "normal", "_fallback": True}
-    if any(x in t for x in ["파이프라인", "가중치", "weight", "임계", "threshold"]):
-        return {"intent": "directive", "route": "claude",
-                "cooldown_key": "directive_pipeline", "priority": "normal", "_fallback": True}
+    if any(x in t for x in ["매매"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "strategy",
+                "confidence": 0.6, "_fallback": True})
 
-    return {"intent": "other", "route": "none", "cooldown_key": "",
-            "priority": "low", "_fallback": True}
+    return _add_legacy_fields({"type": "QUESTION", "intent": "general",
+            "confidence": 0.3, "_fallback": True})
