@@ -723,3 +723,224 @@ def _fill_reverse_open(direction='', avg_price=0, filled_qty=0,
         f'- 예산: {_safe_float(entry_pct):.0f}%/70% '
         f'(stage{start_stage}, 잔여 {budget_remain:.0f}%)'
     )
+
+
+# ── 뉴스→전략 통합 리포트 ────────────────────────────────
+
+def format_news_strategy_report(data, detail=False):
+    """7섹션 고정 한국어 뉴스→전략 리포트.
+
+    data: news_strategy_report.build_report_data() 반환값.
+    detail: True면 TOP 5 + 확장 trace.
+    AI는 1줄요약+리스크만 담당. 나머지 6섹션은 데이터 기반.
+    """
+    snap = data.get('snapshot', {})
+    scores = data.get('scores', {})
+    pos = data.get('position', {})
+    macro_news = data.get('macro_news', [])
+    crypto_news = data.get('crypto_news', [])
+    stats = data.get('stats', {})
+    watch = data.get('watch_matches', [])
+    trace_str = data.get('news_score_trace', '')
+    constraints = data.get('action_constraints', {})
+    ai = data.get('ai_summary', {})
+
+    top_n = 5 if detail else 3
+    lines = []
+
+    # ── [📌 1줄 요약] (AI 생성) ──
+    lines.append('[📌 1줄 요약]')
+    one_liner = ai.get('one_liner', '')
+    risk_level = ai.get('risk_level', '')
+    if one_liner:
+        lines.append(one_liner)
+    else:
+        # Fallback: data-driven summary
+        side = scores.get('dominant_side', 'LONG')
+        stage = scores.get('stage', 1)
+        total = scores.get('total', 0)
+        action = 'HOLD' if not pos.get('side') else '유지'
+        lines.append(f'{side} stg{stage} | {action} | 총점 {total:+.1f}')
+
+    # ── [📊 시장 스냅샷] ──
+    lines.append('')
+    lines.append('[📊 시장 스냅샷]')
+    price = snap.get('price', 0)
+    h24 = snap.get('high_24h', 0)
+    l24 = snap.get('low_24h', 0)
+    ret1h = snap.get('ret_1h')
+    ret4h = snap.get('ret_4h')
+    ret_parts = []
+    if ret1h is not None:
+        ret_parts.append(f'1h:{ret1h:+.1f}%')
+    if ret4h is not None:
+        ret_parts.append(f'4h:{ret4h:+.1f}%')
+    ret_str = ' '.join(ret_parts)
+    lines.append(f'BTC ${price:,.0f} (24h H:${h24:,.0f} L:${l24:,.0f}) {ret_str}')
+
+    bb_mid = snap.get('bb_mid', 0)
+    bb_up = snap.get('bb_up', 0)
+    bb_dn = snap.get('bb_dn', 0)
+    bb_bw = round(bb_up - bb_dn) if bb_up and bb_dn else 0
+    tenkan = snap.get('ich_tenkan', 0)
+    kijun = snap.get('ich_kijun', 0)
+    tk_rel = '<' if tenkan < kijun else '>'
+    lines.append(f'BB(mid:{bb_mid:,.0f} 폭:{bb_bw:,.0f}) '
+                 f'Ich(tenkan:{tenkan:,.0f} {tk_rel} kijun:{kijun:,.0f})')
+
+    total = scores.get('total', 0)
+    side = scores.get('dominant_side', 'LONG')
+    stage = scores.get('stage', 1)
+    tech = scores.get('tech', 0)
+    pos_s = scores.get('pos', 0)
+    regime = scores.get('regime', 0)
+    news_s = scores.get('news_event', 0)
+    lines.append(f'Score: TOTAL {total:+.1f} -> {side} stg{stage} | '
+                 f'TECH:{tech:+.0f} POS:{pos_s:+.0f} REG:{regime:+.0f} NEWS:{news_s:+.0f}')
+
+    # ── [📰 미국/거시 TOP N] ──
+    lines.append('')
+    lines.append(f'[📰 미국/거시 TOP {min(len(macro_news), top_n)}]')
+    if not macro_news:
+        lines.append('- 최근 6시간 거시 뉴스 없음')
+    else:
+        for i, n in enumerate(macro_news[:top_n], 1):
+            _append_news_item(lines, i, n)
+
+    # ── [🪙 크립토 TOP N] ──
+    lines.append('')
+    lines.append(f'[🪙 크립토 TOP {min(len(crypto_news), top_n)}]')
+    if not crypto_news:
+        lines.append('- 최근 6시간 크립토 뉴스 없음')
+    else:
+        for i, n in enumerate(crypto_news[:top_n], 1):
+            _append_news_item(lines, i, n)
+
+    # ── [🧩 뉴스→전략 TRACE] ──
+    lines.append('')
+    lines.append('[🧩 뉴스→전략 TRACE]')
+    news_event = scores.get('news_event', 0)
+    news_w = scores.get('weights', {}).get('news_event_w', 0.05)
+    contribution = abs(news_event * news_w)
+    if trace_str:
+        lines.append(f'점수: {news_event:+.0f} ({trace_str})')
+    else:
+        lines.append(f'점수: {news_event:+.0f}')
+    lines.append(f'가중치: {news_w} ({contribution:.1f}p 기여)')
+
+    guarded = scores.get('news_guarded', False)
+    if guarded:
+        lines.append('뉴스 가드 적용 (TECH+POS 중립)')
+
+    # Action constraints
+    c_parts = []
+    if not constraints.get('can_open', True):
+        c_parts.append('OPEN 불가')
+    if not constraints.get('can_reverse', True):
+        c_parts.append('REVERSE 불가')
+    if c_parts:
+        lines.append(f'제약: 뉴스 단독 {"/".join(c_parts)}')
+
+    if watch:
+        lines.append(f'watchlist: {", ".join(watch)}')
+
+    # ── [🎯 핵심 레벨] ──
+    lines.append('')
+    lines.append('[🎯 핵심 레벨]')
+    support_lines = []
+    resist_lines = []
+    if bb_dn:
+        support_lines.append(f'${bb_dn:,.0f}(BB하단)')
+    val = snap.get('val', 0)
+    if val:
+        support_lines.append(f'${val:,.0f}(VAL)')
+    if bb_up:
+        resist_lines.append(f'${bb_up:,.0f}(BB상단)')
+    vah = snap.get('vah', 0)
+    if vah:
+        resist_lines.append(f'${vah:,.0f}(VAH)')
+    if kijun:
+        resist_lines.append(f'${kijun:,.0f}(Kijun)')
+
+    if support_lines:
+        lines.append(f'지지: {" / ".join(support_lines)}')
+    if resist_lines:
+        lines.append(f'저항: {" / ".join(resist_lines)}')
+
+    sl_pct = pos.get('sl_pct', scores.get('dynamic_sl', 2.0))
+    sl_price = pos.get('sl_price')
+    sl_dist = pos.get('sl_dist')
+    if pos.get('side'):
+        sl_parts = [f'손절: -{sl_pct}%']
+        if sl_price:
+            sl_parts.append(f'(${sl_price:,.0f})')
+        if sl_dist is not None:
+            sl_parts.append(f'| 거리: {sl_dist:+.1f}%')
+        lines.append(' '.join(sl_parts))
+    else:
+        lines.append(f'손절 기준: -{sl_pct}%')
+
+    # ── [⚠ 리스크/다음 체크] ──
+    lines.append('')
+    lines.append('[⚠ 리스크/다음 체크]')
+    bull = stats.get('bullish', 0)
+    bear = stats.get('bearish', 0)
+    if not risk_level:
+        if bear >= 3 and bear > bull * 2:
+            risk_level = '높음'
+        elif bear > bull:
+            risk_level = '보통'
+        else:
+            risk_level = '낮음'
+    lines.append(f'리스크: {risk_level} (거시 하락 {bear}건 vs 상승 {bull}건, regime={regime:+.0f})')
+
+    watch_items = ai.get('watch_items', [])
+    next_check = ai.get('next_check', '')
+    if watch_items:
+        lines.append(f'모니터링: {", ".join(watch_items)}')
+    elif next_check:
+        lines.append(f'모니터링: {next_check}')
+
+    return '\n'.join(lines)
+
+
+def _append_news_item(lines, idx, n):
+    """Append a single news item to report lines."""
+    impact = _safe_int(n.get('impact_score'))
+    title = (n.get('title') or '')[:70]
+    cat_kr = n.get('category_kr', '')
+    direction = n.get('direction', '')
+    source = n.get('source', '')
+    ts = n.get('ts', '')
+
+    dir_str = f' / {direction}' if direction else ''
+    lines.append(f'{idx}) ({impact}/10) {title} — {cat_kr}{dir_str}')
+    lines.append(f'   {source} {ts}')
+
+    impact_path = n.get('impact_path', '')
+    if impact_path:
+        lines.append(f'   {impact_path}')
+
+    # Trace data
+    trace = n.get('trace', {})
+    if trace:
+        ret_30m = trace.get('btc_ret_30m')
+        ret_2h = trace.get('btc_ret_2h')
+        label = trace.get('label', '')
+        z = trace.get('spike_zscore')
+
+        parts = []
+        if ret_30m is not None:
+            parts.append(f'30m {ret_30m:+.1f}%')
+        else:
+            parts.append('30m 집계 중')
+        if ret_2h is not None:
+            parts.append(f'2h {ret_2h:+.1f}%')
+        else:
+            parts.append('2h 집계 중')
+        if label:
+            label_str = label
+            if z is not None:
+                label_str += f' (z={z:.1f})'
+            parts.append(label_str)
+        lines.append(f'   ▸ {" | ".join(parts)}')

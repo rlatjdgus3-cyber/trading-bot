@@ -81,6 +81,22 @@ def _load_weights(cur=None):
                     weights[k] = float(override[k])
     except Exception:
         pass
+    # Emergency news weight bump (TTL-based)
+    try:
+        cur.execute("SELECT value FROM openclaw_policies WHERE key = 'news_emergency_bump';")
+        row = cur.fetchone()
+        if row and row[0]:
+            from datetime import datetime, timezone
+            bump = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            if bump.get('active'):
+                expires_at = datetime.fromisoformat(bump['expires_at'])
+                now = datetime.now(timezone.utc)
+                if now < expires_at:
+                    weights['news_event_w'] = float(bump.get('weight', 0.15))
+                else:
+                    cur.execute("DELETE FROM openclaw_policies WHERE key = 'news_emergency_bump';")
+    except Exception:
+        pass
     return weights
 
 
