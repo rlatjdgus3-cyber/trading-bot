@@ -5,6 +5,7 @@ report_formatter.py — 중앙 한국어 포매팅 모듈
 어디서든 import 가능.
 """
 import os
+import re as _re
 
 # ── 한국어 번역 상수 ──────────────────────────────────────
 
@@ -40,6 +41,17 @@ TRIGGER_KR = {
     'vol_spike': '거래량 급등',
     'funding_extreme': '극단적 펀딩비',
     'event_emergency': '긴급 이벤트',
+    'poc_shift': 'POC 이동(매물대 중심)',
+    'vah_break': 'VAH 돌파(가치영역 상단)',
+    'val_break': 'VAL 이탈(가치영역 하단)',
+    'atr_increase': '변동성(ATR) 급증',
+    'level_break': '주요 레벨 돌파',
+    'price_spike_1m': '1분 급등락',
+    'price_spike_5m': '5분 급등락',
+    'price_spike_15m': '15분 급등락',
+    'bb_squeeze': 'BB 스퀴즈(변동성 압축)',
+    'kijun_cross': '기준선 교차',
+    'ma_cross': '이동평균 교차',
 }
 
 RISK_KR = {
@@ -54,6 +66,64 @@ NEWS_MAGNITUDE_KR = {
     'moderate': '보통',
     'strong': '강',
 }
+
+SUPPRESS_REASON_KR = {
+    'db_event_lock': '이벤트 중복(DB 락)',
+    'db_hash_lock': '동일 이벤트(해시 락)',
+    'db_hold_suppress': 'HOLD 반복 억제',
+    'local_dedupe': '로컬 중복 필터',
+    'local_hold_repeat': 'HOLD 반복 필터',
+    'local_consecutive_hold': '연속 HOLD 스킵',
+}
+
+MODEL_LABEL_KR = {
+    'claude': '🧠 심층 분석(Claude)',
+    'gpt-mini': '⚡ 빠른 분석(GPT-mini)',
+    'suppressed': '🚫 이벤트 억제(중복/쿨다운)',
+}
+
+REASON_KR = {
+    'POSITION_ANALYSIS_REPORT': '포지션 분석 근거',
+    'MIXED_SIGNALS_WITH_POSITIVE_NEWS': '신호 혼재(뉴스 긍정)',
+    'HOLD_CURRENT_POSITION': '현재 포지션 유지',
+    'STRONG_TREND_CONTINUATION': '강한 추세 지속',
+    'COUNTER_SIGNAL_DETECTED': '역방향 신호 감지',
+    'NO_CLEAR_SIGNAL': '명확한 신호 없음',
+    'INSUFFICIENT_CONFIRMATION': '확인 신호 부족',
+    'RISK_TOO_HIGH': '위험도 과다',
+    'BUDGET_EXHAUSTED': '예산 소진',
+    'STOP_LOSS_NEAR': '손절가 근접',
+    'VOLATILITY_TOO_HIGH': '변동성 과다',
+    'TREND_WEAKENING': '추세 약화',
+    'MOMENTUM_DIVERGENCE': '모멘텀 괴리',
+    'LIQUIDITY_CONCERN': '유동성 우려',
+    'NEWS_DRIVEN_CAUTION': '뉴스 기반 경계',
+}
+
+SAFETY_REASON_KR = {
+    'daily trade limit': '일일 거래 한도 초과',
+    'hourly trade limit': '시간당 거래 한도 초과',
+    'circuit breaker': '서킷 브레이커 발동',
+    'daily loss limit': '일일 손실 한도 초과',
+    'total exposure would exceed budget': '총 노출 예산 초과',
+    'max stages reached': '최대 단계 도달',
+    'budget would exceed': '거래 예산 초과',
+}
+
+
+def _kr_safety_reason(reason: str) -> str:
+    """safety_manager 영어 사유를 한국어로 변환."""
+    if not reason:
+        return '알 수 없는 사유'
+    for en_key, kr_val in SAFETY_REASON_KR.items():
+        if en_key in reason:
+            # 괄호 안 수치 정보 보존
+            paren = ''
+            if '(' in reason:
+                paren = ' ' + reason[reason.index('('):]
+            return kr_val + paren
+    return reason
+
 
 DEBUG_MODE_PATH = '/root/trading-bot/app/.debug_mode'
 
@@ -106,6 +176,64 @@ def _debug_line(meta: dict = None) -> str:
     return '\n─\n' + ' | '.join(parts)
 
 
+# ── 영어 비율 감지 ─────────────────────────────────────────
+
+def detect_english_ratio(text: str) -> float:
+    """텍스트의 영어 비율 반환 (0.0~1.0).
+    숫자, 기호, 공백, 약어(BTC, USD 등)는 제외.
+    순수 알파벳 단어 기준으로 비율 계산."""
+    if not text:
+        return 0.0
+    # 허용 약어 — 이것들은 영어로 표시해도 OK
+    ALLOWED_EN = {
+        # 코인/통화
+        'BTC', 'ETH', 'USDT', 'USD', 'KRW', 'SOL', 'XRP', 'DOGE',
+        # 매매 액션
+        'LONG', 'SHORT', 'HOLD', 'ADD', 'REDUCE', 'CLOSE', 'REVERSE', 'OPEN',
+        'SKIPPED', 'ABORT', 'ENTRY', 'POSSIBLE',
+        # 기술 지표
+        'RSI', 'ATR', 'BB', 'MA', 'EMA', 'SMA', 'MACD', 'VWAP', 'OBV',
+        'POC', 'VAH', 'VAL', 'KST', 'UTC',
+        # 점수/라벨
+        'TECH', 'POS', 'REGIME', 'NEWS', 'TOP',
+        'SCORE', 'STAGE', 'NET', 'DEFAULT', 'EVENT', 'WATCHLIST',
+        # 뉴스 카테고리/방향
+        'MACRO', 'MARKET', 'REGULATION', 'BULLISH', 'BEARISH', 'NEUTRAL',
+        'EXTREME',
+        # AI/서비스
+        'ON', 'OFF', 'OK', 'N/A', 'GPT', 'AI', 'API',
+        'CLAUDE', 'BYBIT', 'ANTHROPIC', 'OPENAI',
+        # 거시경제
+        'SEC', 'ETF', 'CPI', 'FOMC', 'FED', 'BOJ', 'NFP', 'PCE',
+        'DXY', 'QQQ', 'SPX', 'GDP', 'PPI',
+        # 뉴스 소스 (고유 명사)
+        'REUTERS', 'COINDESK', 'COINTELEGRAPH', 'BLOOMBERG',
+        'DECRYPT', 'THEBLOCK',
+        # 모델명 토큰
+        'OPUS', 'SONNET', 'HAIKU', 'MINI',
+    }
+    # 3글자 이상 순수 알파벳 단어만 추출 (해시/버전 토큰 무시)
+    words = _re.findall(r'[A-Za-z]{3,}', text)
+    if len(words) < 3:
+        # 영어 단어가 3개 미만이면 판정 불가 — 안전으로 처리
+        return 0.0
+    en_count = sum(1 for w in words if w.upper() not in ALLOWED_EN)
+    return en_count / max(len(words), 1)
+
+
+def sanitize_telegram_text(text: str) -> str:
+    """텔레그램 전송 전 영어 비율 검사. 20% 초과시 경고 로그."""
+    ratio = detect_english_ratio(text)
+    if ratio > 0.2:
+        # 로그만 남기고 전송은 허용 (차단하면 중요 메시지 누락 위험)
+        try:
+            print(f'[report_formatter] LANGUAGE_WARNING: english_ratio={ratio:.2f} '
+                  f'text_preview={text[:80]!r}', flush=True)
+        except Exception:
+            pass
+    return text
+
+
 # ── 유틸리티 ─────────────────────────────────────────────
 
 def _kr_action(action: str) -> str:
@@ -133,6 +261,21 @@ def _kr_direction(direction: str) -> str:
     if not direction:
         return '?'
     return DIRECTION_KR.get(direction, direction)
+
+
+def _kr_suppress_reason(reason: str) -> str:
+    """억제 사유를 한국어로 변환."""
+    return SUPPRESS_REASON_KR.get(reason, reason)
+
+
+def _kr_reason_code(code: str) -> str:
+    """reason_code를 한국어로 변환. 매핑 없으면 _ 분리 가독성 변환."""
+    if not code:
+        return '?'
+    kr = REASON_KR.get(code)
+    if kr:
+        return kr
+    return code.replace('_', ' ').title()
 
 
 def _safe_float(val, default=0.0):
@@ -198,9 +341,8 @@ def _parse_news_category(summary: str) -> str:
     """Extract category tag from summary field like '[up] [FED_RATES] ...'."""
     if not summary:
         return 'OTHER'
-    import re
     # Find all bracket tags (case-insensitive)
-    tags = re.findall(r'\[([A-Za-z_]+)\]', summary)
+    tags = _re.findall(r'\[([A-Za-z_]+)\]', summary)
     direction_tags = {'up', 'down', 'neutral'}
     for tag in tags:
         if tag.lower() in direction_tags:
@@ -251,7 +393,7 @@ def format_news_analysis(macro_news, crypto_news, news_score,
     else:
         for i, n in enumerate(macro_news[:3], 1):
             impact = _safe_int(n.get('impact_score'))
-            title = (n.get('title') or '')[:80]
+            title = (n.get('title_ko') or n.get('title') or '')[:80]
             source = n.get('source', '')
             ts = (n.get('ts') or '')[:16]
             summary = n.get('summary', '')
@@ -275,7 +417,7 @@ def format_news_analysis(macro_news, crypto_news, news_score,
     else:
         for i, n in enumerate(crypto_news[:3], 1):
             impact = _safe_int(n.get('impact_score'))
-            title = (n.get('title') or '')[:80]
+            title = (n.get('title_ko') or n.get('title') or '')[:80]
             source = n.get('source', '')
             ts = (n.get('ts') or '')[:16]
             summary = n.get('summary', '')
@@ -347,7 +489,7 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     if confidence is not None:
         lines.append(f'- 확신도: {confidence}')
     if reason_code:
-        lines.append(f'- 근거: {reason_code}')
+        lines.append(f'- 근거: {_kr_reason_code(reason_code)}')
 
     # ── [📊 점수 상세] ──
     lines.append('')
@@ -366,19 +508,11 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     else:
         for i, n in enumerate(news_items[:3], 1):
             impact = _safe_int(n.get('impact_score'))
-            title = (n.get('title') or '')[:80]
+            title = (n.get('title_ko') or n.get('title') or '')[:80]
             source = n.get('source', '')
             ts = (n.get('ts') or '')[:16]
             summary = n.get('summary', '')
-            direction_tag = ''
-            if summary:
-                sl = summary.lower()
-                if sl.startswith('[up]') or sl.startswith('[bullish]'):
-                    direction_tag = '상승'
-                elif sl.startswith('[down]') or sl.startswith('[bearish]'):
-                    direction_tag = '하락'
-                elif sl.startswith('[neutral]'):
-                    direction_tag = '중립'
+            direction_tag = _parse_news_direction(summary)
             dir_str = f' / {direction_tag}' if direction_tag else ''
             lines.append(f'{i}) ({impact}/10) {title} / {source} / {ts}{dir_str}')
 
@@ -464,7 +598,7 @@ def format_decision_alert(action, parsed, engine_action, scores, pos_state):
         f'[📋 전략 판단]',
         f'- Claude: {_kr_action(action)}',
         f'- 확신도: {parsed.get("confidence", "?")}',
-        f'- 근거: {parsed.get("reason_code", "?")}',
+        f'- 근거: {_kr_reason_code(parsed.get("reason_code", "?"))}',
         f'- 엔진 참조: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}',
         f'- 포지션: {side} {qty} BTC',
     ]
@@ -491,7 +625,7 @@ def format_enqueue_alert(eq_id, action, parsed, pos_state):
     ]
     if qty_info:
         lines.append(f'- 상세: {qty_info}')
-    lines.append(f'- 근거: {parsed.get("reason_code", "?")}')
+    lines.append(f'- 근거: {_kr_reason_code(parsed.get("reason_code", "?"))}')
     return '\n'.join(lines)
 
 
@@ -545,14 +679,28 @@ def format_emergency_post_alert(trigger_type, action, result):
 
 # ── 이벤트 알림 ──────────────────────────────────────────
 
-def format_event_pre_alert(trigger_types, mode):
+def format_event_pre_alert(trigger_types, mode, model='claude', snapshot=None):
     """이벤트 감지 사전 알림."""
     trigger_types = trigger_types or []
     kr_types = [_kr_trigger(t) for t in trigger_types]
+    model_label = MODEL_LABEL_KR.get(model, model)
+
+    # 방향 표기: price_spike / volume_spike 트리거 시 ret_5m 기반 급등/급락 표시
+    price_line = ''
+    if snapshot:
+        ret_5m = (snapshot.get('returns') or {}).get('ret_5m')
+        if ret_5m is not None:
+            spike_triggers = {'price_spike_1m', 'price_spike_5m',
+                              'price_spike_15m', 'volume_spike'}
+            if any(t in spike_triggers for t in trigger_types):
+                direction = '급등' if ret_5m > 0 else '급락'
+                price_line = f'\n- 가격: 5m {ret_5m:+.1f}% ({direction})'
+
     return (
-        f'📡 이벤트 감지 → Claude 분석\n'
+        f'📡 이벤트 감지 → {model_label}\n'
         f'- 트리거: {", ".join(kr_types) or "?"}\n'
         f'- 모드: {mode or "?"}'
+        f'{price_line}'
     )
 
 
@@ -581,6 +729,148 @@ def format_event_post_alert(trigger_types, action, result):
     elif action in ('OPEN_LONG', 'OPEN_SHORT'):
         target_stage = result.get('target_stage', 1)
         lines.append(f'- stage: {target_stage}')
+
+    return '\n'.join(lines)
+
+
+def format_async_claude_result(action, result, reason):
+    """Claude 비동기 분석 결과 한국어 포매팅."""
+    result = result or {}
+    action = action or 'HOLD'
+    confidence = result.get('confidence', '?')
+    risk = _kr_risk(result.get('risk_level', ''))
+    reason_bullets = result.get('reason_bullets', [])
+    reason_code = result.get('reason_code', '')
+    detail = ', '.join(reason_bullets[:2]) if reason_bullets else reason_code
+
+    lines = [f'🧠 비동기 Claude 분석 완료 (claude_waited=false)']
+    lines.append(f'- 조치: {_kr_action(action)}')
+    lines.append(f'- 확신도: {confidence}')
+    if risk and risk != '?':
+        lines.append(f'- 위험도: {risk}')
+    if detail:
+        lines.append(f'- 근거: {detail}')
+    lines.append(f'- 트리거: {reason or "?"}')
+
+    if action == 'REDUCE':
+        reduce_pct = result.get('reduce_pct', 50)
+        lines.append(f'- 축소: {reduce_pct}%')
+
+    return '\n'.join(lines)
+
+
+# ── 서비스/이벤트/예산 알림 ────────────────────────────────
+
+def format_service_start(build_sha, config_version, features=None):
+    """서비스 시작 알림."""
+    lines = [
+        '🚀 서비스 시작',
+        f'- 빌드: {build_sha}',
+        f'- 설정: {config_version}',
+    ]
+    if features:
+        for k, v in features.items():
+            lines.append(f'- {k}: {v}')
+    return '\n'.join(lines)
+
+
+def format_event_suppressed(trigger_types, reason, remaining_sec=0, detail=None):
+    """이벤트 억제 알림."""
+    trigger_types = trigger_types or []
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+    reason_kr = _kr_suppress_reason(reason)
+    lines = [
+        f'🚫 이벤트 억제: {reason_kr}',
+        f'- 트리거: {", ".join(kr_types) or "?"}',
+    ]
+    if remaining_sec > 0:
+        lines.append(f'- 잔여 시간: {remaining_sec}초')
+    if is_debug_on() and detail:
+        parts = [f'{k}={v}' for k, v in detail.items()]
+        lines.append(f'- 상세: {", ".join(parts)}')
+    return '\n'.join(lines)
+
+
+def format_gpt_mini_fallback(trigger_types, gate_reason):
+    """GPT-mini 전환 알림."""
+    trigger_types = trigger_types or []
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+    return (
+        f'⚡ 빠른 분석(GPT-mini) 전환\n'
+        f'- 트리거: {", ".join(kr_types) or "?"}\n'
+        f'- 사유: {gate_reason or "?"}'
+    )
+
+
+def format_hold_suppress_notice(symbol, count, ttl_min, trigger_types):
+    """HOLD 반복 억제 알림."""
+    trigger_types = trigger_types or []
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+    return (
+        f'🚫 HOLD 반복 억제\n'
+        f'- 종목: {symbol}\n'
+        f'- 연속 HOLD: {count}회\n'
+        f'- 억제 시간: {ttl_min}분\n'
+        f'- 트리거: {", ".join(kr_types) or "?"}\n'
+        f'- Claude 호출 차단 (락 만료 후 재개)'
+    )
+
+
+def format_budget_exceeded(reason, daily_report=''):
+    """Claude 예산 초과 알림."""
+    lines = [
+        f'⚠️ Claude 예산 초과',
+        f'- 사유: {reason}',
+    ]
+    if daily_report:
+        lines.append('')
+        lines.append(daily_report)
+    return '\n'.join(lines)
+
+
+def format_daily_cost_report(today, daily_calls, daily_limit,
+                             daily_cost, daily_cost_limit,
+                             monthly_cost, monthly_cost_limit,
+                             auto_c=0, user_c=0, emerg_c=0,
+                             error_remaining=0):
+    """Claude 사용 리포트."""
+    lines = [
+        '=== Claude 사용 리포트 ===',
+        f'날짜: {today}',
+        f'일일 호출: {daily_calls}/{daily_limit}',
+        f'일일 비용: ${daily_cost:.4f}/${daily_cost_limit}',
+        f'월간 비용: ${monthly_cost:.4f}/${monthly_cost_limit}',
+        f'호출 유형: 자동={auto_c} 사용자={user_c} 긴급={emerg_c}',
+    ]
+    if error_remaining > 0:
+        lines.append(f'오류 차단: {error_remaining}초 남음')
+    return '\n'.join(lines)
+
+
+def format_lock_stats_report(hours, caller_stats, lock_stats):
+    """Claude 호출 통계."""
+    lines = [
+        f'=== Claude 호출 통계 (최근 {hours}시간) ===',
+    ]
+    if not caller_stats:
+        lines.append('기록된 호출 없음')
+    else:
+        total_calls = sum(s['total_calls'] for s in caller_stats)
+        total_cost = sum(s['total_cost'] for s in caller_stats)
+        lines.append(f'합계: {total_calls}회, ${total_cost:.4f}')
+        lines.append('')
+        for s in caller_stats:
+            lines.append(
+                f"  {s['caller']}: {s['allowed_calls']}회 허용 / "
+                f"{s['denied_calls']}회 거부 / ${s['total_cost']:.4f}")
+
+    lines.append(f'\n=== 활성 락 ===')
+    lines.append(f"합계: {lock_stats.get('total_active', 0)}")
+    lock_type_kr = {'event': '이벤트', 'hash': '해시', 'hold_sup': 'HOLD 억제'}
+    for lt in ('event', 'hash', 'hold_sup'):
+        cnt = lock_stats.get(lt, 0)
+        if cnt:
+            lines.append(f"  {lock_type_kr.get(lt, lt)}: {cnt}")
 
     return '\n'.join(lines)
 
@@ -907,9 +1197,10 @@ def format_news_strategy_report(data, detail=False):
 def _append_news_item(lines, idx, n):
     """Append a single news item to report lines."""
     impact = _safe_int(n.get('impact_score'))
-    title = (n.get('title') or '')[:70]
-    cat_kr = n.get('category_kr', '')
-    direction = n.get('direction', '')
+    title = (n.get('title_ko') or n.get('title') or '')[:70]
+    cat_kr = n.get('category_kr') or CATEGORY_KR.get(
+        _parse_news_category(n.get('summary', '')), '')
+    direction = n.get('direction') or _parse_news_direction(n.get('summary', ''))
     source = n.get('source', '')
     ts = n.get('ts', '')
 

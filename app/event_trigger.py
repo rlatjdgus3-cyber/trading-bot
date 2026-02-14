@@ -74,6 +74,13 @@ EVENT_CLAUDE_MIN_RET_5M = 1.2     # abs(ret_5m) >= 1.2%
 EVENT_CLAUDE_MIN_VOL_RATIO = 2.5  # vol_spike >= 2.5x
 EVENT_CLAUDE_MIN_CONFIDENCE = 0.75  # trigger confidence threshold
 
+# ── Async Claude escalation (need_claude) ───────────────
+ASYNC_CLAUDE_COOLDOWN_SEC = 1800       # 30분 쿨다운
+ASYNC_CLAUDE_RET_5M_THRESHOLD = 1.0    # 조건A: |ret_5m| >= 1.0%
+ASYNC_CLAUDE_CONFIDENCE_THRESHOLD = 70  # 조건A: GPT confidence < 70
+ASYNC_CLAUDE_BAR_15M_THRESHOLD = 1.0   # 조건B: 각 봉 >= 1.0%
+ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD = 40  # 조건C: |news_event_score| >= 40
+
 # ── Telegram throttle ────────────────────────────────────
 TELEGRAM_EVENT_THROTTLE_SEC = 600  # same event type: max once per 10 min
 
@@ -257,6 +264,53 @@ def should_use_claude_for_event(snapshot, triggers) -> tuple:
         return False, f'no level_break and confidence={max_confidence:.2f} too low'
 
     return True, 'all gates passed'
+
+
+def need_claude(snapshot, mini_result, scores) -> tuple:
+    """Decide if async Claude should be spawned after GPT-mini 1차 결정.
+
+    Returns (need: bool, reason: str).
+
+    Checks: 쿨다운 30분 → 일일 캡 →
+      조건A: abs(ret_5m) >= 1.0% AND confidence < 70
+      조건B: 15분봉 3개 연속 ±1.0% 이상
+      조건C: abs(news_event_score) >= 40
+    → 하나라도 충족 시 True
+    """
+    _check_daily_reset()
+    now = time.time()
+
+    # ── 쿨다운 30분 ──
+    elapsed = now - _event_claude_state['last_call_ts']
+    if _event_claude_state['last_call_ts'] > 0 and elapsed < ASYNC_CLAUDE_COOLDOWN_SEC:
+        return False, f'async_cooldown ({int(elapsed)}s/{ASYNC_CLAUDE_COOLDOWN_SEC}s)'
+
+    # ── 일일 캡 ──
+    if _event_claude_state['daily_count'] >= EVENT_CLAUDE_DAILY_CAP:
+        return False, f'daily_cap ({_event_claude_state["daily_count"]}/{EVENT_CLAUDE_DAILY_CAP})'
+
+    # ── 조건A: |ret_5m| >= 1.0% AND confidence < 70 ──
+    returns = snapshot.get('returns', {}) if snapshot else {}
+    ret_5m = returns.get('ret_5m')
+    confidence = None
+    if isinstance(mini_result, dict):
+        confidence = mini_result.get('confidence')
+    if (ret_5m is not None and abs(ret_5m) >= ASYNC_CLAUDE_RET_5M_THRESHOLD
+            and confidence is not None and confidence < ASYNC_CLAUDE_CONFIDENCE_THRESHOLD):
+        return True, f'condition_A (ret_5m={ret_5m:.2f}%, confidence={confidence})'
+
+    # ── 조건B: 15분봉 3개 연속 ±1.0% 이상 ──
+    bar_15m = snapshot.get('bar_15m_returns', []) if snapshot else []
+    if len(bar_15m) >= 3 and all(
+            abs(b) >= ASYNC_CLAUDE_BAR_15M_THRESHOLD for b in bar_15m):
+        return True, f'condition_B (bar_15m={bar_15m})'
+
+    # ── 조건C: |news_event_score| >= 40 ──
+    news_score = scores.get('news_event_score', 0) if scores else 0
+    if abs(news_score) >= ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD:
+        return True, f'condition_C (news_score={news_score})'
+
+    return False, 'no condition met'
 
 
 def record_event_claude_call():

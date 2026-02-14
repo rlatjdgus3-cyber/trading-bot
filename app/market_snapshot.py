@@ -213,6 +213,14 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
     if len(closes) >= 16:
         ret_15m = (closes[-1] - closes[-16]) / closes[-16] * 100
 
+    # 15m bar individual returns (3 bars)
+    bar_15m_returns = []
+    if len(closes) >= 46:
+        bar1 = (closes[-1] - closes[-16]) / closes[-16] * 100    # 최근 15분
+        bar2 = (closes[-16] - closes[-31]) / closes[-31] * 100   # 직전 15분
+        bar3 = (closes[-31] - closes[-46]) / closes[-46] * 100   # 그 전 15분
+        bar_15m_returns = [round(bar1, 4), round(bar2, 4), round(bar3, 4)]
+
     # Recent candles for context (last 10)
     candles_1m = [
         {'ts': str(r[0]), 'o': float(r[1]), 'h': float(r[2]),
@@ -256,6 +264,7 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
             'ret_5m': round(ret_5m, 4) if ret_5m is not None else None,
             'ret_15m': round(ret_15m, 4) if ret_15m is not None else None,
         },
+        'bar_15m_returns': bar_15m_returns,
     }
 
 
