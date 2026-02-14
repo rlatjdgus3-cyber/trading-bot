@@ -22,6 +22,7 @@ import urllib.request
 import ccxt
 import psycopg2
 from dotenv import load_dotenv
+import report_formatter
 load_dotenv('/root/trading-bot/app/.env')
 
 POLL_SEC = 5
@@ -322,20 +323,11 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
               abs(fee_cost)))
     _update_trade_process_log(cur, signal_id, trade_budget_used_after=entry_pct)
 
-    pos_str = f'{pos_side} {pos_qty}' if pos_side else 'NONE'
-    sig_str = str(signal_id) if signal_id else 'N/A'
-    msg = (
-        f'[진입 체결 완료]\n'
-        f'- side: {direction}\n'
-        f'- 체결가: ${avg_price:,.1f}\n'
-        f'- 수량: {filled_qty} BTC\n'
-        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
-        f'- signal_id: {sig_str}\n'
-        f'- start_stage: {start_stage} ({entry_pct:.0f}%)\n'
-        f'- 남은 budget: {70 - entry_pct:.0f}% (stage{next_stage}~7)\n'
-        f'- 포지션 확인: {pos_str}\n'
-        f'- verification: order_filled\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('entry',
+        direction=direction, avg_price=avg_price, filled_qty=filled_qty,
+        fee_cost=fee_cost, fee_currency=fee_currency, signal_id=signal_id,
+        start_stage=start_stage, entry_pct=entry_pct, next_stage=next_stage,
+        pos_side=pos_side, pos_qty=pos_qty)
     _send_telegram(msg)
     log(f'ENTRY VERIFIED: {direction} qty={filled_qty} price={avg_price} signal={signal_id} start_stage={start_stage}')
 
@@ -392,18 +384,11 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
     if realized_pnl is not None and signal_id:
         _update_trade_process_log(cur, signal_id, pnl_after_trade=realized_pnl)
 
-    pnl_str = f'{realized_pnl:+.4f} USDT (net)' if realized_pnl is not None else 'N/A'
-    pos_str = f'{pos_side} {pos_qty}' if pos_side else 'NONE'
-    msg = (
-        f'[정리 체결 완료]\n'
-        f'- type: {order_type} {direction}\n'
-        f'- 체결가: ${avg_price:,.1f}\n'
-        f'- 수량: {filled_qty} BTC\n'
-        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
-        f'- PnL: {pnl_str}\n'
-        f'- 포지션 확인: {pos_str}\n'
-        f'- close_reason: {close_reason}\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('exit',
+        order_type=order_type, direction=direction, avg_price=avg_price,
+        filled_qty=filled_qty, fee_cost=fee_cost, fee_currency=fee_currency,
+        realized_pnl=realized_pnl, pos_side=pos_side, pos_qty=pos_qty,
+        close_reason=close_reason)
     _send_telegram(msg)
     log(f'EXIT VERIFIED: {order_type} {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
 
@@ -415,12 +400,9 @@ def _handle_timeout(cur, eid, order_id, order_type, direction, signal_id):
         WHERE id = %s;
     """, (eid,))
     _update_stage(cur, signal_id, 'ORDER_TIMEOUT')
-    msg = (
-        f'[주문 미체결 타임아웃]\n'
-        f'- order_type: {order_type} {direction}\n'
-        f'- order_id: {order_id}\n'
-        f'- {ORDER_TIMEOUT_SEC}초 내 체결 안 됨. 수동 확인 필요.\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('timeout',
+        order_type=order_type, direction=direction, order_id=order_id,
+        timeout_sec=ORDER_TIMEOUT_SEC)
     _send_telegram(msg)
     log(f'TIMEOUT: {order_type} {direction} order_id={order_id}')
 
@@ -432,12 +414,8 @@ def _handle_canceled(cur, eid, order_id, order_type, direction, signal_id):
         WHERE id = %s;
     """, (eid,))
     _update_stage(cur, signal_id, 'ORDER_CANCELED')
-    msg = (
-        f'[주문 취소됨]\n'
-        f'- order_type: {order_type} {direction}\n'
-        f'- order_id: {order_id}\n'
-        f'- 거래소에서 취소됨. 수동 확인 필요.\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('canceled',
+        order_type=order_type, direction=direction, order_id=order_id)
     _send_telegram(msg)
     log(f'CANCELED: {order_type} {direction} order_id={order_id}')
 
@@ -552,14 +530,11 @@ def _handle_add_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
             WHERE symbol = %s;
         """, (budget_used_pct, next_avail, new_mask, abs(fee_cost), SYMBOL))
 
-    msg = (
-        f'[추가 진입 체결] - {direction} ADD (stage {new_stage}/7)\n'
-        f'- 체결가: ${avg_price:,.1f}\n'
-        f'- 추가: {filled_qty} BTC\n'
-        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
-        f'- 총 포지션: {pos_side} {pos_qty} BTC\n'
-        f'- budget: {budget_used_pct:.0f}%/70% (잔여 {budget_remaining:.0f}%)\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('add',
+        direction=direction, avg_price=avg_price, filled_qty=filled_qty,
+        fee_cost=fee_cost, fee_currency=fee_currency, new_stage=new_stage,
+        pos_side=pos_side, pos_qty=pos_qty, budget_used_pct=budget_used_pct,
+        budget_remaining=budget_remaining)
     _send_telegram(msg)
     log(f'ADD VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={new_stage} budget={budget_used_pct:.0f}%')
 
@@ -600,17 +575,10 @@ def _handle_reduce_filled(ex, cur, eid, order_id, direction, filled_qty, avg_pri
     cur.execute('UPDATE position_state SET accumulated_entry_fee = %s WHERE symbol = %s;',
                 (remaining_fee, SYMBOL))
 
-    pnl_str = f'{realized_pnl:+.4f} USDT (net)' if realized_pnl is not None else 'N/A'
-    msg = (
-        f'[부분 축소 체결]\n'
-        f'- {direction} REDUCE\n'
-        f'- 체결가: ${avg_price:,.1f}\n'
-        f'- 축소: {filled_qty} BTC\n'
-        f'- 수수료: {fee_cost:.4f} {fee_currency}\n'
-        f'- PnL: {pnl_str}\n'
-        f'- 남은 포지션: {pos_side} {pos_qty} BTC\n'
-        f'- reason: {close_reason}\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('reduce',
+        direction=direction, avg_price=avg_price, filled_qty=filled_qty,
+        fee_cost=fee_cost, fee_currency=fee_currency, realized_pnl=realized_pnl,
+        pos_side=pos_side, pos_qty=pos_qty, close_reason=close_reason)
     _send_telegram(msg)
     log(f'REDUCE VERIFIED: {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
 
@@ -655,15 +623,10 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
 
     _sync_position_state(cur, None, 0)
 
-    pnl_str = f'{realized_pnl:+.4f} USDT (net)' if realized_pnl is not None else 'N/A'
-    msg = (
-        f'[리버스 정리 완료]\n'
-        f'- {direction} REVERSE_CLOSE\n'
-        f'- 체결가: ${avg_price:,.1f}\n'
-        f'- 수량: {filled_qty} BTC\n'
-        f'- PnL: {pnl_str}\n'
-        f'- 포지션 확인: {"NONE" if position_verified else f"{pos_side} {pos_qty}"}\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('reverse_close',
+        direction=direction, avg_price=avg_price, filled_qty=filled_qty,
+        realized_pnl=realized_pnl, position_verified=position_verified,
+        pos_side=pos_side, pos_qty=pos_qty)
     _send_telegram(msg)
     log(f'REVERSE_CLOSE VERIFIED: {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
 
@@ -714,13 +677,10 @@ def _handle_reverse_open_filled(ex, cur, eid, order_id, direction, filled_qty, a
               abs(fee_cost)))
 
     from_side = 'SHORT' if direction in ('LONG', 'long') else 'LONG'
-    msg = (
-        f'[리버스 진입 완료] - {from_side} -> {direction.upper()}\n'
-        f'- 체결가: ${avg_price:,.1f}\n'
-        f'- 수량: {filled_qty} BTC\n'
-        f'- 포지션: {pos_side} {pos_qty} BTC\n'
-        f'- budget: {entry_pct:.0f}%/70% (stage{start_stage}, 잔여 {70 - entry_pct:.0f}%)\n'
-        f'---\nroute=trade, intent=fill_notify, provider=fill_watcher')
+    msg = report_formatter.format_fill_notify('reverse_open',
+        direction=direction, avg_price=avg_price, filled_qty=filled_qty,
+        from_side=from_side, pos_side=pos_side, pos_qty=pos_qty,
+        entry_pct=entry_pct, start_stage=start_stage)
     _send_telegram(msg)
     log(f'REVERSE_OPEN VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={start_stage}')
 

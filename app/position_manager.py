@@ -24,6 +24,7 @@ import ccxt
 import psycopg2
 from dotenv import load_dotenv
 import test_utils
+import report_formatter
 load_dotenv('/root/trading-bot/app/.env')
 
 SYMBOL = 'BTC/USDT:USDT'
@@ -320,10 +321,8 @@ def _check_emergency(ctx=None):
 
 def _handle_emergency(cur=None, ctx=None, trigger=None):
     '''Handle emergency via Claude API. Returns action taken.'''
-    _send_telegram(
-        f'\U0001f6a8 급변 감지 -> Claude 분석 중\n'
-        f'- trigger: {trigger["type"]}\n'
-        f'- detail: {json.dumps(trigger["detail"], default=str)[:200]}')
+    _send_telegram(report_formatter.format_emergency_pre_alert(
+        trigger['type'], trigger.get('detail')))
 
     import attach_similar_events
     import save_claude_analysis
@@ -390,10 +389,8 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
     action = result.get('action') or result.get('recommended_action', 'HOLD')
 
     if action == 'HOLD':
-        _send_telegram(
-            f'[Claude] HOLD 판단 (risk={result.get("risk_level", "?")})\n'
-            f'- confidence: {result.get("confidence")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2]) or result.get("reason_code", "")}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            trigger['type'], 'HOLD', result))
         return 'HOLD'
 
     pos = ctx.get('position', {})
@@ -411,10 +408,8 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] REDUCE {reduce_pct}% 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            trigger['type'], 'REDUCE', result))
         return 'REDUCE'
 
     if action == 'CLOSE':
@@ -429,10 +424,8 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] CLOSE 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            trigger['type'], 'CLOSE', result))
         return 'CLOSE'
 
     if action == 'REVERSE':
@@ -446,10 +439,8 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] REVERSE 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            trigger['type'], 'REVERSE', result))
         return 'REVERSE'
 
     if action in ('OPEN_LONG', 'OPEN_SHORT'):
@@ -472,10 +463,8 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, action, execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] {action} stage={target_stage} 실행\n'
-            f'- risk: {result.get("risk_level")}\n'
-            f'- reason: {", ".join(result.get("reason_bullets", [])[:2])}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            trigger['type'], action, result))
         return action
 
     return 'HOLD'
@@ -487,10 +476,8 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     import save_claude_analysis
 
     trigger_types = [t.get('type', '?') for t in event_result.triggers]
-    _send_telegram(
-        f'Event trigger → Claude 분석\n'
-        f'triggers: {trigger_types}\n'
-        f'mode: {event_result.mode}')
+    _send_telegram(report_formatter.format_event_pre_alert(
+        trigger_types, event_result.mode))
 
     try:
         result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
@@ -556,9 +543,8 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
             action = 'HOLD'
 
     if action == 'HOLD':
-        _send_telegram(
-            f'[Event] HOLD (risk={result.get("risk_level", "?")})\n'
-            f'triggers: {trigger_types}')
+        _send_telegram(report_formatter.format_event_post_alert(
+            trigger_types, 'HOLD', result))
         return 'HOLD'
 
     if action == 'REDUCE':
@@ -573,7 +559,8 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] REDUCE {reduce_pct}%\n{reason_info}')
+        _send_telegram(report_formatter.format_event_post_alert(
+            trigger_types, 'REDUCE', result))
         return 'REDUCE'
 
     if action == 'CLOSE':
@@ -587,7 +574,8 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] CLOSE\n{reason_info}')
+        _send_telegram(report_formatter.format_event_post_alert(
+            trigger_types, 'CLOSE', result))
         return 'CLOSE'
 
     if action in ('OPEN_LONG', 'OPEN_SHORT'):
@@ -608,7 +596,8 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, action, execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] {action} stage={target_stage}\n{reason_info}')
+        _send_telegram(report_formatter.format_event_post_alert(
+            trigger_types, action, result))
         return 'OPEN'
 
     if action == 'REVERSE':
@@ -621,7 +610,8 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(f'[Event] REVERSE\n{reason_info}')
+        _send_telegram(report_formatter.format_event_post_alert(
+            trigger_types, 'REVERSE', result))
         return 'REVERSE'
 
     return 'HOLD'
@@ -630,10 +620,9 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
 def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     """Handle emergency via Claude API (snapshot-based). Returns action taken."""
     trigger_types = [t.get('type', '?') for t in event_result.triggers]
-    _send_telegram(
-        f'\U0001f6a8 긴급 감지 → Claude 분석\n'
-        f'triggers: {trigger_types}\n'
-        f'mode: EMERGENCY')
+    _send_telegram(report_formatter.format_emergency_pre_alert(
+        trigger_types[0] if trigger_types else 'event_emergency',
+        event_result.triggers[0] if event_result.triggers else {}))
 
     import attach_similar_events
     import save_claude_analysis
@@ -746,11 +735,11 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
         elif _et.is_duplicate_emergency_action(SYMBOL, 'REDUCE', pos_side):
             action = 'HOLD'
 
+    em_trigger_type = primary_trigger.get('type', 'event_emergency')
+
     if action == 'HOLD':
-        _send_telegram(
-            f'[Claude] HOLD 판단 (risk={result.get("risk_level", "?")})\n'
-            f'- confidence: {result.get("confidence")}\n'
-            f'- reason: {reason_info}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            em_trigger_type, 'HOLD', result))
         return 'HOLD'
 
     if action == 'REDUCE':
@@ -769,10 +758,8 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REDUCE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] REDUCE {reduce_pct}% 실행\n'
-            f'- risk: {result.get("risk_level", "?")}\n'
-            f'- reason: {reason_info}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            em_trigger_type, 'REDUCE', result))
         return 'REDUCE'
 
     if action == 'CLOSE':
@@ -790,10 +777,8 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'CLOSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] CLOSE 실행\n'
-            f'- risk: {result.get("risk_level", "?")}\n'
-            f'- reason: {reason_info}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            em_trigger_type, 'CLOSE', result))
         return 'CLOSE'
 
     if action in ('OPEN_LONG', 'OPEN_SHORT'):
@@ -818,9 +803,8 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, action, execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] {action} stage={target_stage} 실행\n'
-            f'- reason: {reason_info}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            em_trigger_type, action, result))
         return 'OPEN'
 
     if action == 'REVERSE':
@@ -837,10 +821,8 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
                 save_claude_analysis.create_pending_outcome(cur, ca_id, 'REVERSE', execution_queue_id=eq_id)
             except Exception:
                 traceback.print_exc()
-        _send_telegram(
-            f'[Claude] REVERSE 실행\n'
-            f'- risk: {result.get("risk_level", "?")}\n'
-            f'- reason: {reason_info}')
+        _send_telegram(report_formatter.format_emergency_post_alert(
+            em_trigger_type, 'REVERSE', result))
         return 'REVERSE'
 
     return 'HOLD'

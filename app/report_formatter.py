@@ -1,0 +1,593 @@
+"""
+report_formatter.py — 중앙 한국어 포매팅 모듈
+
+순수 포매팅 전용. DB/API/네트워크 호출 없음.
+어디서든 import 가능.
+"""
+import os
+
+# ── 한국어 번역 상수 ──────────────────────────────────────
+
+ACTION_KR = {
+    'HOLD': '유지',
+    'REDUCE': '부분 축소',
+    'CLOSE': '전량 정리',
+    'REVERSE': '반전',
+    'OPEN_LONG': 'LONG 진입',
+    'OPEN_SHORT': 'SHORT 진입',
+    'ADD': '추가 진입',
+    'ENTRY_POSSIBLE': '진입 가능',
+    'ABORT': '중단',
+}
+
+DIRECTION_KR = {
+    'UP': '상승',
+    'DOWN': '하락',
+    'NEUTRAL': '중립',
+    'up': '상승',
+    'down': '하락',
+    'neutral': '중립',
+}
+
+TRIGGER_KR = {
+    'rapid_price_move': '급격한 가격 변동',
+    'volume_spike': '거래량 급등',
+    'extreme_funding': '극단적 펀딩비',
+    'extreme_score': '극단적 스코어',
+    'price_move': '가격 변동',
+    'score_flip': '스코어 반전',
+    'regime_change': '시장 상태 전환',
+    'vol_spike': '거래량 급등',
+    'funding_extreme': '극단적 펀딩비',
+    'event_emergency': '긴급 이벤트',
+}
+
+RISK_KR = {
+    'HIGH': '높음',
+    'MEDIUM': '보통',
+    'LOW': '낮음',
+    'CRITICAL': '심각',
+}
+
+NEWS_MAGNITUDE_KR = {
+    'weak': '약',
+    'moderate': '보통',
+    'strong': '강',
+}
+
+DEBUG_MODE_PATH = '/root/trading-bot/app/.debug_mode'
+
+
+# ── 디버그 모드 관리 ─────────────────────────────────────
+
+def is_debug_on() -> bool:
+    """디버그 모드 ON 여부."""
+    try:
+        with open(DEBUG_MODE_PATH, 'r') as f:
+            return f.read().strip().lower() == 'on'
+    except Exception:
+        return False
+
+
+def set_debug_mode(on: bool) -> str:
+    """디버그 모드 설정. 결과 메시지 반환."""
+    try:
+        with open(DEBUG_MODE_PATH, 'w') as f:
+            f.write('on' if on else 'off')
+        state = 'ON' if on else 'OFF'
+        return f'디버그 모드: {state}'
+    except Exception as e:
+        return f'디버그 모드 설정 실패: {e}'
+
+
+def _debug_line(meta: dict = None) -> str:
+    """디버그 푸터. 디버그 ON일 때만 내용 표시."""
+    if not is_debug_on():
+        return ''
+    if not meta:
+        return ''
+    parts = []
+    if meta.get('intent_name'):
+        parts.append(f"intent={meta['intent_name']}")
+    if meta.get('route'):
+        parts.append(f"route={meta['route']}")
+    if meta.get('provider'):
+        parts.append(f"provider={meta['provider']}")
+    if meta.get('call_type'):
+        parts.append(f"call_type={meta['call_type']}")
+    if meta.get('cost'):
+        parts.append(f"cost=${meta['cost']:.4f}")
+    if meta.get('latency'):
+        parts.append(f"latency={meta['latency']}ms")
+    if meta.get('model'):
+        parts.append(f"model={meta['model']}")
+    if not parts:
+        return ''
+    return '\n─\n' + ' | '.join(parts)
+
+
+# ── 유틸리티 ─────────────────────────────────────────────
+
+def _kr_action(action: str) -> str:
+    """액션을 한국어로 변환. 원문 병기."""
+    kr = ACTION_KR.get(action, action)
+    if kr == action:
+        return action
+    return f'{action} ({kr})'
+
+
+def _kr_trigger(trigger_type: str) -> str:
+    """트리거 타입을 한국어로 변환."""
+    return TRIGGER_KR.get(trigger_type, trigger_type)
+
+
+def _kr_risk(risk: str) -> str:
+    """위험도를 한국어로 변환."""
+    if not risk:
+        return '?'
+    return RISK_KR.get(risk.upper(), risk)
+
+
+def _kr_direction(direction: str) -> str:
+    """방향을 한국어로 변환."""
+    if not direction:
+        return '?'
+    return DIRECTION_KR.get(direction, direction)
+
+
+def _safe_float(val, default=0.0):
+    """안전한 float 변환."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val, default=0):
+    """안전한 int 변환."""
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_price(price):
+    """가격 포매팅."""
+    p = _safe_float(price)
+    if p == 0:
+        return '$0'
+    return f'${p:,.1f}'
+
+
+def _format_pnl(pnl):
+    """PnL 포매팅."""
+    if pnl is None:
+        return 'N/A'
+    p = _safe_float(pnl)
+    return f'{p:+.4f} USDT'
+
+
+# ── 전략 보고 ────────────────────────────────────────────
+
+def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
+                           scores, pos_state, details, news_items,
+                           watch_kw, execute_status, ai_meta):
+    """전략 보고 전체 포매팅."""
+    parsed = parsed or {}
+    scores = scores or {}
+    pos_state = pos_state or {}
+    details = details or {}
+    news_items = news_items or []
+    watch_kw = watch_kw or []
+    ai_meta = ai_meta or {}
+
+    claude_action = claude_action or 'HOLD'
+    total = _safe_float(scores.get('total_score'))
+    dominant = scores.get('dominant_side', 'LONG')
+    stage = _safe_int(scores.get('stage', 1))
+    tech = _safe_float(scores.get('tech_score'))
+    pos_score = _safe_float(scores.get('position_score'))
+    regime = _safe_float(scores.get('regime_score'))
+    news_s = _safe_float(scores.get('news_event_score'))
+
+    lines = []
+
+    # ── [📌 요약] ──
+    lines.append('[📌 요약]')
+    lines.append(f'- 상태: {_kr_action(claude_action)}')
+
+    if pos_state and pos_state.get('side'):
+        ps_side = (pos_state['side'] or '').upper() or 'NONE'
+        qty = _safe_float(pos_state.get('total_qty'))
+        entry = _safe_float(pos_state.get('avg_entry_price'))
+        lines.append(f'- 포지션: {ps_side} {qty} BTC @ {_format_price(entry)}')
+    else:
+        lines.append('- 포지션: 없음')
+
+    lines.append(f'- 신호: {dominant}, stage {stage}, 총점 {total:+.1f}')
+
+    confidence = parsed.get('confidence')
+    reason_code = parsed.get('reason_code', '')
+    if confidence is not None:
+        lines.append(f'- 확신도: {confidence}')
+    if reason_code:
+        lines.append(f'- 근거: {reason_code}')
+
+    # ── [📊 점수 상세] ──
+    lines.append('')
+    lines.append('[📊 점수 상세]')
+    lines.append(f'- TECH: {tech:+.0f} | POS: {pos_score:+.0f} | '
+                 f'REGIME: {regime:+.0f} | NEWS: {news_s:+.0f}')
+    lines.append(f'- 엔진 참조: {_kr_action(engine_action or "HOLD")}')
+    if engine_reason:
+        lines.append(f'  ({engine_reason})')
+
+    # ── [📰 뉴스 요약] ──
+    lines.append('')
+    lines.append('[📰 뉴스 요약]')
+    if not news_items:
+        lines.append('- 최근 6시간 고영향 뉴스 없음')
+    else:
+        for i, n in enumerate(news_items[:3], 1):
+            impact = _safe_int(n.get('impact_score'))
+            title = (n.get('title') or '')[:80]
+            source = n.get('source', '')
+            ts = (n.get('ts') or '')[:16]
+            summary = n.get('summary', '')
+            direction_tag = ''
+            if summary:
+                sl = summary.lower()
+                if sl.startswith('[up]') or sl.startswith('[bullish]'):
+                    direction_tag = '상승'
+                elif sl.startswith('[down]') or sl.startswith('[bearish]'):
+                    direction_tag = '하락'
+                elif sl.startswith('[neutral]'):
+                    direction_tag = '중립'
+            dir_str = f' / {direction_tag}' if direction_tag else ''
+            lines.append(f'{i}) ({impact}/10) {title} / {source} / {ts}{dir_str}')
+
+        # Watchlist 매칭
+        matched = set()
+        for n in news_items:
+            text_lower = ((n.get('title') or '') + ' ' + (n.get('summary') or '')).lower()
+            for kw in watch_kw:
+                if kw in text_lower:
+                    matched.add(kw)
+        if matched:
+            lines.append(f'- watchlist 매칭: {", ".join(sorted(matched))}')
+        else:
+            lines.append('- watchlist 매칭: 없음')
+
+    # ── [🧠 판단 근거] (뉴스→결정 영향) ──
+    lines.append('')
+    lines.append('[🧠 판단 근거]')
+    news_score = _safe_float(scores.get('news_event_score'))
+    guarded = scores.get('news_event_guarded', False)
+    if guarded or news_score == 0:
+        lines.append(f'- 뉴스 영향: 없음 (score={news_score:+.0f}'
+                     f'{", 가드 적용" if guarded else ""})')
+        lines.append('- 뉴스→결정: 변경 없음')
+    else:
+        direction = '상승' if news_score > 0 else '하락'
+        mag_abs = abs(news_score)
+        magnitude = '약' if mag_abs < 20 else ('보통' if mag_abs < 50 else '강')
+        lines.append(f'- 뉴스 영향: {magnitude} {direction} (score={news_score:+.0f})')
+        if claude_action != engine_action:
+            lines.append(f'- 뉴스→결정: {_kr_action(engine_action or "HOLD")} → '
+                         f'{_kr_action(claude_action)} 변경')
+        else:
+            lines.append('- 뉴스→결정: 변경 없음')
+
+    # ── [🎯 핵심 레벨] ──
+    sl_dist = details.get('sl_dist_pct')
+    sl_pct = details.get('stop_loss_pct', 2.0)
+    if sl_dist is not None:
+        lines.append('')
+        lines.append('[🎯 핵심 레벨]')
+        lines.append(f'- 손절: -{sl_pct}% | 현재 거리: {sl_dist:+.1f}%')
+
+    # ── [⚠ 실행] ──
+    if claude_action == 'REDUCE':
+        reduce_pct = parsed.get('reduce_pct', 0)
+        lines.append('')
+        lines.append(f'[⚠ 실행] {_kr_action(claude_action)} {reduce_pct}%')
+    elif claude_action in ('OPEN_LONG', 'OPEN_SHORT'):
+        target_stage = parsed.get('target_stage', 1)
+        lines.append('')
+        lines.append(f'[⚠ 실행] {_kr_action(claude_action)} stage={target_stage}')
+
+    lines.append(f'- 실행: {execute_status or "NO"}')
+
+    # ── 디버그 정보 ──
+    debug = _debug_line({
+        'provider': ai_meta.get('model_provider', ''),
+        'cost': ai_meta.get('estimated_cost_usd', 0),
+        'latency': ai_meta.get('api_latency_ms', 0),
+        'model': ai_meta.get('model', ''),
+    })
+    if debug:
+        lines.append(debug)
+
+    return '\n'.join(lines)
+
+
+# ── 전략 판단 알림 ───────────────────────────────────────
+
+def format_decision_alert(action, parsed, engine_action, scores, pos_state):
+    """전략 판단 알림 포매팅."""
+    parsed = parsed or {}
+    scores = scores or {}
+    pos_state = pos_state or {}
+    action = action or 'HOLD'
+
+    total = _safe_float(scores.get('total_score'))
+    side = (pos_state.get('side') or 'none').upper() if pos_state.get('side') else 'NONE'
+    qty = _safe_float(pos_state.get('total_qty'))
+
+    lines = [
+        f'[📋 전략 판단]',
+        f'- Claude: {_kr_action(action)}',
+        f'- 확신도: {parsed.get("confidence", "?")}',
+        f'- 근거: {parsed.get("reason_code", "?")}',
+        f'- 엔진 참조: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}',
+        f'- 포지션: {side} {qty} BTC',
+    ]
+    return '\n'.join(lines)
+
+
+# ── 실행 대기열 알림 ──────────────────────────────────────
+
+def format_enqueue_alert(eq_id, action, parsed, pos_state):
+    """실행 대기열 알림 포매팅."""
+    parsed = parsed or {}
+    action = action or '?'
+
+    qty_info = ''
+    if action == 'REDUCE':
+        qty_info = f'축소 {parsed.get("reduce_pct", 0)}%'
+    elif action in ('OPEN_LONG', 'OPEN_SHORT'):
+        qty_info = f'stage={parsed.get("target_stage", 1)}'
+
+    lines = [
+        f'[⏳ 실행 대기]',
+        f'- 액션: {_kr_action(action)}',
+        f'- 대기열 ID: {eq_id}',
+    ]
+    if qty_info:
+        lines.append(f'- 상세: {qty_info}')
+    lines.append(f'- 근거: {parsed.get("reason_code", "?")}')
+    return '\n'.join(lines)
+
+
+# ── 긴급 알림 ────────────────────────────────────────────
+
+def format_emergency_pre_alert(trigger_type, trigger_detail):
+    """긴급 감지 사전 알림."""
+    trigger_detail = trigger_detail or {}
+    detail_str = ''
+    if isinstance(trigger_detail, dict):
+        parts = []
+        for k, v in list(trigger_detail.items())[:4]:
+            parts.append(f'{k}={v}')
+        detail_str = ', '.join(parts)
+    else:
+        detail_str = str(trigger_detail)[:200]
+
+    return (
+        f'🚨 긴급 감지 → Claude 분석 중\n'
+        f'- 유형: {_kr_trigger(trigger_type or "unknown")}\n'
+        f'- 상세: {detail_str}'
+    )
+
+
+def format_emergency_post_alert(trigger_type, action, result):
+    """긴급 조치 결과 알림."""
+    result = result or {}
+    action = action or 'HOLD'
+    risk = _kr_risk(result.get('risk_level', ''))
+    confidence = result.get('confidence', '?')
+
+    reason_bullets = result.get('reason_bullets', [])
+    reason_code = result.get('reason_code', '')
+    reason = ', '.join(reason_bullets[:2]) if reason_bullets else reason_code
+
+    lines = [f'🚨 긴급 조치: {_kr_action(action)}']
+    lines.append(f'- 위험도: {risk}')
+    lines.append(f'- 확신도: {confidence}')
+    if reason:
+        lines.append(f'- 근거: {reason}')
+
+    if action == 'REDUCE':
+        reduce_pct = result.get('reduce_pct', 50)
+        lines.append(f'- 축소: {reduce_pct}%')
+    elif action in ('OPEN_LONG', 'OPEN_SHORT'):
+        target_stage = result.get('target_stage', 1)
+        lines.append(f'- stage: {target_stage}')
+
+    return '\n'.join(lines)
+
+
+# ── 이벤트 알림 ──────────────────────────────────────────
+
+def format_event_pre_alert(trigger_types, mode):
+    """이벤트 감지 사전 알림."""
+    trigger_types = trigger_types or []
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+    return (
+        f'📡 이벤트 감지 → Claude 분석\n'
+        f'- 트리거: {", ".join(kr_types) or "?"}\n'
+        f'- 모드: {mode or "?"}'
+    )
+
+
+def format_event_post_alert(trigger_types, action, result):
+    """이벤트 조치 결과 알림."""
+    result = result or {}
+    action = action or 'HOLD'
+    trigger_types = trigger_types or []
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+
+    risk = _kr_risk(result.get('risk_level', ''))
+    reason_bullets = result.get('reason_bullets', [])
+    reason_code = result.get('reason_code', '')
+    reason = ', '.join(reason_bullets[:2]) if reason_bullets else reason_code
+
+    lines = [f'📡 이벤트 조치: {_kr_action(action)}']
+    lines.append(f'- 트리거: {", ".join(kr_types) or "?"}')
+    if risk and risk != '?':
+        lines.append(f'- 위험도: {risk}')
+    if reason:
+        lines.append(f'- 근거: {reason}')
+
+    if action == 'REDUCE':
+        reduce_pct = result.get('reduce_pct', 50)
+        lines.append(f'- 축소: {reduce_pct}%')
+    elif action in ('OPEN_LONG', 'OPEN_SHORT'):
+        target_stage = result.get('target_stage', 1)
+        lines.append(f'- stage: {target_stage}')
+
+    return '\n'.join(lines)
+
+
+# ── 체결 알림 ────────────────────────────────────────────
+
+def format_fill_notify(fill_type, **kwargs):
+    """체결 알림 포매팅 (8종).
+
+    fill_type: entry, exit, timeout, canceled, add, reduce, reverse_close, reverse_open
+    """
+    if fill_type == 'entry':
+        return _fill_entry(**kwargs)
+    elif fill_type == 'exit':
+        return _fill_exit(**kwargs)
+    elif fill_type == 'timeout':
+        return _fill_timeout(**kwargs)
+    elif fill_type == 'canceled':
+        return _fill_canceled(**kwargs)
+    elif fill_type == 'add':
+        return _fill_add(**kwargs)
+    elif fill_type == 'reduce':
+        return _fill_reduce(**kwargs)
+    elif fill_type == 'reverse_close':
+        return _fill_reverse_close(**kwargs)
+    elif fill_type == 'reverse_open':
+        return _fill_reverse_open(**kwargs)
+    return f'[체결 알림] 유형: {fill_type}'
+
+
+def _fill_entry(direction='', avg_price=0, filled_qty=0, fee_cost=0,
+                fee_currency='', signal_id=None, start_stage=1,
+                entry_pct=10, next_stage=2, pos_side=None, pos_qty=0,
+                **_extra):
+    pos_str = f'{pos_side} {pos_qty} BTC' if pos_side else 'NONE'
+    sig_str = str(signal_id) if signal_id else 'N/A'
+    budget_remain = 70 - _safe_float(entry_pct)
+    return (
+        f'✅ 진입 체결 완료\n'
+        f'- 방향: {(direction or "?").upper()}\n'
+        f'- 체결가: {_format_price(avg_price)}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 수수료: {_safe_float(fee_cost):.4f} {fee_currency}\n'
+        f'- 시그널: {sig_str}\n'
+        f'- 단계: stage {start_stage} ({_safe_float(entry_pct):.0f}%)\n'
+        f'- 잔여 예산: {budget_remain:.0f}% (stage{next_stage}~7)\n'
+        f'- 포지션: {pos_str}'
+    )
+
+
+def _fill_exit(order_type='', direction='', avg_price=0, filled_qty=0,
+               fee_cost=0, fee_currency='', realized_pnl=None,
+               pos_side=None, pos_qty=0, close_reason='', **_extra):
+    pos_str = f'{pos_side} {pos_qty} BTC' if pos_side else 'NONE'
+    return (
+        f'✅ 정리 체결 완료\n'
+        f'- 유형: {order_type} {(direction or "").upper()}\n'
+        f'- 체결가: {_format_price(avg_price)}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 수수료: {_safe_float(fee_cost):.4f} {fee_currency}\n'
+        f'- 손익: {_format_pnl(realized_pnl)}\n'
+        f'- 포지션: {pos_str}\n'
+        f'- 사유: {close_reason or "N/A"}'
+    )
+
+
+def _fill_timeout(order_type='', direction='', order_id='',
+                  timeout_sec=60, **_extra):
+    return (
+        f'⏰ 주문 미체결 타임아웃\n'
+        f'- 유형: {order_type} {(direction or "").upper()}\n'
+        f'- 주문ID: {order_id}\n'
+        f'- {timeout_sec}초 내 체결 안 됨\n'
+        f'- 수동 확인 필요'
+    )
+
+
+def _fill_canceled(order_type='', direction='', order_id='', **_extra):
+    return (
+        f'❌ 주문 취소됨\n'
+        f'- 유형: {order_type} {(direction or "").upper()}\n'
+        f'- 주문ID: {order_id}\n'
+        f'- 거래소에서 취소됨\n'
+        f'- 수동 확인 필요'
+    )
+
+
+def _fill_add(direction='', avg_price=0, filled_qty=0, fee_cost=0,
+              fee_currency='', new_stage='?', pos_side=None, pos_qty=0,
+              budget_used_pct=0, budget_remaining=70, **_extra):
+    return (
+        f'✅ 추가 진입 체결 — {(direction or "?").upper()} ADD (stage {new_stage}/7)\n'
+        f'- 체결가: {_format_price(avg_price)}\n'
+        f'- 추가: {filled_qty} BTC\n'
+        f'- 수수료: {_safe_float(fee_cost):.4f} {fee_currency}\n'
+        f'- 총 포지션: {pos_side} {pos_qty} BTC\n'
+        f'- 예산: {_safe_float(budget_used_pct):.0f}%/70% '
+        f'(잔여 {_safe_float(budget_remaining):.0f}%)'
+    )
+
+
+def _fill_reduce(direction='', avg_price=0, filled_qty=0, fee_cost=0,
+                 fee_currency='', realized_pnl=None, pos_side=None,
+                 pos_qty=0, close_reason='', **_extra):
+    return (
+        f'✅ 부분 축소 체결\n'
+        f'- {(direction or "?").upper()} REDUCE\n'
+        f'- 체결가: {_format_price(avg_price)}\n'
+        f'- 축소: {filled_qty} BTC\n'
+        f'- 수수료: {_safe_float(fee_cost):.4f} {fee_currency}\n'
+        f'- 손익: {_format_pnl(realized_pnl)}\n'
+        f'- 남은 포지션: {pos_side} {pos_qty} BTC\n'
+        f'- 사유: {close_reason or "N/A"}'
+    )
+
+
+def _fill_reverse_close(direction='', avg_price=0, filled_qty=0,
+                         realized_pnl=None, position_verified=False,
+                         pos_side=None, pos_qty=0, **_extra):
+    pos_str = 'NONE' if position_verified else f'{pos_side} {pos_qty}'
+    return (
+        f'✅ 리버스 정리 완료\n'
+        f'- {(direction or "?").upper()} REVERSE_CLOSE\n'
+        f'- 체결가: {_format_price(avg_price)}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 손익: {_format_pnl(realized_pnl)}\n'
+        f'- 포지션: {pos_str}'
+    )
+
+
+def _fill_reverse_open(direction='', avg_price=0, filled_qty=0,
+                        from_side='', pos_side=None, pos_qty=0,
+                        entry_pct=10, start_stage=1, **_extra):
+    budget_remain = 70 - _safe_float(entry_pct)
+    return (
+        f'✅ 리버스 진입 완료 — {from_side} → {(direction or "?").upper()}\n'
+        f'- 체결가: {_format_price(avg_price)}\n'
+        f'- 수량: {filled_qty} BTC\n'
+        f'- 포지션: {pos_side} {pos_qty} BTC\n'
+        f'- 예산: {_safe_float(entry_pct):.0f}%/70% '
+        f'(stage{start_stage}, 잔여 {budget_remain:.0f}%)'
+    )

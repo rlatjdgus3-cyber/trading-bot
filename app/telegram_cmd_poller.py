@@ -14,6 +14,7 @@ sys.path.insert(0, "/root/trading-bot/app")
 import gpt_router
 import local_query_executor
 import emergency_detector
+import report_formatter
 
 ENV_PATH = "/root/trading-bot/app/telegram_cmd.env"
 ENV_FALLBACKS = [
@@ -104,6 +105,7 @@ HELP_TEXT = (
     "  /risk MODE 리스크 모드 (conservative/normal/aggressive)\n"
     "  /keywords  워치 키워드 목록/관리\n"
     "  /force     쿨다운 무시 + Claude 강제 전략 분석\n"
+    "  /debug     디버그 모드 토글 (on/off)\n"
     "\n"
     "💬 자연어 예시\n"
     "  상태 보여줘\n"
@@ -494,101 +496,6 @@ def _fetch_news_summary(cur):
         _log(f'_fetch_news_summary error: {e}')
         return []
 
-
-def _build_news_section(news_items, scores, watch_keywords):
-    """Build [NEWS SUMMARY] and [NEWS->DECISION TRACE] sections."""
-    lines = ['', '[NEWS SUMMARY]']
-
-    if not news_items:
-        lines.append('- 최근 6시간 고영향 뉴스 없음')
-    else:
-        # Top 3 news
-        for i, n in enumerate(news_items[:3], 1):
-            ts_short = n['ts'][:16] if len(n['ts']) >= 16 else n['ts']
-            lines.append(
-                f'{i}. [{n["impact_score"]}/10] {n["title"][:80]}'
-                f'\n   ({n["source"]}, {ts_short})')
-            # Summary direction
-            summary = n.get('summary', '')
-            if summary:
-                direction_tag = ''
-                sl = summary.lower()
-                if sl.startswith('[up]') or sl.startswith('[bullish]'):
-                    direction_tag = 'UP'
-                elif sl.startswith('[down]') or sl.startswith('[bearish]'):
-                    direction_tag = 'DOWN'
-                elif sl.startswith('[neutral]'):
-                    direction_tag = 'NEUTRAL'
-                if direction_tag:
-                    lines.append(f'   direction: {direction_tag}')
-
-        # Keyword matching
-        matched = set()
-        for n in news_items:
-            text_lower = (n['title'] + ' ' + n.get('summary', '')).lower()
-            for kw in watch_keywords:
-                if kw in text_lower:
-                    matched.add(kw)
-        if matched:
-            lines.append(f'- watchlist 매칭: {", ".join(sorted(matched))}')
-        else:
-            lines.append('- watchlist 매칭: 없음')
-
-    # news_event_score + reason
-    news_score = scores.get('news_event_score', 0)
-    guarded = scores.get('news_event_guarded', False)
-    news_ctx = scores.get('context', {}).get('news_event', {})
-    sentiment = news_ctx.get('recent_sentiment', 0)
-    cat_bias = news_ctx.get('category_bias', 0)
-    evt_sim = news_ctx.get('event_similarity', 0)
-
-    score_reason = (f'sentiment={sentiment:+d} category={cat_bias:+d} '
-                    f'similarity={evt_sim:+d}')
-    guard_note = ' (GUARDED→0: tech/pos 약세)' if guarded else ''
-    lines.append(f'- news_event_score: {news_score:+d}{guard_note}')
-    lines.append(f'  근거: {score_reason}')
-
-    # Impact path (simple inference)
-    if news_items:
-        cats = set()
-        for n in news_items[:5]:
-            text_lower = (n['title'] + ' ' + n.get('summary', '')).lower()
-            if any(k in text_lower for k in ('fed', 'rate', 'cpi', 'fomc', 'powell', 'inflation')):
-                cats.add('금리')
-            if any(k in text_lower for k in ('dollar', 'usd', 'dxy')):
-                cats.add('달러')
-            if any(k in text_lower for k in ('war', 'conflict', 'sanctions', 'geopolit')):
-                cats.add('지정학')
-            if any(k in text_lower for k in ('etf', 'sec', 'regulation', 'approval', 'ban')):
-                cats.add('규제')
-            if any(k in text_lower for k in ('tariff', 'trade war', 'china')):
-                cats.add('무역')
-            if any(k in text_lower for k in ('nasdaq', 'sp500', 'stocks', 'equity')):
-                cats.add('주식')
-        if cats:
-            path = ' -> '.join(sorted(cats))
-            lines.append(f'- impact_path: {path} -> BTC')
-
-    return '\n'.join(lines)
-
-
-def _build_news_decision_trace(claude_action, engine_action, news_score, guarded):
-    """Build [NEWS->DECISION TRACE] one-liner."""
-    if guarded or news_score == 0:
-        return ('\n[NEWS->DECISION TRACE]\n'
-                f'- 뉴스 영향: 없음 (score={news_score:+d}'
-                f'{", guarded" if guarded else ""}). '
-                f'액션 변경 없음.')
-    direction = 'bullish' if news_score > 0 else 'bearish'
-    magnitude = 'weak' if abs(news_score) < 20 else ('moderate' if abs(news_score) < 50 else 'strong')
-    changed = claude_action != engine_action
-    if changed:
-        return ('\n[NEWS->DECISION TRACE]\n'
-                f'- 뉴스 영향: {magnitude} {direction} (score={news_score:+d}). '
-                f'뉴스 반영으로 engine={engine_action} -> claude={claude_action} 변경됨.')
-    return ('\n[NEWS->DECISION TRACE]\n'
-            f'- 뉴스 영향: {magnitude} {direction} (score={news_score:+d}). '
-            f'액션 변경 없음 (claude={claude_action}).')
 
 
 def _evaluate_strategy_action(scores, pos_state):
@@ -1213,16 +1120,9 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
 def _send_decision_alert(action, parsed, engine_action, scores, pos_state):
     """[DECISION] Claude final JSON summary via Telegram."""
     try:
-        side = pos_state.get('side', 'none') or 'none'
-        qty = pos_state.get('total_qty', 0)
-        total = scores.get('total_score', 0)
-        send_message(
-            _load_tg_token(), _load_tg_chat_id(),
-            f'[DECISION] Claude: {action}\n'
-            f'confidence={parsed.get("confidence", 0)} '
-            f'reason={parsed.get("reason_code", "?")}\n'
-            f'engine_ref={engine_action} | score={total:+.1f}\n'
-            f'pos={side} {qty}')
+        msg = report_formatter.format_decision_alert(
+            action, parsed, engine_action, scores, pos_state)
+        send_message(_load_tg_token(), _load_tg_chat_id(), msg)
     except Exception as e:
         _log(f'_send_decision_alert error: {e}')
 
@@ -1230,15 +1130,9 @@ def _send_decision_alert(action, parsed, engine_action, scores, pos_state):
 def _send_enqueue_alert(eq_id, action, parsed, pos_state):
     """[ENQUEUE] Execution queue push alert via Telegram."""
     try:
-        qty_info = ''
-        if action == 'REDUCE':
-            qty_info = f'reduce_pct={parsed.get("reduce_pct", 0)}'
-        elif action in ('OPEN_LONG', 'OPEN_SHORT'):
-            qty_info = f'stage={parsed.get("target_stage", 1)}'
-        send_message(
-            _load_tg_token(), _load_tg_chat_id(),
-            f'[ENQUEUE] eq_id={eq_id} | {action} | {qty_info}\n'
-            f'reason={parsed.get("reason_code", "?")}')
+        msg = report_formatter.format_enqueue_alert(
+            eq_id, action, parsed, pos_state)
+        send_message(_load_tg_token(), _load_tg_chat_id(), msg)
     except Exception as e:
         _log(f'_send_enqueue_alert error: {e}')
 
@@ -1366,64 +1260,17 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             news_s = scores.get('news_event_score', 0)
             price = scores.get('price') or 0
 
-            lines = [
-                '=== 전략 평가 (Claude Execution Authority) ===',
-                f'CLAUDE ACTION: {claude_action}',
-                f'confidence={parsed.get("confidence", 0)} | '
-                f'reason={parsed.get("reason_code", "?")}',
-                f'ENGINE REF: {engine_action} ({engine_reason})',
-                f'SCORE: {total:+.1f} ({dominant} stage {stage})',
-                f'  TECH: {tech:+.0f} | POS: {pos_score:+.0f} | REGIME: {regime:+.0f} | NEWS: {news_s:+.0f}',
-            ]
+            result = report_formatter.format_strategy_report(
+                claude_action, parsed, engine_action, engine_reason,
+                scores, pos_state, details, news_items,
+                watch_kw, execute_status, ai_meta)
 
-            if pos_state:
-                ps_side = pos_state.get('side', '?')
-                if ps_side:
-                    ps_side = ps_side.upper()
-                else:
-                    ps_side = 'NONE'
-                qty = pos_state.get('total_qty', 0)
-                entry = pos_state.get('avg_entry_price', 0)
-                lines.append(f'POSITION: {ps_side} {qty} BTC @ ${entry:,.1f}')
-                sl_dist = details.get('sl_dist_pct')
-                sl_pct = details.get('stop_loss_pct', 2.0)
-                if sl_dist is not None:
-                    lines.append(f'STOP-LOSS: {sl_dist:+.1f}% (limit -{sl_pct}%)')
-            else:
-                lines.append('POSITION: none')
-
-            if claude_action == 'REDUCE':
-                lines.append(f'REDUCE: {parsed.get("reduce_pct", 0)}%')
-            elif claude_action in ('OPEN_LONG', 'OPEN_SHORT'):
-                lines.append(f'TARGET STAGE: {parsed.get("target_stage", 1)}')
-
-            lines.append(f'EXECUTE: {execute_status}')
-
-            # NEWS SUMMARY section
-            news_section_text = _build_news_section(news_items, scores, watch_kw)
-            lines.append(news_section_text)
-
-            # NEWS->DECISION TRACE
-            news_trace = _build_news_decision_trace(
-                claude_action, engine_action,
-                scores.get('news_event_score', 0),
-                scores.get('news_event_guarded', False))
-            lines.append(news_trace)
-
-            header = '\n'.join(lines)
-
-            # Provider label
+            # Provider label for return tuple
             if ai_meta.get('fallback_used'):
-                ai_label = 'Claude (denied)' if no_fallback else 'Claude (fallback)'
                 provider = 'claude(denied)'
             else:
                 cost = ai_meta.get('estimated_cost_usd', 0)
-                latency = ai_meta.get('api_latency_ms', 0)
-                ai_label = f'Claude (${cost:.4f}, {latency}ms)'
                 provider = f'anthropic (${cost:.4f})'
-
-            result = header
-            result += f'\n─ {ai_label}'
 
             # Save advisory
             scores_summary = {
@@ -1734,12 +1581,13 @@ def _handle_directive_intent(intent, text):
 
 def _footer(intent_name: str, route: str, provider: str,
             call_type: str = '', bypass: bool = False, cost: float = 0.0) -> str:
-    if provider.startswith('anthropic') or call_type in ('USER', 'EMERGENCY'):
-        ct_str = f' {call_type} |' if call_type else ''
-        bp_str = f' bypass={str(bypass).lower()} |' if call_type else ''
-        cost_str = f' cost=${cost:.4f}' if cost else ''
-        return f"\n─\n[{intent_name}]{ct_str} Claude used |{bp_str}{cost_str} {provider}"
-    return f"\n─\n[{intent_name}] route={route} provider={provider}"
+    return report_formatter._debug_line({
+        'intent_name': intent_name,
+        'route': route,
+        'provider': provider,
+        'call_type': call_type,
+        'cost': cost,
+    })
 
 def handle_command(text: str) -> str:
     t = (text or "").strip()
@@ -1762,7 +1610,16 @@ def handle_command(text: str) -> str:
         args_text = t[len('/keywords'):].strip()
         return _handle_directive_command('WATCH_KEYWORDS', _parse_kw_args(args_text)) + _footer('keywords', 'local', 'local')
 
-    # 1c. /force — cooldown bypass, Claude forced, no fallback
+    # 1c. /debug — toggle debug mode
+    if t == '/debug on':
+        return report_formatter.set_debug_mode(True)
+    if t == '/debug off':
+        return report_formatter.set_debug_mode(False)
+    if t == '/debug':
+        state = 'ON' if report_formatter.is_debug_on() else 'OFF'
+        return f'디버그 모드: {state}\n사용법: /debug on 또는 /debug off'
+
+    # 1d. /force — cooldown bypass, Claude forced, no fallback
     if t == '/force' or t.startswith('/force '):
         force_text = t[len('/force'):].strip() or '지금 BTC 전략 분석해줘'
         _log(f'/force command: call_type=USER, text={force_text[:50]}')
