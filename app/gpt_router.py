@@ -327,12 +327,18 @@ def _keyword_fallback(text: str) -> dict:
         return _add_legacy_fields({"type": "COMMAND", "intent": "reverse_position",
                 "needs_confirmation": True, "confidence": 0.7, "_fallback": True})
 
-    if any(x in t for x in ["일시정지", "멈춰", "stop", "pause", "정지"]) and any(
-            x in t for x in ["트레이딩", "매매", "자동", "trading", "봇", ""]):
+    if any(x in t for x in ["일시정지", "멈춰", "pause"]) and any(
+            x in t for x in ["트레이딩", "매매", "자동", "trading", "봇"]):
         return _add_legacy_fields({"type": "COMMAND", "intent": "toggle_trading",
                 "confidence": 0.7, "_fallback": True})
-    if any(x in t for x in ["재개", "시작", "resume", "켜"]) and any(
-            x in t for x in ["트레이딩", "매매", "자동", "trading", "봇", ""]):
+    if any(x in t for x in ["트레이딩 정지", "매매 정지", "trading stop", "자동매매 stop"]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "toggle_trading",
+                "confidence": 0.7, "_fallback": True})
+    if any(x in t for x in ["재개", "resume"]) and any(
+            x in t for x in ["트레이딩", "매매", "자동", "trading", "봇"]):
+        return _add_legacy_fields({"type": "COMMAND", "intent": "toggle_trading",
+                "confidence": 0.7, "_fallback": True})
+    if any(x in t for x in ["매매 시작", "트레이딩 시작", "자동매매 켜", "trading on"]):
         return _add_legacy_fields({"type": "COMMAND", "intent": "toggle_trading",
                 "confidence": 0.7, "_fallback": True})
 
@@ -383,7 +389,8 @@ def _keyword_fallback(text: str) -> dict:
         return _add_legacy_fields({"type": "QUESTION", "intent": "indicators",
                 "confidence": 0.8, "_fallback": True})
 
-    if any(x in t for x in ["긴급", "급변", "급락", "급등", "손절", "stop.?loss"]):
+    if any(x in t for x in ["긴급", "급변", "급락", "급등", "손절", "stop loss",
+                             "stoploss", "stop-loss"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "emergency",
                 "urgency": "high", "confidence": 0.8, "_fallback": True})
 

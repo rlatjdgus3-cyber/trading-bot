@@ -393,16 +393,9 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO',
             context=gate_ctx, call_type=call_type, max_tokens=500)
         meta['call_type'] = call_type
 
-        if meta.get('fallback_used') and not no_fallback:
-            _log('news summary: Claude denied -> GPT-mini fallback')
-            start_ms = int(time.time() * 1000)
-            ai_result = _call_gpt_advisory(summary_prompt, max_tokens=500)
-            elapsed = int(time.time() * 1000) - start_ms
-            meta = {'model': 'gpt-4o-mini', 'model_provider': 'openai',
-                    'api_latency_ms': elapsed, 'fallback_used': True,
-                    'call_type': call_type}
-            provider = 'gpt-4o-mini'
-        elif meta.get('fallback_used'):
+        if meta.get('fallback_used'):
+            _log('news summary: Claude denied — GPT fallback BLOCKED, strategy aborted')
+            ai_result = ''
             provider = 'claude(denied)'
         else:
             cost = meta.get('estimated_cost_usd', 0)
@@ -735,6 +728,24 @@ def _enqueue_strategy_action(cur, action, pos_state, scores, reason, snapshot=No
             return None
 
     side = (pos_state.get('side', '') or '').upper()
+
+    # 10-min same intent dedup: block if same action_type+direction queued recently
+    action_type_map = {
+        'REDUCE': 'REDUCE', 'CLOSE': 'CLOSE', 'ADD': 'ADD',
+        'REVERSE': 'REVERSE_CLOSE',
+    }
+    eq_action = action_type_map.get(action, action)
+    eq_direction = side
+    cur.execute("""
+        SELECT id FROM execution_queue
+        WHERE symbol = %s AND action_type = %s AND direction = %s
+          AND status IN ('PENDING', 'PICKED')
+          AND ts >= now() - interval '10 minutes';
+    """, (STRATEGY_SYMBOL, eq_action, eq_direction))
+    if cur.fetchone():
+        _log(f'duplicate intent {eq_action} {eq_direction} blocked (same intent within 10 min)')
+        return None
+
     meta = json.dumps({
         'total_score': scores.get('total_score'),
         'long_score': scores.get('long_score'),
@@ -1107,21 +1118,34 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
             _log(f'execution validation failed: {reason}')
             return None
 
-    # Duplicate check: same action PENDING/PICKED within 5 min
+    # Price context validation: Claude-mentioned price vs snapshot
+    mentioned_price = parsed.get('price') or parsed.get('entry_price') or parsed.get('target_price')
+    if mentioned_price and snapshot:
+        price_ok, price_reason = _ms.validate_price_mention(mentioned_price, snapshot)
+        if not price_ok:
+            _log(f'INVALID PRICE CONTEXT – STRATEGY REJECTED: {price_reason}')
+            return None
+
+    # Duplicate check: same action+direction PENDING/PICKED within 10 min
     action_type_map = {
         'REDUCE': 'REDUCE', 'CLOSE': 'CLOSE',
         'OPEN_LONG': 'ADD', 'OPEN_SHORT': 'ADD',
         'REVERSE': 'REVERSE_CLOSE',
     }
     eq_action = action_type_map.get(action, action)
+    direction = side
+    if action == 'OPEN_LONG':
+        direction = 'LONG'
+    elif action == 'OPEN_SHORT':
+        direction = 'SHORT'
     cur.execute("""
         SELECT id FROM execution_queue
-        WHERE symbol = %s AND action_type = %s
+        WHERE symbol = %s AND action_type = %s AND direction = %s
           AND status IN ('PENDING', 'PICKED')
-          AND ts >= now() - interval '5 minutes';
-    """, (STRATEGY_SYMBOL, eq_action))
+          AND ts >= now() - interval '10 minutes';
+    """, (STRATEGY_SYMBOL, eq_action, direction))
     if cur.fetchone():
-        _log(f'duplicate {action} blocked (PENDING/PICKED exists)')
+        _log(f'duplicate intent {eq_action} {direction} blocked (same intent within 10 min)')
         return None
 
     meta = json.dumps({
@@ -1553,11 +1577,11 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
                 'gate_reason': reason,
                 'call_type': call_type,
             })
-        # Block GPT fallback for strategy/event_trigger routes
-        if gate in ('pre_action', 'event_trigger'):
+        # Block GPT fallback for strategy/event_trigger/emergency routes
+        if gate in ('pre_action', 'event_trigger', 'emergency'):
             reason = result.get('gate_reason', 'unknown')
-            _log(f"Claude gate denied ({reason}) — strategy route, no GPT fallback")
-            return ('Claude unavailable. Strategy aborted (no GPT fallback).', {
+            _log(f"CLAUDE UNAVAILABLE – STRATEGY ABORTED ({reason})")
+            return ('⚠️ Claude 미응답 — 전략 중단', {
                 'model': 'claude(denied)',
                 'model_provider': 'anthropic(denied)',
                 'api_latency_ms': 0,
@@ -1686,7 +1710,7 @@ def _get_directive_conn():
 def _handle_directive_command(dtype, params):
     """Execute a directive via openclaw_engine."""
     import openclaw_engine
-    conn = _get_directive_conn()
+    conn = _get_db_conn()
     try:
         result = openclaw_engine.execute_directive(conn, dtype, params, source='telegram')
         return result.get('message', 'Directive processed')
@@ -1735,8 +1759,22 @@ def _handle_directive_intent(intent, text):
 
 # ── NL-first handler functions ────────────────────────────
 
-TRADE_INTENTS = {'close_position', 'reduce_position', 'open_long',
-                 'open_short', 'reverse_position'}
+TRADE_INTENTS = frozenset({
+    'close_position', 'reduce_position', 'open_long',
+    'open_short', 'reverse_position',
+})
+
+# QUESTION intent → local_query_executor query type
+NL_LOCAL_MAP = {
+    'status': 'status_full',
+    'price': 'btc_price',
+    'indicators': 'indicator_snapshot',
+    'score': 'score_summary',
+    'health': 'health_check',
+    'errors': 'recent_errors',
+    'report': 'daily_report',
+    'volatility': 'volatility_summary',
+}
 
 
 def _format_command_result(action, eq_id, parsed, pos, scores):
@@ -1847,6 +1885,9 @@ def _toggle_trading(parsed, text):
                 "UPDATE trade_switch SET enabled = %s "
                 "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
                 (enable,))
+            if cur.rowcount == 0:
+                return "⚠️ trade_switch 레코드가 없습니다." + \
+                    _footer('toggle_trading', 'error', 'local')
         state_str = "재개" if enable else "일시정지"
         return f"자동매매 {state_str} 완료" + _footer('toggle_trading', 'local', 'local')
     finally:
@@ -1904,9 +1945,12 @@ def _extract_keywords_from_text(text):
     """Extract potential keywords from natural language text."""
     import re
     t = text.lower()
-    # Remove common verbs/particles
-    for w in ['추가', '삭제', '해제', '등록', '제거', '감시', '키워드',
-              '워치', '해줘', '해', '하', '좀', '에', '를', '을', '강화']:
+    # Remove common verb/particle phrases (longer first to avoid partial matches)
+    for w in ['추가해줘', '삭제해줘', '해제해줘', '등록해줘', '제거해줘',
+              '추가해', '삭제해', '해제해', '등록해', '제거해',
+              '추가', '삭제', '해제', '등록', '제거',
+              '감시', '키워드', '워치', '해줘', '강화',
+              '좀', '뉴스']:
         t = t.replace(w, ' ')
     parts = [p.strip() for p in re.split(r'[\s/,]+', t) if p.strip() and len(p.strip()) >= 2]
     return parts
@@ -1916,17 +1960,6 @@ def _handle_nl_question(parsed, text):
     """Handle NL QUESTION type. Dispatches by intent."""
     intent = parsed.get('intent', 'general')
     use_claude = parsed.get('use_claude', False)
-
-    LOCAL_MAP = {
-        'status': 'status_full',
-        'price': 'btc_price',
-        'indicators': 'indicator_snapshot',
-        'score': 'score_summary',
-        'health': 'health_check',
-        'errors': 'recent_errors',
-        'report': 'daily_report',
-        'volatility': 'volatility_summary',
-    }
 
     # 1. News → news report pipeline
     if intent == 'news_analysis':
@@ -1945,8 +1978,8 @@ def _handle_nl_question(parsed, text):
         return result + _footer('emergency', 'claude', provider, call_type='USER')
 
     # 4. Local queries
-    if intent in LOCAL_MAP:
-        qtype = LOCAL_MAP[intent]
+    if intent in NL_LOCAL_MAP:
+        qtype = NL_LOCAL_MAP[intent]
         return local_query_executor.execute(qtype, original_text=text) + \
             _footer(intent, 'local', 'local')
 
