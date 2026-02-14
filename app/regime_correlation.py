@@ -43,16 +43,16 @@ def _db_conn():
 def _compute_correlation(cur):
     """Compute 30-day rolling correlation between BTC and QQQ daily returns.
 
-    Uses kline_1h for BTC and macro_data for QQQ.
+    Uses candles (1m, aggregated to daily) for BTC and macro_data for QQQ.
     Returns (correlation_float, sample_count) or (None, 0) on error.
     """
     try:
-        # BTC daily returns from kline_1h (aggregate to daily)
+        # BTC daily returns from candles (1m aggregated to daily)
         cur.execute("""
             SELECT date_trunc('day', ts) AS day,
                    (MAX(c) - MIN(o)) / NULLIF(MIN(o), 0) * 100 AS daily_ret
-            FROM kline_1h
-            WHERE symbol = 'BTCUSDT' AND ts >= now() - interval '30 days'
+            FROM candles
+            WHERE symbol = 'BTC/USDT:USDT' AND ts >= now() - interval '30 days'
             GROUP BY day
             ORDER BY day;
         """)

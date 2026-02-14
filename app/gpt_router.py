@@ -371,13 +371,14 @@ def _keyword_fallback(text: str) -> dict:
                 "confidence": 0.7, "_fallback": True})
 
     # ── QUESTION intents ────────────────────────────────────
-    if any(x in t for x in ["상태", "status", "스테이터스", "잘 돌아", "돌아가"]):
-        return _add_legacy_fields({"type": "QUESTION", "intent": "status",
-                "confidence": 0.8, "_fallback": True})
-
+    # db_health must be checked BEFORE status (because "디비상태" contains "상태")
     if any(x in t for x in ["db_health", "디비상태", "db상태", "데이터베이스", "테이블 점검",
                              "디비 점검", "db 점검", "db health"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "db_health",
+                "confidence": 0.8, "_fallback": True})
+
+    if any(x in t for x in ["상태", "status", "스테이터스", "잘 돌아", "돌아가"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "status",
                 "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["헬스", "health", "건강", "서비스 상태"]):

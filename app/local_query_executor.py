@@ -340,7 +340,7 @@ def _db_health(_text=None):
         conn = _db()
         with conn.cursor() as cur:
             tables = [
-                ('kline_1h', 'ts'),
+                ('candles', 'ts'),
                 ('news', 'ts'),
                 ('indicators', 'ts'),
                 ('events', 'start_ts'),

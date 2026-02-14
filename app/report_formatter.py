@@ -222,20 +222,28 @@ def detect_english_ratio(text: str) -> float:
     return en_count / max(len(words), 1)
 
 
-_COMMON_EN_TO_KR = {
+# Multi-word phrases replaced first (safe substring match),
+# then single words with word boundary regex.
+_PHRASE_EN_TO_KR = {
     'Stop-Loss': '손절',
     'stop loss': '손절',
     'Stop Loss': '손절',
     'Take Profit': '익절',
     'take profit': '익절',
+    'Risk Level': '위험도',
+    'risk level': '위험도',
+    'No position': '포지션 없음',
+    'no position': '포지션 없음',
+}
+
+# Single-word replacements — applied with word boundary (\b) regex
+_WORD_EN_TO_KR = {
     'Entry': '진입',
     'entry': '진입',
     'Position': '포지션',
     'position': '포지션',
     'Confidence': '확신도',
     'confidence': '확신도',
-    'Risk Level': '위험도',
-    'risk level': '위험도',
     'Reason': '근거',
     'reason': '근거',
     'Action': '조치',
@@ -268,10 +276,12 @@ _COMMON_EN_TO_KR = {
     'pending': '대기 중',
     'Completed': '완료',
     'completed': '완료',
-    'No position': '포지션 없음',
-    'no position': '포지션 없음',
-    'none': '없음',
 }
+
+# Pre-compile regex for single-word replacements (longest first to avoid partial match)
+_WORD_RE_MAP = []
+for _en in sorted(_WORD_EN_TO_KR, key=len, reverse=True):
+    _WORD_RE_MAP.append((_re.compile(r'\b' + _re.escape(_en) + r'\b'), _WORD_EN_TO_KR[_en]))
 
 
 def sanitize_telegram_text(text: str) -> str:
@@ -279,8 +289,12 @@ def sanitize_telegram_text(text: str) -> str:
     if not text:
         return text
     result = text
-    for en, kr in _COMMON_EN_TO_KR.items():
+    # Phase 1: multi-word phrases (safe substring replace)
+    for en, kr in _PHRASE_EN_TO_KR.items():
         result = result.replace(en, kr)
+    # Phase 2: single words with word boundary
+    for pattern, kr in _WORD_RE_MAP:
+        result = pattern.sub(kr, result)
     ratio = detect_english_ratio(result)
     if ratio > 0.2:
         try:
