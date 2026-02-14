@@ -57,7 +57,8 @@ def execute(query_type=None, original_text=None):
         'indicator_snapshot': _indicator_snapshot,
         'volatility_summary': _volatility_summary,
         'position_info': _position_info,
-        'score_summary': _score_summary}
+        'score_summary': _score_summary,
+        'db_health': _db_health}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -331,6 +332,85 @@ def _score_summary(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'스코어 조회 실패: {e}'
+
+
+def _db_health(_text=None):
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            tables = [
+                ('kline_1h', 'ts'),
+                ('news', 'ts'),
+                ('indicators', 'ts'),
+                ('events', 'start_ts'),
+                ('pm_decision_log', 'ts'),
+                ('execution_log', 'ts'),
+                ('score_history', 'ts'),
+                ('macro_data', 'ts'),
+            ]
+            lines = ['🗄 DB 상태 점검']
+            lines.append('━━━━━━━━━━━━━━━━━━')
+            for tbl, ts_col in tables:
+                try:
+                    cur.execute(f"""
+                        SELECT count(*),
+                               min({ts_col})::text,
+                               max({ts_col})::text,
+                               count(*) FILTER (WHERE {ts_col} >= now() - interval '24 hours')
+                        FROM {tbl};
+                    """)
+                    row = cur.fetchone()
+                    total, min_ts, max_ts, recent = row
+                    min_ts = (min_ts or '')[:16]
+                    max_ts = (max_ts or '')[:16]
+                    lines.append(f'  {tbl}: {total:,}건 (24h: {recent:,}건)')
+                    lines.append(f'    범위: {min_ts} ~ {max_ts}')
+                except Exception as e:
+                    lines.append(f'  {tbl}: 조회 실패 ({e})')
+
+            # news_impact_stats
+            lines.append('')
+            lines.append('[뉴스 영향 통계]')
+            try:
+                cur.execute("""
+                    SELECT stats_version, count(*), sum(sample_count)
+                    FROM news_impact_stats
+                    GROUP BY stats_version
+                    ORDER BY stats_version DESC LIMIT 1;
+                """)
+                row = cur.fetchone()
+                if row:
+                    lines.append(f'  버전: {row[0]} | 카테고리: {row[1]}개 | 샘플: {row[2]:,}건')
+                else:
+                    lines.append('  데이터 없음 (compute_news_impact_stats.py 실행 필요)')
+            except Exception:
+                lines.append('  테이블 미생성')
+
+            # regime_correlation
+            lines.append('')
+            lines.append('[BTC-QQQ 상관관계]')
+            try:
+                import regime_correlation
+                info = regime_correlation.get_correlation_info(cur)
+                regime = info.get('regime', '?')
+                corr = info.get('correlation')
+                age = info.get('cache_age_sec')
+                corr_str = f'{corr:.4f}' if corr is not None else 'N/A'
+                age_str = f'{age}초 전' if age is not None else 'N/A'
+                lines.append(f'  레짐: {regime} | 상관계수: {corr_str} | 캐시: {age_str}')
+            except Exception as e:
+                lines.append(f'  조회 실패 ({e})')
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'DB 상태 조회 실패: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _unknown(_text=None):

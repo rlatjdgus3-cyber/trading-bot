@@ -309,6 +309,27 @@ def compute_total(cur=None, exchange=None):
         news_evt_result = news_event_scorer.compute(cur)
         news_event_score = news_evt_result.get('score', 0)
 
+        # ── BTC-QQQ regime correlation → dynamic NEWS_EVENT weight ──
+        btc_qqq_regime = None
+        try:
+            import regime_correlation
+            btc_qqq_regime = regime_correlation.get_current_regime(cur)
+            base_news_w = weights['news_event_w']
+            if btc_qqq_regime == 'COUPLED_RISK':
+                weights['news_event_w'] = 0.15
+            elif btc_qqq_regime == 'DECOUPLED':
+                weights['news_event_w'] = 0.02
+            # Redistribute delta across other 3 axes proportionally
+            delta = weights['news_event_w'] - base_news_w
+            if abs(delta) > 0.001:
+                other_keys = ['tech_w', 'position_w', 'regime_w']
+                other_sum = sum(weights[k] for k in other_keys)
+                if other_sum > 0:
+                    for k in other_keys:
+                        weights[k] -= delta * (weights[k] / other_sum)
+        except Exception as e:
+            _log(f'regime_correlation skip: {e}')
+
         # GUARD: NEWS_EVENT cannot trigger trades alone.
         # If both TECH and POSITION are neutral (abs < 10), zero out NEWS_EVENT.
         news_event_guarded = False
@@ -372,6 +393,7 @@ def compute_total(cur=None, exchange=None):
                 'macro': macro_result,
             },
             'price': price,
+            'btc_qqq_regime': btc_qqq_regime,
             'context': {
                 'tech': tech_result.get('components', {}),
                 'position': pos_result.get('components', {}),

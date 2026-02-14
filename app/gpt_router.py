@@ -41,7 +41,7 @@ COMMAND_INTENTS = (
 QUESTION_INTENTS = (
     "status", "price", "indicators", "news_analysis", "strategy",
     "emergency", "score", "report", "health", "errors",
-    "volatility", "general")
+    "volatility", "db_health", "general")
 
 # Legacy mapping: new QUESTION intent → (route, local_query_type)
 QUESTION_ROUTE_MAP = {
@@ -56,6 +56,7 @@ QUESTION_ROUTE_MAP = {
     'health': ('local', 'health_check'),
     'errors': ('local', 'recent_errors'),
     'volatility': ('local', 'volatility_summary'),
+    'db_health': ('local', 'db_health'),
     'general': ('none', ''),
 }
 
@@ -90,6 +91,7 @@ SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/Engl
 - health: 서비스 상태
 - errors: 에러 로그
 - volatility: 변동성 요약
+- db_health: DB 상태/테이블 점검
 - general: 기타 질문
 
 ## Output JSON (ONLY valid JSON, no text)
@@ -371,6 +373,11 @@ def _keyword_fallback(text: str) -> dict:
     # ── QUESTION intents ────────────────────────────────────
     if any(x in t for x in ["상태", "status", "스테이터스", "잘 돌아", "돌아가"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "status",
+                "confidence": 0.8, "_fallback": True})
+
+    if any(x in t for x in ["db_health", "디비상태", "db상태", "데이터베이스", "테이블 점검",
+                             "디비 점검", "db 점검", "db health"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "db_health",
                 "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["헬스", "health", "건강", "서비스 상태"]):

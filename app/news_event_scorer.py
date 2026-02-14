@@ -39,7 +39,7 @@ SOURCE_QUALITY_DEFAULT = 8
 
 # ── Category weight scores (0-25) ────────────────────────
 
-CATEGORY_WEIGHT = {
+CATEGORY_WEIGHT_DEFAULT = {
     'FED_RATES': 25, 'CPI_JOBS': 23,
     'REGULATION_SEC_ETF': 22, 'WAR': 20,
     'US_POLITICS': 18, 'NASDAQ_EQUITIES': 17,
@@ -47,6 +47,12 @@ CATEGORY_WEIGHT = {
     'FIN_STRESS': 18, 'CRYPTO_SPECIFIC': 14,
     'OTHER': 5,
 }
+# Will be populated from DB if available
+CATEGORY_WEIGHT = dict(CATEGORY_WEIGHT_DEFAULT)
+
+# Cache for DB-loaded weights
+_db_weights_loaded = False
+_db_weights_version = None
 
 # ── Recency weight (0-15) ────────────────────────────────
 
@@ -81,17 +87,33 @@ WATCH_KEYWORDS_DEFAULT = [
 
 LIST_ARTICLE_KEYWORDS = {'5선', 'top', 'best', 'list', '추천', '정리',
                          'roundup', 'picks', 'ranking', '순위'}
-RELEVANCE_MULTIPLIERS = {'HIGH': 1.0, 'MED': 0.5, 'LOW': 0.1}
+RELEVANCE_MULTIPLIERS = {'HIGH': 1.0, 'MED': 0.5, 'LOW': 0.0}
+
+CRYPTO_DIRECT_KEYWORDS = {
+    'bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'blockchain',
+    'defi', 'nft', 'altcoin', 'stablecoin', 'usdt', 'usdc',
+    'binance', 'coinbase', 'bybit', 'okx', 'kraken',
+    'halving', 'mining', 'hash rate',
+    'etf', 'fed', 'cpi', 'inflation', 'sec', 'fomc',
+    '비트코인', '이더리움', '가상자산', '암호화폐', '코인',
+}
 
 
-def _classify_relevance(title, category, impact_score):
-    """HIGH / MED / LOW 분류."""
+def _classify_relevance(title, category, impact_score, summary=''):
+    """HIGH / MED / LOW 분류. OTHER 카테고리에서 crypto 키워드 2개 미만 → LOW."""
     title_lower = (title or '').lower()
     impact = int(impact_score or 0)
     if any(kw in title_lower for kw in LIST_ARTICLE_KEYWORDS):
         return 'LOW'
     if category == 'OTHER' and impact <= 3:
         return 'LOW'
+    # OTHER 카테고리: crypto 키워드 2개 미만이면 LOW
+    # (FED_RATES, CPI_JOBS 등 매크로 카테고리는 OTHER가 아니므로 자연 면제)
+    if category == 'OTHER':
+        combined = title_lower + ' ' + (summary or '').lower()
+        crypto_hits = sum(1 for kw in CRYPTO_DIRECT_KEYWORDS if kw in combined)
+        if crypto_hits < 2:
+            return 'LOW'
     if impact >= 7:
         return 'HIGH'
     if category == 'OTHER':
@@ -103,6 +125,67 @@ def _classify_relevance(title, category, impact_score):
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
+
+
+def _load_db_category_weights(cur):
+    """Load category weights from news_impact_stats (avg_abs_ret_2h based).
+
+    Maps avg_abs_ret_2h to 0-25 score: higher abs return = higher weight.
+    Falls back to hardcoded CATEGORY_WEIGHT_DEFAULT if DB unavailable.
+    Returns (weights_dict, stats_version, total_samples).
+    """
+    global _db_weights_loaded, _db_weights_version, CATEGORY_WEIGHT
+    try:
+        cur.execute("""
+            SELECT event_type, avg_abs_ret_2h, sample_count, stats_version
+            FROM news_impact_stats
+            WHERE region = 'GLOBAL'
+            ORDER BY avg_abs_ret_2h DESC;
+        """)
+        rows = cur.fetchall()
+        if not rows:
+            return (dict(CATEGORY_WEIGHT_DEFAULT), None, 0)
+
+        # Scale: max avg_abs_ret_2h → 25, min → 5
+        abs_rets = [float(r[1]) for r in rows if r[1] is not None]
+        if not abs_rets:
+            return (dict(CATEGORY_WEIGHT_DEFAULT), None, 0)
+
+        max_ret = max(abs_rets) if abs_rets else 1.0
+        min_ret = min(abs_rets) if abs_rets else 0.0
+        range_ret = max_ret - min_ret if max_ret > min_ret else 1.0
+
+        db_weights = {}
+        total_samples = 0
+        version = None
+        for event_type, avg_abs, sample_count, sv in rows:
+            if avg_abs is None:
+                continue
+            # Scale to 5-25 range
+            normalized = (float(avg_abs) - min_ret) / range_ret
+            weight = int(round(5 + normalized * 20))
+            weight = max(5, min(25, weight))
+            # Only use if enough samples
+            if sample_count and int(sample_count) >= 5:
+                db_weights[event_type] = weight
+            total_samples += int(sample_count or 0)
+            if sv:
+                version = sv
+
+        # Merge: DB weights override defaults, keep defaults for missing categories
+        merged = dict(CATEGORY_WEIGHT_DEFAULT)
+        merged.update(db_weights)
+        CATEGORY_WEIGHT = merged
+        _db_weights_loaded = True
+        _db_weights_version = version
+
+        _log(f'DB weights loaded: {len(db_weights)} categories, '
+             f'version={version}, total_samples={total_samples}')
+        return (merged, version, total_samples)
+
+    except Exception as e:
+        _log(f'DB weights load failed (using defaults): {e}')
+        return (dict(CATEGORY_WEIGHT_DEFAULT), None, 0)
 
 
 def _load_watch_keywords(cur):
@@ -223,6 +306,9 @@ def compute(cur):
         }
     """
     try:
+        # Load DB-based category weights (with fallback)
+        db_cat_weights, stats_version, total_samples = _load_db_category_weights(cur)
+
         watch_kw = _load_watch_keywords(cur)
 
         # Fetch recent news (6h, impact > 0)
@@ -346,8 +432,8 @@ def compute(cur):
             # Weight by impact_score for aggregation
             w = float(impact) if impact else 3.0
 
-            # Relevance filter: LOW articles contribute only 10%, MED 50%
-            relevance = _classify_relevance(title, cat, impact)
+            # Relevance filter: LOW=0.0, MED=0.5
+            relevance = _classify_relevance(title, cat, impact, summary)
             relevance_mult = RELEVANCE_MULTIPLIERS.get(relevance, 1.0)
             effective_w = w * relevance_mult
             _log(f'relevance: "{(title or "")[:40]}" cat={cat} impact={impact} '
@@ -406,6 +492,8 @@ def compute(cur):
                 'neutral': total_neutral,
                 'watch_matched': sorted(watch_matched),
                 'score_trace': score_trace,
+                'stats_version': stats_version,
+                'stats_total_samples': total_samples,
             },
             'action_constraints': {
                 'can_open': False,

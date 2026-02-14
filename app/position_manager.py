@@ -376,6 +376,84 @@ def _build_decision_history(cur):
     return history
 
 
+def get_db_context_for_prompt(cur=None):
+    """Build DB context dict for GPT-mini prompt injection.
+
+    Returns dict with:
+      last_position: {side, qty, entry_price, unrealized_pnl}
+      last_trade: {action, timestamp, pnl}
+      last_reason: str (최근 결정 근거)
+      cooldown_active: bool
+      recent_decisions: list of last 3 pm_decision_log entries
+    """
+    ctx = {}
+    try:
+        # 1) Position state
+        cur.execute("""
+            SELECT side, total_qty, avg_entry_price, stage,
+                   trade_budget_used_pct, last_reason
+            FROM position_state WHERE symbol = %s;
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        if row and row[0]:
+            ctx['last_position'] = {
+                'side': row[0], 'qty': float(row[1] or 0),
+                'entry_price': float(row[2] or 0), 'stage': int(row[3] or 0),
+                'budget_used_pct': float(row[4] or 0),
+            }
+            ctx['last_reason'] = (row[5] or '')[:100]
+        else:
+            ctx['last_position'] = {'side': 'NONE', 'qty': 0}
+            ctx['last_reason'] = ''
+
+        # 2) Last trade from execution_log
+        cur.execute("""
+            SELECT order_type, direction, avg_fill_price, realized_pnl,
+                   to_char(last_fill_at AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts
+            FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+            ORDER BY last_fill_at DESC LIMIT 1;
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        if row:
+            ctx['last_trade'] = {
+                'action': row[0], 'direction': row[1],
+                'price': float(row[2] or 0),
+                'pnl': float(row[3]) if row[3] is not None else None,
+                'ts': row[4] or '',
+            }
+        else:
+            ctx['last_trade'] = None
+
+        # 3) Recent decisions (last 3)
+        cur.execute("""
+            SELECT chosen_action, action_reason, actor, confidence,
+                   to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts,
+                   position_side, claude_skipped
+            FROM pm_decision_log WHERE symbol = %s
+            ORDER BY ts DESC LIMIT 3;
+        """, (SYMBOL,))
+        rows = cur.fetchall()
+        ctx['recent_decisions'] = [
+            {'action': r[0], 'reason': (r[1] or '')[:80], 'actor': r[2] or 'engine',
+             'confidence': r[3], 'ts': r[4], 'position_side': r[5],
+             'claude_skipped': r[6]}
+            for r in rows
+        ]
+
+        # 4) Cooldown/lock state
+        try:
+            locked, _ = event_lock.check_hold_suppress(SYMBOL)
+            ctx['cooldown_active'] = locked
+        except Exception:
+            ctx['cooldown_active'] = False
+
+    except Exception:
+        traceback.print_exc()
+
+    return ctx
+
+
 def _check_emergency(ctx=None):
     '''Check for emergency conditions. Returns trigger dict or None.'''
     ind = ctx.get('indicators', {})
@@ -497,6 +575,10 @@ def _handle_emergency(cur=None, ctx=None, trigger=None):
         ca_id = None
 
     action = result.get('action') or result.get('recommended_action', 'HOLD')
+
+    if action == 'SKIP' or result.get('fallback_used'):
+        _log(f'CLAUDE_SKIP: API fail → action forced to SKIP (original={action})')
+        return 'HOLD'
 
     if action == 'HOLD':
         _send_telegram(report_formatter.format_emergency_post_alert(
@@ -652,6 +734,11 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
         ca_id = None
 
     action = result.get('action') or result.get('recommended_action', 'HOLD')
+
+    if action == 'SKIP':
+        _log(f'CLAUDE_SKIP: event_trigger API fail → SKIP')
+        return 'HOLD'
+
     pos = ctx.get('position', {})
     reason_info = ', '.join(result.get('reason_bullets', [])[:2]) or result.get('reason_code', '')
 
@@ -807,6 +894,11 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
         traceback.print_exc()
 
     action = result.get('action') or result.get('recommended_action', 'HOLD')
+
+    if action == 'SKIP':
+        _log(f'CLAUDE_SKIP: GPT-mini API fail → SKIP')
+        return ('HOLD', result)
+
     pos = ctx.get('position', {})
     pos_side = (pos.get('side') or '').upper()
 
@@ -1022,6 +1114,11 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
             return 'HOLD'
 
     action = result.get('action') or result.get('recommended_action', 'HOLD')
+
+    if action == 'SKIP':
+        _log(f'CLAUDE_SKIP: emergency_v2 API fail → SKIP')
+        return 'HOLD'
+
     pos = ctx.get('position', {})
     reason_info = ', '.join(result.get('reason_bullets', [])[:2]) or result.get('reason_code', '')
 
@@ -1326,7 +1423,9 @@ def _sync_position_state(cur=None, pos=None):
 
 
 def _log_decision(cur=None, ctx=None, action=None, reason=None,
-                   model_used=None, model_provider=None, model_latency_ms=None):
+                   model_used=None, model_provider=None, model_latency_ms=None,
+                   actor='engine', candidate_action=None, final_action=None,
+                   confidence=None, claude_skipped=False):
     '''Log decision to pm_decision_log. Returns id.'''
     pos = ctx.get('position', {})
     ind = ctx.get('indicators', {})
@@ -1339,9 +1438,10 @@ def _log_decision(cur=None, ctx=None, action=None, reason=None,
                 (symbol, position_side, position_qty, avg_entry_price, stage,
                  current_price, long_score, short_score, atr_14, rsi_14,
                  poc, vah, val, chosen_action, action_reason, full_context,
-                 model_used, model_provider, model_latency_ms)
+                 model_used, model_provider, model_latency_ms,
+                 actor, candidate_action, final_action, confidence, claude_skipped)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
-                    %s, %s, %s)
+                    %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id;
         """, (
             SYMBOL,
@@ -1363,6 +1463,11 @@ def _log_decision(cur=None, ctx=None, action=None, reason=None,
             model_used,
             model_provider,
             model_latency_ms,
+            actor,
+            candidate_action,
+            final_action or action,
+            confidence,
+            claude_skipped,
         ))
         row = cur.fetchone()
         return row[0] if row else None

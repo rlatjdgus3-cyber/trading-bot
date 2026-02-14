@@ -310,6 +310,11 @@ def need_claude(snapshot, mini_result, scores) -> tuple:
     if abs(news_score) >= ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD:
         return True, f'condition_C (news_score={news_score})'
 
+    # ── 조건D: NASDAQ 연관 뉴스 + COUPLED_RISK regime ──
+    btc_qqq_regime = scores.get('btc_qqq_regime') if scores else None
+    if btc_qqq_regime == 'COUPLED_RISK' and abs(news_score) >= 20:
+        return True, f'condition_D (coupled_risk + news_score={news_score})'
+
     return False, 'no condition met'
 
 

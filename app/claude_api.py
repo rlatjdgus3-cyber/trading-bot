@@ -11,13 +11,13 @@ import json
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[claude_api]'
 FALLBACK_RESPONSE = {
-    'action': 'HOLD',
-    'recommended_action': 'HOLD',  # backward compat
+    'action': 'SKIP',
+    'recommended_action': 'SKIP',  # backward compat
     'reduce_pct': 0,
     'target_stage': 0,
     'reason_code': 'API_CALL_FAILED',
     'reason_bullets': ['API_CALL_FAILED'],  # backward compat
-    'confidence': 0,
+    'confidence': None,
     'ttl_seconds': 0,
     'fallback_used': True,
 }

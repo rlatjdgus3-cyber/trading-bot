@@ -118,7 +118,7 @@ HELP_TEXT = (
     "  트럼프 감시 키워드 추가해\n"
     "  시스템 점검해줘\n\n"
     "🔧 백업 슬래시 명령\n"
-    "  /help /status /health /force /detail /debug\n"
+    "  /help /status /health /db_health /force /detail /debug\n"
 )
 
 # ── news importance check & AI news advisory ─────────────
@@ -622,8 +622,9 @@ def _load_watch_keywords(cur):
 
 
 def _fetch_news_summary(cur):
-    """Fetch recent news for strategy output. Returns list of dicts."""
+    """Fetch recent news for strategy output. Returns list of dicts with relevance tag."""
     try:
+        import news_event_scorer
         cur.execute("""
             SELECT title, source, impact_score, summary, ts,
                    keywords, title_ko
@@ -634,15 +635,24 @@ def _fetch_news_summary(cur):
             LIMIT 10;
         """)
         rows = cur.fetchall()
-        return [{
-            'title': r[0] or '',
-            'source': r[1] or '',
-            'impact_score': int(r[2]) if r[2] else 0,
-            'summary': r[3] or '',
-            'ts': str(r[4]) if r[4] else '',
-            'keywords': list(r[5]) if r[5] else [],
-            'title_ko': r[6] if len(r) > 6 and r[6] else None,
-        } for r in rows]
+        items = []
+        for r in rows:
+            title = r[0] or ''
+            summary = r[3] or ''
+            impact = int(r[2]) if r[2] else 0
+            cat = news_event_scorer._parse_category_tag(summary)
+            relevance = news_event_scorer._classify_relevance(title, cat, impact, summary)
+            items.append({
+                'title': title,
+                'source': r[1] or '',
+                'impact_score': impact,
+                'summary': summary,
+                'ts': str(r[4]) if r[4] else '',
+                'keywords': list(r[5]) if r[5] else [],
+                'title_ko': r[6] if len(r) > 6 and r[6] else None,
+                'relevance': relevance,
+            })
+        return items
     except Exception as e:
         _log(f'_fetch_news_summary error: {e}')
         return []
@@ -1047,11 +1057,68 @@ def _parse_claude_action(ai_text: str) -> str:
     return ''
 
 
+def _build_db_context_section():
+    """Build DB context section for GPT-mini prompt."""
+    try:
+        import position_manager as _pm
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST', 'localhost'),
+            port=int(os.getenv('DB_PORT', '5432')),
+            dbname=os.getenv('DB_NAME', 'trading'),
+            user=os.getenv('DB_USER', 'bot'),
+            password=os.getenv('DB_PASS', 'botpass'),
+            connect_timeout=10,
+            options='-c statement_timeout=10000',
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            db_ctx = _pm.get_db_context_for_prompt(cur)
+        conn.close()
+
+        lines = ['=== DB 컨텍스트 ===']
+        lp = db_ctx.get('last_position', {})
+        if lp.get('side') and lp['side'] != 'NONE':
+            lines.append(f"포지션: {lp['side']} qty={lp.get('qty', 0)} "
+                         f"entry=${lp.get('entry_price', 0):,.0f} stage={lp.get('stage', 0)}")
+        else:
+            lines.append('포지션: 없음')
+
+        lt = db_ctx.get('last_trade')
+        if lt:
+            pnl_str = f" pnl={lt['pnl']:+.4f}" if lt.get('pnl') is not None else ''
+            lines.append(f"최근 거래: {lt['action']} {lt['direction']} "
+                         f"${lt.get('price', 0):,.0f}{pnl_str} ({lt.get('ts', '')})")
+
+        if db_ctx.get('last_reason'):
+            lines.append(f"최근 결정 근거: {db_ctx['last_reason']}")
+
+        if db_ctx.get('cooldown_active'):
+            lines.append('쿨다운: 활성화')
+
+        rd = db_ctx.get('recent_decisions', [])
+        if rd:
+            lines.append('최근 결정 3건:')
+            for d in rd[:3]:
+                skip_tag = ' [SKIP]' if d.get('claude_skipped') else ''
+                conf_str = f" conf={d['confidence']:.2f}" if d.get('confidence') is not None else ''
+                lines.append(f"  {d['ts']}: {d['action']} ({d.get('actor', '?')}"
+                             f"{conf_str}{skip_tag}) {d.get('reason', '')[:50]}")
+
+        return '\n'.join(lines) + '\n\n'
+    except Exception as e:
+        _log(f'_build_db_context_section error: {e}')
+        return ''
+
+
 def _build_execution_prompt(scores, pos_state, strategy_ctx, snapshot, user_text,
                             engine_action, engine_reason, news_items=None):
-    """Claude execution authority prompt. Forces JSON-only output."""
+    """Claude risk advisor prompt. Engine action is final; Claude evaluates risk/confidence. Forces JSON-only output."""
     price = scores.get('price') or (snapshot.get('price') if snapshot else 0) or 0
     market_data = _format_market_data(price, strategy_ctx)
+
+    # DB context injection for GPT-mini
+    db_ctx_section = _build_db_context_section()
 
     side = pos_state.get('side', 'none') or 'none'
     qty = pos_state.get('total_qty', 0)
@@ -1079,31 +1146,34 @@ def _build_execution_prompt(scores, pos_state, strategy_ctx, snapshot, user_text
             f"ret_1m={returns.get('ret_1m', '?')}% ret_5m={returns.get('ret_5m', '?')}%\n\n"
         )
 
-    # Build news section for prompt
+    # Build news section for prompt (LOW 뉴스 제외)
     news_section = ''
     if news_items:
-        news_lines = ['=== 최근 뉴스 ===']
-        for i, n in enumerate(news_items[:5], 1):
-            imp = n.get('impact_score', 0)
-            title = (n.get('title_ko') or n.get('title', '?'))[:80]
-            summary = n.get('summary', '')[:100]
-            news_lines.append(f'{i}. [{imp}/10] {title}')
-            if summary:
-                news_lines.append(f'   {summary}')
-        news_section = '\n'.join(news_lines) + '\n\n'
+        prompt_news = [n for n in news_items if n.get('relevance', 'MED') != 'LOW']
+        if prompt_news:
+            news_lines = ['=== 최근 뉴스 ===']
+            for i, n in enumerate(prompt_news[:5], 1):
+                imp = n.get('impact_score', 0)
+                title = (n.get('title_ko') or n.get('title', '?'))[:80]
+                summary = n.get('summary', '')[:100]
+                news_lines.append(f'{i}. [{imp}/10] {title}')
+                if summary:
+                    news_lines.append(f'   {summary}')
+            news_section = '\n'.join(news_lines) + '\n\n'
 
     return (
-        f"당신은 BTC 선물 트레이딩 최종결정자입니다.\n"
-        f"아래 실시간 데이터를 분석하고 즉시 실행될 JSON을 출력하세요.\n\n"
+        f"당신은 BTC 선물 트레이딩 리스크 파라미터 조언자입니다.\n"
+        f"아래 실시간 데이터를 분석하고 리스크 평가 JSON을 출력하세요.\n\n"
         f"사용자 요청: {user_text}\n\n"
+        f"{db_ctx_section}"
         f"=== 실시간 시장 데이터 ===\n{market_data}\n\n"
         f"=== 포지션 ===\n{pos_line}\n\n"
         f"{news_section}"
-        f"=== 스코어 엔진(참고) ===\n"
+        f"=== 스코어 엔진(최종) ===\n"
         f"판단: {engine_action} | 이유: {engine_reason}\n"
         f"TOTAL={total:+.1f} ({dominant}) TECH={tech:+.0f} POS={pos_s:+.0f} "
         f"REGIME={regime:+.0f} NEWS={news:+.0f}\n"
-        f"※ 참고용. 당신의 판단이 최종입니다.\n\n"
+        f"※ 이 판단이 최종 action입니다. 리스크/확신도/근거를 평가하세요.\n\n"
         f"{snap_section}"
         f"## JSON 출력 (이것만 출력, 텍스트 금지)\n"
         f'{{"action":"HOLD|OPEN_LONG|OPEN_SHORT|REDUCE|CLOSE|REVERSE",'
@@ -1298,11 +1368,13 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
     return None
 
 
-def _send_decision_alert(action, parsed, engine_action, scores, pos_state):
-    """[DECISION] Claude final JSON summary via Telegram."""
+def _send_decision_alert(action, parsed, engine_action, scores, pos_state,
+                         claude_failed=False):
+    """[DECISION] Final action summary via Telegram."""
     try:
         msg = report_formatter.format_decision_alert(
-            action, parsed, engine_action, scores, pos_state)
+            action, parsed, engine_action, scores, pos_state,
+            claude_failed=claude_failed)
         send_message(_load_tg_token(), _load_tg_chat_id(), msg)
     except Exception as e:
         _log(f'_send_decision_alert error: {e}')
@@ -1351,8 +1423,8 @@ def _load_tg_chat_id():
 
 
 def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
-    """Claude-first strategy pipeline: Score → Claude JSON → Execute.
-    Claude is the EXECUTION AUTHORITY. Returns (text, provider)."""
+    """Engine-first strategy pipeline: Score → Engine final → Claude risk advice.
+    Engine determines final action. Claude provides risk parameters only. Returns (text, provider)."""
     no_fallback = call_type in ('USER', 'EMERGENCY')
     import psycopg2
     import score_engine
@@ -1401,7 +1473,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                 context={'intent': 'strategy', 'candidate_action': engine_action},
                 call_type=call_type, max_tokens=500)
 
-            # Phase 3: JSON parsing
+            # Phase 3: JSON parsing + claude_failed 감지
             if ai_meta.get('fallback_used'):
                 parsed = dict(claude_api.FALLBACK_RESPONSE)
                 parsed['fallback_used'] = True
@@ -1409,25 +1481,42 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                 parsed = claude_api._parse_response(ai_text)
 
             claude_action = parsed.get('action', 'HOLD')
+            claude_failed = (ai_meta.get('fallback_used')
+                             or parsed.get('reason_code') == 'API_CALL_FAILED')
+
+            # Engine이 항상 최종 action. Claude는 리스크 파라미터만 참고.
+            final_action = engine_action
+            if final_action == 'ENTRY_POSSIBLE':
+                final_action = 'HOLD'
+
+            if claude_failed:
+                _log(f'CLAUDE_FALLBACK: claude_used=false, '
+                     f'claude_error={parsed.get("reason_code", "unknown")}, '
+                     f'final_action={final_action} (engine_only)')
 
             # [DECISION] Telegram alert
-            _send_decision_alert(claude_action, parsed, engine_action, scores, pos_state)
+            _send_decision_alert(final_action, parsed, engine_action, scores, pos_state,
+                                 claude_failed=claude_failed)
 
-            # Phase 4: Safety guard -> enqueue
+            # Phase 4: Safety guard -> enqueue (final_action 기반)
+            # ENTRY_POSSIBLE은 이미 위에서 HOLD로 변환됨
             eq_id = None
             execute_status = 'NO'
-            if claude_action in ('HOLD', 'ABORT') or parsed.get('fallback_used') or parsed.get('aborted'):
-                execute_status = f'HOLD (claude={claude_action})'
+            if final_action in ('HOLD', 'ABORT') or claude_failed:
+                execute_status = f'HOLD (final={final_action})'
             else:
+                # final_action 실행을 위해 parsed에 action 덮어쓰기
+                exec_parsed = dict(parsed)
+                exec_parsed['action'] = final_action
                 (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
                 if not auto_ok:
                     execute_status = f'BLOCKED ({auto_reason})'
                 else:
-                    eq_id = _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot)
+                    eq_id = _enqueue_claude_action(cur, exec_parsed, pos_state, scores, snapshot)
                     if eq_id:
                         execute_status = f'YES (eq_id={eq_id})'
                         # [ENQUEUE] Telegram alert
-                        _send_enqueue_alert(eq_id, claude_action, parsed, pos_state)
+                        _send_enqueue_alert(eq_id, final_action, exec_parsed, pos_state)
                     else:
                         execute_status = f'BLOCKED (safety)'
 
@@ -1442,9 +1531,10 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             price = scores.get('price') or 0
 
             result = report_formatter.format_strategy_report(
-                claude_action, parsed, engine_action, engine_reason,
+                final_action, parsed, engine_action, engine_reason,
                 scores, pos_state, details, news_items,
-                watch_kw, execute_status, ai_meta)
+                watch_kw, execute_status, ai_meta,
+                claude_failed=claude_failed)
 
             # Provider label for return tuple
             if ai_meta.get('fallback_used'):
@@ -1469,7 +1559,9 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             }
             save_meta = {
                 **ai_meta,
-                'recommended_action': claude_action,
+                'recommended_action': final_action,
+                'claude_action': claude_action,
+                'claude_failed': claude_failed,
                 'confidence': parsed.get('confidence'),
                 'reason_bullets': [parsed.get('reason_code', '')],
                 'execution_queue_id': eq_id,
@@ -1478,6 +1570,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
             _save_advisory('strategy',
                            {'user_text': text, 'scores': scores_summary,
                             'pos_state': pos_state,
+                            'final_action': final_action,
                             'claude_action': claude_action,
                             'engine_action': engine_action,
                             'reason': engine_reason,
@@ -1796,6 +1889,7 @@ NL_LOCAL_MAP = {
     'errors': 'recent_errors',
     'report': 'daily_report',
     'volatility': 'volatility_summary',
+    'db_health': 'db_health',
 }
 
 
@@ -2036,6 +2130,11 @@ def handle_command(text: str) -> str:
             return report_formatter.set_debug_mode(False)
         state = 'ON' if report_formatter.is_debug_on() else 'OFF'
         return f'디버그 모드: {state}\n사용법: /debug on 또는 /debug off'
+
+    # /db_health — direct DB health check (no GPT cost)
+    if t in ('/db_health', '/dbhealth', 'db_health'):
+        return local_query_executor.execute('db_health') + \
+            _footer('db_health', 'local', 'local')
 
     # /force — cooldown bypass, Claude forced
     if t == '/force' or t.startswith('/force '):

@@ -960,6 +960,42 @@ def ensure_news_title_ko(cur):
     _log('ensure_news_title_ko done')
 
 
+def ensure_pm_decision_log_extended(cur):
+    '''Add actor, candidate/final action, confidence, used_news_ids, claude_skipped columns.'''
+    for col, dtype in (('actor', "VARCHAR(20) DEFAULT 'engine'"),
+                        ('candidate_action', 'VARCHAR(20)'),
+                        ('final_action', 'VARCHAR(20)'),
+                        ('confidence', 'FLOAT'),
+                        ('used_news_ids', 'TEXT'),
+                        ('claude_skipped', 'BOOLEAN DEFAULT FALSE')):
+        cur.execute(f"""
+            ALTER TABLE pm_decision_log
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_pm_decision_log_extended done')
+
+
+def ensure_news_impact_stats(cur):
+    '''Aggregated news impact statistics per event_type/region/regime.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.news_impact_stats (
+            id SERIAL PRIMARY KEY,
+            event_type VARCHAR(50) NOT NULL,
+            region VARCHAR(20) DEFAULT 'GLOBAL',
+            regime VARCHAR(20) DEFAULT 'NORMAL',
+            avg_ret_2h FLOAT,
+            med_ret_2h FLOAT,
+            std_ret_2h FLOAT,
+            avg_abs_ret_2h FLOAT,
+            sample_count INT DEFAULT 0,
+            last_updated TIMESTAMP DEFAULT NOW(),
+            stats_version VARCHAR(30),
+            UNIQUE(event_type, region, regime)
+        );
+    """)
+    _log('ensure_news_impact_stats done')
+
+
 def ensure_exchange_policy_audit(cur):
     '''Exchange policy audit results — 10-day compliance review.'''
     cur.execute("""
@@ -1051,6 +1087,10 @@ def run_all():
             ensure_event_lock(cur)
             ensure_hold_consecutive(cur)
             ensure_claude_call_log(cur)
+            # Extended pm_decision_log columns
+            ensure_pm_decision_log_extended(cur)
+            # News impact stats table
+            ensure_news_impact_stats(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

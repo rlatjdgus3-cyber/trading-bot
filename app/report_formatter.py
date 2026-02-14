@@ -19,6 +19,7 @@ ACTION_KR = {
     'ADD': '추가 진입',
     'ENTRY_POSSIBLE': '진입 가능',
     'ABORT': '중단',
+    'SKIP': 'SKIP(API fail)',
 }
 
 DIRECTION_KR = {
@@ -221,17 +222,73 @@ def detect_english_ratio(text: str) -> float:
     return en_count / max(len(words), 1)
 
 
+_COMMON_EN_TO_KR = {
+    'Stop-Loss': '손절',
+    'stop loss': '손절',
+    'Stop Loss': '손절',
+    'Take Profit': '익절',
+    'take profit': '익절',
+    'Entry': '진입',
+    'entry': '진입',
+    'Position': '포지션',
+    'position': '포지션',
+    'Confidence': '확신도',
+    'confidence': '확신도',
+    'Risk Level': '위험도',
+    'risk level': '위험도',
+    'Reason': '근거',
+    'reason': '근거',
+    'Action': '조치',
+    'action': '조치',
+    'Current': '현재',
+    'current': '현재',
+    'Signal': '신호',
+    'signal': '신호',
+    'Trigger': '트리거',
+    'trigger': '트리거',
+    'Summary': '요약',
+    'summary': '요약',
+    'Analysis': '분석',
+    'analysis': '분석',
+    'Recommendation': '권고',
+    'recommendation': '권고',
+    'Warning': '경고',
+    'warning': '경고',
+    'Error': '오류',
+    'error': '오류',
+    'Failed': '실패',
+    'failed': '실패',
+    'Success': '성공',
+    'success': '성공',
+    'Active': '활성',
+    'active': '활성',
+    'Inactive': '비활성',
+    'inactive': '비활성',
+    'Pending': '대기 중',
+    'pending': '대기 중',
+    'Completed': '완료',
+    'completed': '완료',
+    'No position': '포지션 없음',
+    'no position': '포지션 없음',
+    'none': '없음',
+}
+
+
 def sanitize_telegram_text(text: str) -> str:
-    """텔레그램 전송 전 영어 비율 검사. 20% 초과시 경고 로그."""
-    ratio = detect_english_ratio(text)
+    """텔레그램 전송 전 영어→한국어 치환 + 비율 검사."""
+    if not text:
+        return text
+    result = text
+    for en, kr in _COMMON_EN_TO_KR.items():
+        result = result.replace(en, kr)
+    ratio = detect_english_ratio(result)
     if ratio > 0.2:
-        # 로그만 남기고 전송은 허용 (차단하면 중요 메시지 누락 위험)
         try:
             print(f'[report_formatter] LANGUAGE_WARNING: english_ratio={ratio:.2f} '
-                  f'text_preview={text[:80]!r}', flush=True)
+                  f'text_preview={result[:80]!r}', flush=True)
         except Exception:
             pass
-    return text
+    return result
 
 
 # ── 유틸리티 ─────────────────────────────────────────────
@@ -456,7 +513,8 @@ def format_news_analysis(macro_news, crypto_news, news_score,
 
 def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
                            scores, pos_state, details, news_items,
-                           watch_kw, execute_status, ai_meta):
+                           watch_kw, execute_status, ai_meta,
+                           claude_failed=False):
     """전략 보고 전체 포매팅."""
     parsed = parsed or {}
     scores = scores or {}
@@ -490,14 +548,20 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     else:
         lines.append('- 포지션: 없음')
 
-    lines.append(f'- 참조신호: {dominant} stage{stage} (총점 {total:+.1f})')
+    # 참조신호: 디버그 모드에서만 표시
+    if is_debug_on():
+        lines.append(f'- 참조신호: {dominant} stage{stage} (총점 {total:+.1f})')
 
-    confidence = parsed.get('confidence')
-    reason_code = parsed.get('reason_code', '')
-    if confidence is not None:
-        lines.append(f'- 확신도: {confidence}')
-    if reason_code:
-        lines.append(f'- 근거: {_kr_reason_code(reason_code)}')
+    # Claude 실패 시 SKIP 한 줄만, 성공 시 확신도+근거 표시
+    if claude_failed:
+        lines.append('- Claude: SKIP(API fail)')
+    else:
+        confidence = parsed.get('confidence')
+        reason_code = parsed.get('reason_code', '')
+        if confidence is not None:
+            lines.append(f'- 확신도: {confidence}')
+        if reason_code:
+            lines.append(f'- 근거: {_kr_reason_code(reason_code)}')
 
     # ── [📊 점수 상세] ──
     lines.append('')
@@ -511,10 +575,11 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     # ── [📰 뉴스 요약] ──
     lines.append('')
     lines.append('[📰 뉴스 요약]')
-    if not news_items:
+    display_news = [n for n in news_items if n.get('relevance', 'MED') != 'LOW']
+    if not display_news:
         lines.append('- 최근 6시간 고영향 뉴스 없음')
     else:
-        for i, n in enumerate(news_items[:3], 1):
+        for i, n in enumerate(display_news[:3], 1):
             impact = _safe_int(n.get('impact_score'))
             title = (n.get('title_ko') or n.get('title') or '')[:80]
             source = n.get('source', '')
@@ -526,7 +591,7 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
 
         # Watchlist 매칭
         matched = set()
-        for n in news_items:
+        for n in display_news:
             text_lower = ((n.get('title') or '') + ' ' + (n.get('summary') or '')).lower()
             for kw in watch_kw:
                 if kw in text_lower:
@@ -591,7 +656,8 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
 
 # ── 전략 판단 알림 ───────────────────────────────────────
 
-def format_decision_alert(action, parsed, engine_action, scores, pos_state):
+def format_decision_alert(action, parsed, engine_action, scores, pos_state,
+                          claude_failed=False):
     """전략 판단 알림 포매팅."""
     parsed = parsed or {}
     scores = scores or {}
@@ -604,12 +670,15 @@ def format_decision_alert(action, parsed, engine_action, scores, pos_state):
 
     lines = [
         f'[📋 전략 판단]',
-        f'- Claude: {_kr_action_ctx(action, side)}',
-        f'- 확신도: {parsed.get("confidence", "?")}',
-        f'- 근거: {_kr_reason_code(parsed.get("reason_code", "?"))}',
-        f'- 엔진 참조: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}',
-        f'- 포지션: {side} {qty} BTC',
+        f'- 최종: {_kr_action_ctx(action, side)}',
+        f'- 엔진: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}',
     ]
+    if claude_failed:
+        lines.append('- Claude: SKIP(API fail)')
+    else:
+        lines.append(f'- 확신도: {parsed.get("confidence", "?")}')
+        lines.append(f'- 근거: {_kr_reason_code(parsed.get("reason_code", "?"))}')
+    lines.append(f'- 포지션: {side} {qty} BTC')
     return '\n'.join(lines)
 
 
