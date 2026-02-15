@@ -155,9 +155,10 @@ def _fetch_position(cur):
 
 
 def _fetch_categorized_news(cur, max_news=5):
-    """Fetch recent news categorized into macro/crypto with IDs for trace lookup."""
+    """Fetch recent news categorized into macro/crypto/ignored with IDs for trace lookup."""
     macro_news = []
     crypto_news = []
+    ignored_news = []
     stats = {'total': 0, 'enriched': 0, 'high_impact': 0,
              'bullish': 0, 'bearish': 0, 'neutral': 0,
              'categories': {}}
@@ -183,11 +184,13 @@ def _fetch_categorized_news(cur, max_news=5):
             stats['bearish'] = sr[4] or 0
             stats['neutral'] = sr[5] or 0
 
-        # News items with id
+        # News items with id (include tier/relevance columns)
         cur.execute("""
             SELECT id, title, source, impact_score, summary,
                    to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr,
-                   keywords
+                   keywords, title_ko,
+                   COALESCE(tier, 'UNKNOWN') AS tier,
+                   relevance_score, source_tier, exclusion_reason
             FROM news
             WHERE ts >= now() - interval '6 hours'
               AND impact_score > 0
@@ -199,6 +202,10 @@ def _fetch_categorized_news(cur, max_news=5):
         for r in rows:
             news_id = r[0]
             summary_raw = r[4] or ''
+            tier = r[8] or 'UNKNOWN'
+            rel_score = float(r[9]) if r[9] is not None else None
+            source_tier = r[10] or ''
+            exclusion_reason = r[11] or None
             cat = report_formatter._parse_news_category(summary_raw)
             direction = report_formatter._parse_news_direction(summary_raw)
             impact_path = report_formatter._parse_impact_path(summary_raw)
@@ -212,6 +219,7 @@ def _fetch_categorized_news(cur, max_news=5):
             item = {
                 'id': news_id,
                 'title': r[1] or '',
+                'title_ko': r[7] or '',
                 'source': r[2] or '',
                 'impact_score': int(r[3]) if r[3] else 0,
                 'summary': summary_raw,
@@ -223,23 +231,186 @@ def _fetch_categorized_news(cur, max_news=5):
                 'ts': r[5] or '',
                 'keywords': list(r[6]) if r[6] else [],
                 'trace': {},
+                'tier': tier,
+                'relevance_score': rel_score,
+                'source_tier': source_tier,
             }
             stats['categories'][cat] = stats['categories'].get(cat, 0) + 1
 
-            if cat in report_formatter.CRYPTO_CATEGORIES:
-                crypto_news.append(item)
-            elif cat in report_formatter.MACRO_CATEGORIES:
-                macro_news.append(item)
+            # 3-way 분류: 제외 vs 전략반영(macro/crypto)
+            # Tier 기반 강화 필터:
+            #   TIERX → 무조건 제외
+            #   TIER3 + rel_score < 0.6 → 제외 (일반 시황)
+            #   TIER1/TIER2 + STRATEGY_CATEGORIES → 전략 반영
+            from news_event_scorer import STRATEGY_CATEGORIES
+            if (exclusion_reason
+                    or tier == 'TIERX'
+                    or (rel_score is not None and rel_score < 0.6)
+                    or (tier == 'TIER3' and cat not in STRATEGY_CATEGORIES)):
+                ignore_reason = exclusion_reason or f'tier={tier}'
+                if rel_score is not None and rel_score < 0.6 and not exclusion_reason:
+                    ignore_reason = f'low_relevance: {rel_score}'
+                elif tier == 'TIER3' and cat not in STRATEGY_CATEGORIES:
+                    ignore_reason = 'tier=TIER3'
+                item['ignore_reason'] = ignore_reason
+                ignored_news.append(item)
             else:
-                if item['source'] in ('coindesk', 'cointelegraph'):
+                if cat in report_formatter.CRYPTO_CATEGORIES:
                     crypto_news.append(item)
-                else:
+                elif cat in report_formatter.MACRO_CATEGORIES:
                     macro_news.append(item)
+                else:
+                    if item['source'] in ('coindesk', 'cointelegraph'):
+                        crypto_news.append(item)
+                    else:
+                        macro_news.append(item)
 
     except Exception as e:
         _log(f'_fetch_categorized_news error: {e}')
 
-    return macro_news[:max_news], crypto_news[:max_news], stats
+    return macro_news[:max_news], crypto_news[:max_news], ignored_news, stats
+
+
+def _fetch_chart_flow(cur):
+    """4h/12h 추세 방향, BB 포지션, Ichimoku 클라우드 위치 조회."""
+    result = {
+        'trend_4h': 'neutral',
+        'trend_12h': 'neutral',
+        'bb_position': 'middle',  # upper/middle/lower
+        'ichimoku_cloud': 'neutral',  # above/below/inside
+    }
+    try:
+        # 4h trend: compare last close vs 4h-ago close
+        cur.execute("""
+            SELECT c FROM candles
+            WHERE symbol = 'BTC/USDT:USDT' AND tf = '1h'
+            ORDER BY ts DESC LIMIT 1;
+        """)
+        last_row = cur.fetchone()
+        cur.execute("""
+            SELECT c FROM candles
+            WHERE symbol = 'BTC/USDT:USDT' AND tf = '1h'
+              AND ts <= now() - interval '4 hours'
+            ORDER BY ts DESC LIMIT 1;
+        """)
+        h4_row = cur.fetchone()
+        if last_row and h4_row and last_row[0] and h4_row[0]:
+            price_now = float(last_row[0])
+            price_4h = float(h4_row[0])
+            diff_4h = (price_now - price_4h) / price_4h * 100
+            result['trend_4h'] = '상승' if diff_4h > 0.3 else ('하락' if diff_4h < -0.3 else '횡보')
+            result['trend_4h_pct'] = round(diff_4h, 2)
+
+        # 12h trend
+        cur.execute("""
+            SELECT c FROM candles
+            WHERE symbol = 'BTC/USDT:USDT' AND tf = '1h'
+              AND ts <= now() - interval '12 hours'
+            ORDER BY ts DESC LIMIT 1;
+        """)
+        h12_row = cur.fetchone()
+        if last_row and h12_row and last_row[0] and h12_row[0]:
+            price_now = float(last_row[0])
+            price_12h = float(h12_row[0])
+            diff_12h = (price_now - price_12h) / price_12h * 100
+            result['trend_12h'] = '상승' if diff_12h > 0.5 else ('하락' if diff_12h < -0.5 else '횡보')
+            result['trend_12h_pct'] = round(diff_12h, 2)
+
+        # BB position
+        cur.execute("""
+            SELECT bb_up, bb_mid, bb_dn FROM indicators
+            WHERE symbol = 'BTC/USDT:USDT'
+            ORDER BY ts DESC LIMIT 1;
+        """)
+        bb_row = cur.fetchone()
+        if bb_row and last_row and all(bb_row) and last_row[0]:
+            price = float(last_row[0])
+            bb_up = float(bb_row[0])
+            bb_mid = float(bb_row[1])
+            bb_dn = float(bb_row[2])
+            if price > bb_up:
+                result['bb_position'] = '상단 돌파'
+            elif price > bb_mid:
+                result['bb_position'] = '상단 영역'
+            elif price > bb_dn:
+                result['bb_position'] = '하단 영역'
+            else:
+                result['bb_position'] = '하단 이탈'
+
+        # Ichimoku cloud position
+        cur.execute("""
+            SELECT ich_span_a, ich_span_b FROM indicators
+            WHERE symbol = 'BTC/USDT:USDT'
+            ORDER BY ts DESC LIMIT 1;
+        """)
+        ich_row = cur.fetchone()
+        if ich_row and last_row and last_row[0]:
+            price = float(last_row[0])
+            senkou_a = float(ich_row[0]) if ich_row[0] else None
+            senkou_b = float(ich_row[1]) if ich_row[1] else None
+            if senkou_a and senkou_b:
+                cloud_top = max(senkou_a, senkou_b)
+                cloud_bot = min(senkou_a, senkou_b)
+                if price > cloud_top:
+                    result['ichimoku_cloud'] = '클라우드 위'
+                elif price < cloud_bot:
+                    result['ichimoku_cloud'] = '클라우드 아래'
+                else:
+                    result['ichimoku_cloud'] = '클라우드 내부'
+    except Exception as e:
+        _log(f'_fetch_chart_flow error: {e}')
+
+    return result
+
+
+def _fetch_conditional_scenarios(scores, snapshot):
+    """2-3개 조건부 시나리오 생성."""
+    scenarios = []
+    price = snapshot.get('price', 0)
+    bb_up = snapshot.get('bb_up', 0)
+    bb_dn = snapshot.get('bb_dn', 0)
+    val = snapshot.get('val', 0)
+    vah = snapshot.get('vah', 0)
+
+    if bb_up and price:
+        dist_to_bb_up = (bb_up - price) / price * 100
+        if 0 < dist_to_bb_up < 2:
+            scenarios.append(
+                f'BB 상단(${bb_up:,.0f}) 돌파 시 → 추세 강화, 추가 매수 검토'
+            )
+
+    if val and price:
+        dist_to_val = (price - val) / price * 100
+        if 0 < dist_to_val < 2:
+            scenarios.append(
+                f'VAL(${val:,.0f}) 이탈 시 → 매도 압력 증가, 축소/손절 검토'
+            )
+
+    if bb_dn and price:
+        dist_to_bb_dn = (price - bb_dn) / price * 100
+        if 0 < dist_to_bb_dn < 2:
+            scenarios.append(
+                f'BB 하단(${bb_dn:,.0f}) 터치 시 → 반등 가능, 분할 매수 검토'
+            )
+
+    if vah and price:
+        dist_to_vah = (vah - price) / price * 100
+        if 0 < dist_to_vah < 2:
+            scenarios.append(
+                f'VAH(${vah:,.0f}) 돌파 시 → 거래량 확인 후 추세 추종'
+            )
+
+    # Fallback scenario based on regime
+    total_score = _safe_float(scores.get('total', 0))
+    if not scenarios:
+        if total_score > 30:
+            scenarios.append('강세 지속 시 → 단계적 추가 진입 검토')
+        elif total_score < -30:
+            scenarios.append('약세 지속 시 → 포지션 축소 또는 손절 검토')
+        else:
+            scenarios.append('횡보 지속 시 → 관망, 방향성 확인 후 진입')
+
+    return scenarios[:3]
 
 
 def build_report_data(cur, exchange=None, max_news=5, detail=False):
@@ -272,9 +443,9 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
         if not snapshot.get('price') and scores.get('price'):
             snapshot['price'] = scores['price']
 
-        # 5. Categorized news
+        # 5. Categorized news (3-way: macro, crypto, ignored)
         max_n = max_news if not detail else max(max_news, 7)
-        macro_news, crypto_news, stats = _fetch_categorized_news(cur, max_n)
+        macro_news, crypto_news, ignored_news, stats = _fetch_categorized_news(cur, max_n)
 
         # 6. Attach macro_trace to each news item
         all_news = macro_news + crypto_news
@@ -290,6 +461,19 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
             nid = n.get('id')
             if nid and nid in traces:
                 n['trace'] = traces[nid]
+
+        # 6b. Macro data snapshot (QQQ, SPY, DXY, US10Y, VIX)
+        macro_snapshot = {}
+        try:
+            cur.execute("""
+                SELECT DISTINCT ON (source) source, price,
+                       to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr
+                FROM macro_data ORDER BY source, ts DESC;
+            """)
+            macro_snapshot = {r[0]: {'price': float(r[1]), 'ts_kr': r[2]}
+                             for r in cur.fetchall() if r[1]}
+        except Exception as e:
+            _log(f'macro_snapshot error: {e}')
 
         # 7. Watch keywords
         watch_matches = set()
@@ -344,6 +528,24 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
                     entry * (1 - sl_pct / 100) if side == 'long'
                     else entry * (1 + sl_pct / 100), 1)
 
+        # Chart flow + conditional scenarios
+        chart_flow = _fetch_chart_flow(cur)
+        conditional_scenarios = _fetch_conditional_scenarios(scores, snapshot)
+
+        # Macro data staleness check (Phase F)
+        macro_stale_info = {}
+        try:
+            cur.execute("SELECT MAX(ts) FROM macro_data WHERE source = 'QQQ';")
+            row = cur.fetchone()
+            if row and row[0]:
+                from datetime import datetime, timezone
+                age_h = (datetime.now(timezone.utc) - row[0]).total_seconds() / 3600
+                if age_h > 1:
+                    macro_stale_info['macro_stale'] = True
+                    macro_stale_info['macro_age_hours'] = round(age_h, 1)
+        except Exception as e:
+            _log(f'macro staleness check error: {e}')
+
         data = {
             'snapshot': snapshot,
             'scores': {
@@ -367,10 +569,15 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
             },
             'macro_news': macro_news,
             'crypto_news': crypto_news,
+            'ignored_news': ignored_news,
+            'macro_snapshot': macro_snapshot,
             'stats': stats,
             'watch_matches': sorted(watch_matches),
             'news_score_trace': score_trace,
             'action_constraints': news_evt.get('action_constraints', {}),
+            'chart_flow': chart_flow,
+            'conditional_scenarios': conditional_scenarios,
+            **macro_stale_info,
         }
         return data
 
@@ -386,11 +593,15 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
             'position': {},
             'macro_news': [],
             'crypto_news': [],
+            'ignored_news': [],
             'stats': {'total': 0, 'enriched': 0, 'high_impact': 0,
                       'bullish': 0, 'bearish': 0, 'neutral': 0,
                       'categories': {}},
             'watch_matches': [],
             'news_score_trace': '',
             'action_constraints': {},
+            'macro_snapshot': {},
+            'chart_flow': {},
+            'conditional_scenarios': [],
             'error': str(e),
         }

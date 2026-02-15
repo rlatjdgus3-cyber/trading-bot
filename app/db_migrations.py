@@ -1004,8 +1004,8 @@ def ensure_exchange_policy_audit(cur):
         CREATE TABLE IF NOT EXISTS public.exchange_policy_audit (
             id                          BIGSERIAL PRIMARY KEY,
             ts                          TIMESTAMPTZ NOT NULL DEFAULT now(),
-            audit_period_start          TIMESTAMPTZ NOT NULL,
-            audit_period_end            TIMESTAMPTZ NOT NULL,
+            audit_period_start          TIMESTAMPTZ,
+            audit_period_end            TIMESTAMPTZ,
             total_orders                INTEGER NOT NULL DEFAULT 0,
             total_rejections            INTEGER NOT NULL DEFAULT 0,
             rejection_rate              NUMERIC NOT NULL DEFAULT 0,
@@ -1014,11 +1014,44 @@ def ensure_exchange_policy_audit(cur):
             mode_mismatch_events        INTEGER NOT NULL DEFAULT 0,
             protection_mode_activations INTEGER NOT NULL DEFAULT 0,
             report_text                 TEXT,
-            detail                      JSONB NOT NULL DEFAULT '{}'::jsonb
+            detail                      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            symbol                      TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            audit_type                  TEXT NOT NULL DEFAULT 'periodic_audit',
+            metadata                    JSONB
         );
     """)
+    # Add columns for exchange_audit.py (symbol, audit_type, metadata)
+    for col, dtype in (('symbol', "TEXT NOT NULL DEFAULT 'BTC/USDT:USDT'"),
+                       ('audit_type', "TEXT NOT NULL DEFAULT 'periodic_audit'"),
+                       ('metadata', 'JSONB')):
+        cur.execute(f"""
+            ALTER TABLE exchange_policy_audit
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    # Make audit_period_start/end nullable for exchange_audit.py rows
+    cur.execute("""
+        ALTER TABLE exchange_policy_audit
+            ALTER COLUMN audit_period_start DROP NOT NULL;
+    """)
+    cur.execute("""
+        ALTER TABLE exchange_policy_audit
+            ALTER COLUMN audit_period_end DROP NOT NULL;
+    """)
     cur.execute('CREATE INDEX IF NOT EXISTS idx_epa_ts ON exchange_policy_audit(ts);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_epa_symbol ON exchange_policy_audit(symbol);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_epa_audit_type ON exchange_policy_audit(audit_type);')
     _log('ensure_exchange_policy_audit done')
+
+
+def ensure_execution_log_audit_columns(cur):
+    '''Add error_code and error_message columns to execution_log for exchange_audit.py.'''
+    for col, dtype in (('error_code', 'TEXT'),
+                       ('error_message', 'TEXT')):
+        cur.execute(f"""
+            ALTER TABLE execution_log
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_execution_log_audit_columns done')
 
 
 def cleanup_old_data(cur):
@@ -1050,6 +1083,160 @@ def cleanup_old_data(cur):
                 _log(f'cleanup {table}: deleted {deleted} rows (>{days}d)')
         except Exception as e:
             _log(f'cleanup {table} skip: {e}')
+
+
+def ensure_macro_events():
+    """macro_events 테이블 생성 — 거시경제 이벤트 이력."""
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS macro_events (
+                    id SERIAL PRIMARY KEY,
+                    event_type VARCHAR(20) NOT NULL,
+                    event_date DATE NOT NULL,
+                    actual_value NUMERIC,
+                    expected_value NUMERIC,
+                    previous_value NUMERIC,
+                    impact_direction VARCHAR(10),
+                    btc_ret_1h NUMERIC,
+                    btc_ret_4h NUMERIC,
+                    btc_ret_24h NUMERIC,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    UNIQUE(event_type, event_date)
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_macro_events_type_date
+                ON macro_events(event_type, event_date DESC);
+            """)
+            conn.commit()
+            _log('ensure_macro_events: OK')
+    except Exception as e:
+        conn.rollback()
+        _log(f'ensure_macro_events: {e}')
+    finally:
+        conn.close()
+
+
+def ensure_news_relevance_verified():
+    """news 테이블에 relevance_verified 컬럼 추가."""
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                ALTER TABLE news ADD COLUMN IF NOT EXISTS relevance_verified BOOLEAN DEFAULT NULL;
+            """)
+            conn.commit()
+            _log('ensure_news_relevance_verified: OK')
+    except Exception as e:
+        conn.rollback()
+        _log(f'ensure_news_relevance_verified: {e}')
+    finally:
+        conn.close()
+
+
+def ensure_news_tier_columns(cur):
+    """news 테이블에 tier/relevance_score/source_tier/exclusion_reason/direction_hit 컬럼 추가."""
+    for col, dtype in (('tier', "TEXT DEFAULT 'UNKNOWN'"),
+                       ('relevance_score', 'NUMERIC DEFAULT NULL'),
+                       ('source_tier', 'TEXT DEFAULT NULL'),
+                       ('exclusion_reason', 'TEXT DEFAULT NULL'),
+                       ('direction_hit', 'BOOLEAN DEFAULT NULL')):
+        cur.execute(f"""
+            ALTER TABLE news ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_news_tier_ts ON news(tier, ts DESC);')
+    _log('ensure_news_tier_columns done')
+
+
+def ensure_news_source_accuracy(cur):
+    """news_source_accuracy 테이블 — 소스별 방향 예측 적중률."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.news_source_accuracy (
+            id SERIAL PRIMARY KEY,
+            source TEXT NOT NULL,
+            category TEXT DEFAULT 'ALL',
+            total_predictions INT DEFAULT 0,
+            correct_predictions INT DEFAULT 0,
+            hit_rate NUMERIC DEFAULT 0.0,
+            last_updated TIMESTAMP DEFAULT NOW(),
+            UNIQUE(source, category)
+        );
+    """)
+    _log('ensure_news_source_accuracy done')
+
+
+def ensure_error_log(cur):
+    """에러 로그 테이블 (scheduled_liquidation CRITICAL 등)."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS error_log (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            service VARCHAR(50),
+            level VARCHAR(20) DEFAULT 'ERROR',
+            message TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_error_log_ts
+        ON error_log(ts DESC);
+    """)
+    _log('ensure_error_log done')
+
+
+def ensure_service_health_log(cur):
+    """서비스 헬스체크 3-state 로깅 테이블."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS service_health_log (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            service VARCHAR(50) NOT NULL,
+            state VARCHAR(10) NOT NULL CHECK (state IN ('OK','DOWN','UNKNOWN')),
+            detail TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_shl_svc_ts
+        ON service_health_log(service, ts DESC);
+    """)
+    _log('ensure_service_health_log done')
+
+
+def ensure_news_topic_columns(cur):
+    """news 테이블에 topic_class, asset_relevance 컬럼 추가."""
+    cur.execute("""
+        ALTER TABLE news ADD COLUMN IF NOT EXISTS topic_class VARCHAR(20);
+    """)
+    cur.execute("""
+        ALTER TABLE news ADD COLUMN IF NOT EXISTS asset_relevance VARCHAR(20);
+    """)
+    _log('ensure_news_topic_columns done')
+
+
+def ensure_macro_trace_qqq_columns(cur):
+    """macro_trace 테이블에 QQQ 수익률 컬럼 추가."""
+    cur.execute("""
+        ALTER TABLE macro_trace ADD COLUMN IF NOT EXISTS qqq_ret_2h FLOAT;
+    """)
+    cur.execute("""
+        ALTER TABLE macro_trace ADD COLUMN IF NOT EXISTS qqq_ret_24h FLOAT;
+    """)
+    _log('ensure_macro_trace_qqq_columns done')
+
+
+def ensure_news_impact_stats_extended(cur):
+    """news_impact_stats 확장 컬럼 추가."""
+    cur.execute("""
+        ALTER TABLE news_impact_stats ADD COLUMN IF NOT EXISTS avg_ret_30m FLOAT;
+    """)
+    cur.execute("""
+        ALTER TABLE news_impact_stats ADD COLUMN IF NOT EXISTS avg_abs_ret_24h FLOAT;
+    """)
+    cur.execute("""
+        ALTER TABLE news_impact_stats ADD COLUMN IF NOT EXISTS direction_accuracy FLOAT;
+    """)
+    _log('ensure_news_impact_stats_extended done')
 
 
 def run_all():
@@ -1114,8 +1301,9 @@ def run_all():
             ensure_execution_queue_compliance_columns(cur)
             # News title_ko for Korean translation
             ensure_news_title_ko(cur)
-            # Exchange policy audit
+            # Exchange policy audit + execution_log audit columns
             ensure_exchange_policy_audit(cur)
+            ensure_execution_log_audit_columns(cur)
             # DB-based event dedup lock (replaces in-memory dedup)
             ensure_event_lock(cur)
             ensure_hold_consecutive(cur)
@@ -1126,8 +1314,25 @@ def run_all():
             ensure_news_impact_stats(cur)
             # Hourly trade limit 8→15
             ensure_safety_limits_hourly_15(cur)
+            # Macro events table (FRED/FOMC history)
+            ensure_macro_events()
+            # News relevance_verified column
+            ensure_news_relevance_verified()
+            # News tier columns + source accuracy table
+            ensure_news_tier_columns(cur)
+            ensure_news_source_accuracy(cur)
             # Data retention cleanup
             cleanup_old_data(cur)
+            # Error log table
+            ensure_error_log(cur)
+            # Phase 2: Service health log
+            ensure_service_health_log(cur)
+            # Phase 3: News topic classification columns
+            ensure_news_topic_columns(cur)
+            # Phase 4: Macro trace QQQ columns
+            ensure_macro_trace_qqq_columns(cur)
+            # Phase 5: News impact stats extended columns
+            ensure_news_impact_stats_extended(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

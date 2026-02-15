@@ -17,6 +17,7 @@ Components (5 factors):
   5. watchlist_bonus  (0-15): watch_keywords match count
 """
 import os
+import re
 import sys
 import json
 import traceback
@@ -32,7 +33,7 @@ SOURCE_QUALITY = {
     'bloomberg': 18, 'reuters': 18, 'wsj': 17,
     'cnbc': 16, 'coindesk': 16, 'ft': 16,
     'marketwatch': 15, 'cointelegraph': 15,
-    'yahoo': 12, 'decrypt': 12, 'theblock': 14,
+    'yahoo': 8, 'decrypt': 12, 'theblock': 14,
     'coinglass': 10, 'cryptopanic': 8,
 }
 SOURCE_QUALITY_DEFAULT = 8
@@ -86,8 +87,33 @@ WATCH_KEYWORDS_DEFAULT = [
 # ── Relevance filter ──────────────────────────────────────
 
 LIST_ARTICLE_KEYWORDS = {'5선', 'top', 'best', 'list', '추천', '정리',
-                         'roundup', 'picks', 'ranking', '순위'}
+                         'roundup', 'picks', 'ranking', '순위',
+                         'quiz', 'recipe', 'travel', 'lifestyle',
+                         'celebrity', 'entertainment', 'sports', 'dating'}
+MINIMUM_IMPACT_FOR_SCORING = 3
 RELEVANCE_MULTIPLIERS = {'HIGH': 1.0, 'MED': 0.5, 'LOW': 0.0}
+
+# ── Tier multipliers ─────────────────────────────────────
+TIER_MULTIPLIERS = {
+    'TIER1': 1.0,
+    'TIER2': 0.7,
+    'TIER3': 0.1,
+    'TIERX': 0.0,
+    'UNKNOWN': 0.5,  # 기존 데이터 호환: tier 미분류 → 50% 반영
+}
+
+# ── 전략 반영 카테고리 ────────────────────────────────────
+# STRATEGY_CATEGORIES에 포함된 카테고리만 전략 점수에 의미있게 반영
+STRATEGY_TIER1 = {'FED_RATES', 'CPI_JOBS', 'REGULATION_SEC_ETF', 'WAR'}
+STRATEGY_TIER2 = {'NASDAQ_EQUITIES', 'US_POLITICS', 'FIN_STRESS', 'CRYPTO_SPECIFIC'}
+STRATEGY_CATEGORIES = STRATEGY_TIER1 | STRATEGY_TIER2
+# 카테고리별 전략 가중치
+STRATEGY_CATEGORY_MULT = {}
+for _c in STRATEGY_TIER1:
+    STRATEGY_CATEGORY_MULT[_c] = 1.0
+for _c in STRATEGY_TIER2:
+    STRATEGY_CATEGORY_MULT[_c] = 0.7
+MINIMUM_RELEVANCE_FOR_SCORING = 0.6
 
 CRYPTO_DIRECT_KEYWORDS = {
     'bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'blockchain',
@@ -99,20 +125,36 @@ CRYPTO_DIRECT_KEYWORDS = {
 }
 
 
-def _classify_relevance(title, category, impact_score, summary=''):
-    """HIGH / MED / LOW 분류. OTHER 카테고리에서 crypto 키워드 2개 미만 → LOW."""
+def _classify_relevance(title, category, impact_score, summary='',
+                        tier=None, relevance_score=None):
+    """HIGH / MED / LOW 분류.
+
+    DB relevance_score 우선 사용. TIERX → 항상 LOW.
+    """
+    # TIERX → 항상 LOW
+    if tier == 'TIERX':
+        return 'LOW'
+
+    # DB relevance_score가 있으면 우선 사용
+    if relevance_score is not None:
+        if relevance_score >= 0.8:
+            return 'HIGH'
+        elif relevance_score >= 0.6:
+            return 'MED'
+        else:
+            return 'LOW'
+
+    # 기존 휴리스틱 fallback
     title_lower = (title or '').lower()
     impact = int(impact_score or 0)
     if any(kw in title_lower for kw in LIST_ARTICLE_KEYWORDS):
         return 'LOW'
     if category == 'OTHER' and impact <= 3:
         return 'LOW'
-    # OTHER 카테고리: crypto 키워드 2개 미만이면 LOW
-    # (FED_RATES, CPI_JOBS 등 매크로 카테고리는 OTHER가 아니므로 자연 면제)
     if category == 'OTHER':
         combined = title_lower + ' ' + (summary or '').lower()
         crypto_hits = sum(1 for kw in CRYPTO_DIRECT_KEYWORDS if kw in combined)
-        if crypto_hits < 2:
+        if crypto_hits < 3:
             return 'LOW'
     if impact >= 7:
         return 'HIGH'
@@ -166,7 +208,7 @@ def _load_db_category_weights(cur):
             weight = int(round(5 + normalized * 20))
             weight = max(5, min(25, weight))
             # Only use if enough samples
-            if sample_count and int(sample_count) >= 5:
+            if sample_count and int(sample_count) >= 10:
                 db_weights[event_type] = weight
             total_samples += int(sample_count or 0)
             if sv:
@@ -237,7 +279,6 @@ def _parse_category_tag(summary):
     """Extract category from summary like '[up] [FED_RATES] ...'."""
     if not summary:
         return 'OTHER'
-    import re
     tags = re.findall(r'\[([A-Za-z_]+)\]', summary)
     direction_tags = {'up', 'down', 'neutral', 'bullish', 'bearish'}
     for tag in tags:
@@ -287,8 +328,189 @@ def _majority_direction(gpt_dir, trace_ret_2h, kw_sentiment):
     return 1 if total >= 0 else -1
 
 
+MACRO_CATEGORIES = {
+    'FED_RATES', 'CPI_JOBS', 'NASDAQ_EQUITIES', 'US_POLITICS',
+    'WAR', 'JAPAN_BOJ', 'CHINA', 'FIN_STRESS',
+}
+CRYPTO_CATEGORIES = {'CRYPTO_SPECIFIC', 'REGULATION_SEC_ETF'}
+
+# Macro/crypto score blend weights
+MACRO_WEIGHT = 0.6
+CRYPTO_WEIGHT = 0.4
+
+
+def _macro_corroboration(cur, direction_sign):
+    """QQQ 2시간 변동과 뉴스 방향 일치 여부 확인.
+
+    일치 시 보너스 (+5점), 불일치 시 감점 (-3점).
+    """
+    try:
+        cur.execute("""
+            WITH latest AS (SELECT price FROM macro_data WHERE source='QQQ' ORDER BY ts DESC LIMIT 1),
+                 past AS (SELECT price FROM macro_data WHERE source='QQQ' AND ts <= now()-interval '2h' ORDER BY ts DESC LIMIT 1)
+            SELECT (SELECT price FROM latest) - (SELECT price FROM past);
+        """)
+        row = cur.fetchone()
+        if row and row[0]:
+            qqq_change = float(row[0])
+            if (qqq_change > 0 and direction_sign > 0) or (qqq_change < 0 and direction_sign < 0):
+                return 5   # 일치 보너스
+            elif abs(qqq_change) > 1.0:
+                return -3  # 불일치 감점
+    except Exception:
+        pass
+    return 0
+
+
+def _get_macro_context(cur):
+    """Get current QQQ/VIX values for score_trace context."""
+    try:
+        cur.execute("""
+            SELECT DISTINCT ON (source) source, price
+            FROM macro_data
+            WHERE source IN ('QQQ', 'VIX')
+            ORDER BY source, ts DESC;
+        """)
+        return {r[0]: float(r[1]) for r in cur.fetchall() if r[1]}
+    except Exception:
+        return {}
+
+
+def _score_group(items, traces, watch_kw, row_tiers=None, row_rel_scores=None,
+                  source_accuracy=None):
+    """Score a group of news items (macro or crypto). Returns (magnitude, direction_sign, components, stats)."""
+    agg_source = 0.0
+    agg_category = 0.0
+    agg_recency = 0.0
+    agg_reaction = 0.0
+    agg_watchlist = 0.0
+    agg_weight = 0.0
+    direction_votes_sum = 0
+    watch_matched = set()
+    total_bull = 0
+    total_bear = 0
+    total_neutral = 0
+    row_tiers = row_tiers or {}
+    row_rel_scores = row_rel_scores or {}
+    source_accuracy = source_accuracy or {}
+
+    for r in items[:10]:
+        news_id = r[0]
+        title, source, impact, summary, age_min, ts, keywords = r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+        cat = _parse_category_tag(summary)
+        gpt_dir = _parse_direction_tag(summary)
+        text = f'{title or ""} {summary or ""}'
+        kw_sent = _keyword_sentiment(text)
+
+        if gpt_dir == 'up':
+            total_bull += 1
+        elif gpt_dir == 'down':
+            total_bear += 1
+        else:
+            total_neutral += 1
+
+        f_source = _get_source_quality(source)
+        f_category = CATEGORY_WEIGHT.get(cat, 5)
+        f_recency = _get_recency_score(age_min)
+
+        f_reaction = 0
+        trace = traces.get(news_id, {})
+        ret_2h = trace.get('btc_ret_2h')
+        ret_24h = trace.get('btc_ret_24h')
+        spike_z = trace.get('spike_zscore')
+        if ret_2h is not None:
+            base = min(25, abs(ret_2h) * 12.5)
+            confirm_24h = min(5, abs(ret_24h) * 2.5) if ret_24h else 0
+            vol_bonus = min(5, spike_z * 1.5) if spike_z and spike_z > 1.0 else 0
+            f_reaction = min(25, round(base + confirm_24h * 0.3 + vol_bonus * 0.2))
+
+        f_watchlist = 0
+        text_lower = text.lower()
+        kw_list = list(keywords) if keywords else []
+        combined = text_lower + ' ' + ' '.join(str(k).lower() for k in kw_list)
+        matched_here = set()
+        for wk in watch_kw:
+            if wk in combined:
+                matched_here.add(wk)
+                watch_matched.add(wk)
+        f_watchlist = min(15, len(matched_here) * 5)
+
+        item_mag = f_source + f_category + f_recency + f_reaction + f_watchlist
+        item_dir = _majority_direction(gpt_dir, ret_2h, kw_sent)
+
+        # 티어/relevance_score 조회 (classify 전에 먼저 로드)
+        item_tier = row_tiers.get(news_id, 'UNKNOWN')
+        item_rel_score = row_rel_scores.get(news_id)
+
+        w = float(impact) if impact else 3.0
+        relevance = _classify_relevance(title, cat, impact, summary,
+                                        tier=item_tier,
+                                        relevance_score=item_rel_score)
+        relevance_mult = RELEVANCE_MULTIPLIERS.get(relevance, 1.0)
+        effective_w = w * relevance_mult
+
+        # 티어 승수 적용
+        tier_mult = TIER_MULTIPLIERS.get(item_tier, 0.0)
+        effective_w *= tier_mult
+
+        # 전략 카테고리 승수: STRATEGY_CATEGORIES 외 → 0.05 (사실상 무시)
+        strat_mult = STRATEGY_CATEGORY_MULT.get(cat, 0.05)
+        effective_w *= strat_mult
+
+        # relevance_score < 0.6 → 승수 0 (전략 반영 차단)
+        if item_rel_score is not None and item_rel_score < MINIMUM_RELEVANCE_FOR_SCORING:
+            effective_w = 0.0
+
+        # 소스 신뢰도 감소: hit_rate < 0.4 (20건+) → 50% 감소
+        sa_key = ((source or '').lower(), 'ALL')
+        sa_info = source_accuracy.get(sa_key, {})
+        if sa_info.get('total', 0) >= 20 and sa_info.get('hit_rate', 1.0) < 0.4:
+            effective_w *= 0.5
+
+        agg_source += f_source * effective_w
+        agg_category += f_category * effective_w
+        agg_recency += f_recency * effective_w
+        agg_reaction += f_reaction * effective_w
+        agg_watchlist += f_watchlist * effective_w
+        agg_weight += effective_w
+        direction_votes_sum += item_dir * effective_w
+
+    if agg_weight > 0:
+        comp_source = round(agg_source / agg_weight, 1)
+        comp_category = round(agg_category / agg_weight, 1)
+        comp_recency = round(agg_recency / agg_weight, 1)
+        comp_reaction = round(agg_reaction / agg_weight, 1)
+        comp_watchlist = round(agg_watchlist / agg_weight, 1)
+    else:
+        comp_source = comp_category = comp_recency = comp_reaction = comp_watchlist = 0
+
+    magnitude = round(comp_source + comp_category + comp_recency +
+                      comp_reaction + comp_watchlist)
+    magnitude = max(0, min(100, magnitude))
+    direction_sign = 1 if direction_votes_sum >= 0 else -1
+
+    components = {
+        'source_quality': comp_source,
+        'category_weight': comp_category,
+        'recency': comp_recency,
+        'market_reaction': comp_reaction,
+        'watchlist': comp_watchlist,
+    }
+    stats = {
+        'bullish': total_bull,
+        'bearish': total_bear,
+        'neutral': total_neutral,
+        'watch_matched': watch_matched,
+        'count': len(items),
+    }
+    return magnitude, direction_sign, components, stats
+
+
 def compute(cur):
     """Compute NEWS_EVENT_SCORE with 5-factor composite scoring.
+
+    매크로 vs 크립토 분리 스코어링 후 가중 합산.
+    macro_data 연동으로 방향 일치/불일치 보정.
 
     Returns:
         {
@@ -311,42 +533,72 @@ def compute(cur):
 
         watch_kw = _load_watch_keywords(cur)
 
-        # Fetch recent news (6h, impact > 0)
+        # Load source accuracy for trust weighting
+        source_accuracy = {}
+        try:
+            cur.execute("""
+                SELECT source, category, hit_rate, total_predictions
+                FROM news_source_accuracy
+                WHERE total_predictions >= 5;
+            """)
+            for sa_row in cur.fetchall():
+                source_accuracy[(sa_row[0], sa_row[1])] = {
+                    'hit_rate': float(sa_row[2]) if sa_row[2] else 0.0,
+                    'total': int(sa_row[3]) if sa_row[3] else 0,
+                }
+        except Exception:
+            pass
+
+        # Fetch recent news (6h, impact >= MINIMUM_IMPACT_FOR_SCORING, exclude TIERX)
         cur.execute("""
             SELECT id, title, source, impact_score, summary,
                    EXTRACT(EPOCH FROM (now() - ts)) / 60 AS age_min,
-                   ts, keywords
+                   ts, keywords,
+                   COALESCE(tier, 'UNKNOWN') AS tier,
+                   relevance_score
             FROM news
             WHERE ts >= now() - interval '6 hours'
-              AND impact_score > 0
+              AND impact_score >= %(min_impact)s
+              AND COALESCE(tier, 'UNKNOWN') NOT IN ('TIERX')
+              AND exclusion_reason IS NULL
             ORDER BY impact_score DESC, ts DESC
             LIMIT 30;
-        """)
+        """, {'min_impact': MINIMUM_IMPACT_FOR_SCORING})
         rows = cur.fetchall()
 
         if not rows:
             return _empty_result()
 
-        # Dedup: same category within 5 min → keep highest impact only
-        seen_cat_window = {}  # (category, 5min_bucket) → best_row
+        # Precompute category and tier for each row
+        row_cats = {r[0]: _parse_category_tag(r[4]) for r in rows}
+        row_tiers = {r[0]: r[8] for r in rows}
+        row_rel_scores = {r[0]: float(r[9]) if r[9] is not None else None for r in rows}
+
+        # Dedup: same category within 5 min → keep highest source_quality item
+        seen_cat_window = {}  # (category, 5min_bucket) → news_id
         deduped = []
+        deduped_ids = set()
         for r in rows:
-            news_id, title, source, impact, summary, age_min, ts, keywords = r
-            cat = _parse_category_tag(summary)
-            # 5-minute bucket
+            news_id, title, source, impact, summary, age_min, ts, keywords, tier, rel_score = r
+            cat = row_cats[news_id]
             bucket = int(age_min // 5)
             key = (cat, bucket)
             if key in seen_cat_window:
-                existing_impact = seen_cat_window[key][3]
-                if impact > existing_impact:
-                    seen_cat_window[key] = r
-                    # Replace in deduped
-                    deduped = [x for x in deduped if (
-                        _parse_category_tag(x[4]), int(x[5] // 5)) != key]
+                existing_id = seen_cat_window[key]
+                existing_r = next(x for x in deduped if x[0] == existing_id)
+                existing_quality = _get_source_quality(existing_r[2])
+                new_quality = _get_source_quality(source)
+                # Prefer higher source quality, then higher impact
+                if new_quality > existing_quality or (new_quality == existing_quality and impact > existing_r[3]):
+                    seen_cat_window[key] = news_id
+                    deduped = [x for x in deduped if x[0] != existing_id]
+                    deduped_ids.discard(existing_id)
                     deduped.append(r)
+                    deduped_ids.add(news_id)
             else:
-                seen_cat_window[key] = r
+                seen_cat_window[key] = news_id
                 deduped.append(r)
+                deduped_ids.add(news_id)
 
         if not deduped:
             return _empty_result()
@@ -360,133 +612,117 @@ def compute(cur):
         except Exception:
             pass
 
-        # Compute 5 factors for top news item (highest composite)
-        best_magnitude = 0
-        best_direction = 0
-        best_components = {}
-        best_detail = {}
-        total_bull = 0
-        total_bear = 0
-        total_neutral = 0
-
-        # Aggregate across all deduped news
-        agg_source = 0.0
-        agg_category = 0.0
-        agg_recency = 0.0
-        agg_reaction = 0.0
-        agg_watchlist = 0.0
-        agg_weight = 0.0
-        direction_votes_sum = 0
-        watch_matched = set()
-
-        for r in deduped[:10]:  # top 10 for scoring
-            news_id, title, source, impact, summary, age_min, ts, keywords = r
-            cat = _parse_category_tag(summary)
-            gpt_dir = _parse_direction_tag(summary)
-            text = f'{title or ""} {summary or ""}'
-            kw_sent = _keyword_sentiment(text)
-
-            # Track sentiment counts
-            if gpt_dir == 'up':
-                total_bull += 1
-            elif gpt_dir == 'down':
-                total_bear += 1
+        # 6-1: Separate macro vs crypto items using precomputed categories
+        macro_items = []
+        crypto_items = []
+        for r in deduped:
+            cat = row_cats[r[0]]
+            if cat in CRYPTO_CATEGORIES:
+                crypto_items.append(r)
             else:
-                total_neutral += 1
+                # MACRO_CATEGORIES + OTHER → macro (broader market impact)
+                macro_items.append(r)
 
-            # Factor 1: source_quality (0-20)
-            f_source = _get_source_quality(source)
+        # Score each group separately (with tier/relevance data)
+        macro_mag, macro_dir, macro_comp, macro_stats = _score_group(
+            macro_items, traces, watch_kw, row_tiers, row_rel_scores, source_accuracy)
+        crypto_mag, crypto_dir, crypto_comp, crypto_stats = _score_group(
+            crypto_items, traces, watch_kw, row_tiers, row_rel_scores, source_accuracy)
 
-            # Factor 2: category_weight (0-25)
-            f_category = CATEGORY_WEIGHT.get(cat, 5)
-
-            # Factor 3: recency (0-15)
-            f_recency = _get_recency_score(age_min)
-
-            # Factor 4: market_reaction (0-25)
-            f_reaction = 0
-            trace = traces.get(news_id, {})
-            ret_2h = trace.get('btc_ret_2h')
-            if ret_2h is not None:
-                # 1% abs ret → ~12.5 points, capped at 25
-                f_reaction = min(25, round(abs(ret_2h) * 12.5))
-
-            # Factor 5: watchlist_bonus (0-15)
-            f_watchlist = 0
-            text_lower = text.lower()
-            kw_list = list(keywords) if keywords else []
-            combined = text_lower + ' ' + ' '.join(str(k).lower() for k in kw_list)
-            matched_here = set()
-            for wk in watch_kw:
-                if wk in combined:
-                    matched_here.add(wk)
-                    watch_matched.add(wk)
-            f_watchlist = min(15, len(matched_here) * 5)
-
-            # Item magnitude
-            item_mag = f_source + f_category + f_recency + f_reaction + f_watchlist
-
-            # Direction for this item
-            item_dir = _majority_direction(gpt_dir, ret_2h, kw_sent)
-
-            # Weight by impact_score for aggregation
-            w = float(impact) if impact else 3.0
-
-            # Relevance filter: LOW=0.0, MED=0.5
-            relevance = _classify_relevance(title, cat, impact, summary)
-            relevance_mult = RELEVANCE_MULTIPLIERS.get(relevance, 1.0)
-            effective_w = w * relevance_mult
+        # Log group details
+        for r in deduped[:10]:
+            news_id = r[0]
+            title, source, impact, summary = r[1], r[2], r[3], r[4]
+            cat = row_cats[news_id]
+            tier = row_tiers.get(news_id, 'UNKNOWN')
+            rel_s = row_rel_scores.get(news_id)
+            group = 'macro' if cat not in CRYPTO_CATEGORIES else 'crypto'
+            relevance = _classify_relevance(title, cat, impact, summary,
+                                            tier=tier, relevance_score=rel_s)
             _log(f'relevance: "{(title or "")[:40]}" cat={cat} impact={impact} '
-                 f'level={relevance} mag={item_mag} eff_w={effective_w:.1f}')
+                 f'tier={tier} rel={rel_s} level={relevance} group={group}')
 
-            agg_source += f_source * effective_w
-            agg_category += f_category * effective_w
-            agg_recency += f_recency * effective_w
-            agg_reaction += f_reaction * effective_w
-            agg_watchlist += f_watchlist * effective_w
-            agg_weight += effective_w
-            direction_votes_sum += item_dir * effective_w
+        # BTC-QQQ 30일 상관관계 기반 동적 가중치
+        dyn_macro_w = MACRO_WEIGHT
+        dyn_crypto_w = CRYPTO_WEIGHT
+        btc_qqq_corr = None
+        try:
+            from score_engine import regime_correlation
+            corr_data = regime_correlation.get_current_regime()
+            btc_qqq_corr = corr_data.get('correlation') if corr_data else None
+            if btc_qqq_corr is not None:
+                if btc_qqq_corr > 0.5:
+                    dyn_macro_w = 0.75
+                    dyn_crypto_w = 0.25
+                elif btc_qqq_corr < 0.3:
+                    dyn_macro_w = 0.4
+                    dyn_crypto_w = 0.6
+        except Exception:
+            pass
 
-        # Weighted average factors
-        if agg_weight > 0:
-            comp_source = round(agg_source / agg_weight, 1)
-            comp_category = round(agg_category / agg_weight, 1)
-            comp_recency = round(agg_recency / agg_weight, 1)
-            comp_reaction = round(agg_reaction / agg_weight, 1)
-            comp_watchlist = round(agg_watchlist / agg_weight, 1)
+        # Weighted blend: macro * dyn_w + crypto * dyn_w
+        macro_score = macro_mag * macro_dir
+        crypto_score = crypto_mag * crypto_dir
+
+        if macro_items and crypto_items:
+            blended_score = round(macro_score * dyn_macro_w + crypto_score * dyn_crypto_w)
+        elif macro_items:
+            blended_score = macro_score
+        elif crypto_items:
+            blended_score = crypto_score
         else:
-            comp_source = comp_category = comp_recency = comp_reaction = comp_watchlist = 0
+            blended_score = 0
 
-        magnitude = round(comp_source + comp_category + comp_recency +
-                          comp_reaction + comp_watchlist)
-        magnitude = max(0, min(100, magnitude))
+        # 6-3: macro_data corroboration
+        direction_sign = 1 if blended_score >= 0 else -1
+        macro_bonus = _macro_corroboration(cur, direction_sign)
+        blended_score = max(-100, min(100, blended_score + macro_bonus))
 
-        direction_sign = 1 if direction_votes_sum >= 0 else -1
-        score = magnitude * direction_sign
-        score = max(-100, min(100, score))
+        # Blended components (weighted average with dynamic weights)
+        components = {}
+        for key in ('source_quality', 'category_weight', 'recency', 'market_reaction', 'watchlist'):
+            mc = macro_comp.get(key, 0)
+            cc = crypto_comp.get(key, 0)
+            if macro_items and crypto_items:
+                components[key] = round(mc * dyn_macro_w + cc * dyn_crypto_w, 1)
+            elif macro_items:
+                components[key] = mc
+            else:
+                components[key] = cc
 
-        components = {
-            'source_quality': comp_source,
-            'category_weight': comp_category,
-            'recency': comp_recency,
-            'market_reaction': comp_reaction,
-            'watchlist': comp_watchlist,
-        }
+        magnitude = abs(blended_score)
+        total_bull = macro_stats.get('bullish', 0) + crypto_stats.get('bullish', 0)
+        total_bear = macro_stats.get('bearish', 0) + crypto_stats.get('bearish', 0)
+        total_neutral = macro_stats.get('neutral', 0) + crypto_stats.get('neutral', 0)
+        watch_matched = macro_stats.get('watch_matched', set()) | crypto_stats.get('watch_matched', set())
 
-        # Score trace string for report
+        # 6-4: Score trace with macro_data context
         dir_char = '+' if direction_sign > 0 else '-'
-        score_trace = (f"source:{comp_source:.0f} + cat:{comp_category:.0f} + "
-                       f"recency:{comp_recency:.0f} + reaction:{comp_reaction:.0f} + "
-                       f"watch:{comp_watchlist:.0f} = {magnitude} -> "
-                       f"방향:{dir_char}")
+        macro_ctx = _get_macro_context(cur)
+        ctx_parts = [f'{k}:{v:.1f}' for k, v in macro_ctx.items()]
+        ctx_str = f' [{", ".join(ctx_parts)}]' if ctx_parts else ''
+
+        score_trace = (f"macro:{macro_score:+d}*{dyn_macro_w:.2f} + "
+                       f"crypto:{crypto_score:+d}*{dyn_crypto_w:.2f} "
+                       f"= {blended_score - macro_bonus:+d}")
+        if macro_bonus != 0:
+            score_trace += f" QQQ보정:{macro_bonus:+d}"
+        if btc_qqq_corr is not None:
+            score_trace += f" corr:{btc_qqq_corr:.2f}"
+        score_trace += f" -> {blended_score:+d} 방향:{dir_char}{ctx_str}"
 
         return {
-            'score': score,
+            'score': blended_score,
             'is_supplementary': True,
             'components': components,
             'details': {
                 'news_count': len(deduped),
                 'deduped_from': len(rows),
+                'macro_count': len(macro_items),
+                'crypto_count': len(crypto_items),
+                'macro_score': macro_score,
+                'crypto_score': crypto_score,
+                'macro_bonus': macro_bonus,
                 'bullish': total_bull,
                 'bearish': total_bear,
                 'neutral': total_neutral,

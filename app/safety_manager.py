@@ -76,16 +76,43 @@ def _load_safety_limits(cur):
     }
 
 
-def run_all_checks(cur, target_usdt=0, limits=None, emergency=False):
+def check_service_health():
+    '''Check service health state. Returns (can_open, reason).
+    DOWN 서비스 > 0 또는 UNKNOWN 필수 서비스 >= 2 → 신규 포지션 차단.
+    '''
+    try:
+        from local_query_executor import get_service_health_summary
+        health = get_service_health_summary()
+        req_down = health.get('required_down', [])
+        req_unknown = health.get('required_unknown', [])
+        if req_down:
+            return (False, f'필수 서비스 중지: {", ".join(req_down)}')
+        if len(req_unknown) >= 2:
+            return (False, f'필수 서비스 미확인 {len(req_unknown)}개: {", ".join(req_unknown)}')
+        return (True, 'ok')
+    except Exception as e:
+        _log(f'check_service_health error: {e}')
+        return (True, 'health check unavailable')
+
+
+def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_override=False):
     '''Run all safety checks. Returns (ok, reason).
-    When emergency=True, daily/hourly trade limits are BYPASSED.
+    When emergency=True or manual_override=True, daily/hourly trade limits are BYPASSED.
     Circuit breaker, daily loss limit, and 70% exposure cap remain active.
     '''
     if limits is None:
         limits = _load_safety_limits(cur)
 
-    if emergency:
-        _log('EMERGENCY mode: hourly/daily limits BYPASSED')
+    # Service health check (신규 포지션 차단)
+    if not emergency and not manual_override:
+        svc_ok, svc_reason = check_service_health()
+        if not svc_ok:
+            _log(f'Service health block: {svc_reason}')
+            return (False, f'서비스 상태 이상: {svc_reason}')
+
+    if emergency or manual_override:
+        bypass_reason = 'MANUAL OVERRIDE' if manual_override else 'EMERGENCY'
+        _log(f'{bypass_reason}: hourly/daily limits BYPASSED')
     else:
         # Daily trade count
         cur.execute("""

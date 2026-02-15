@@ -141,10 +141,171 @@ def compute_stats(conn):
         _log(f'  {r[0]:25s} regime={r[1]:8s} avg_abs_ret={r[2]:.4f}% n={r[3]}')
 
 
+def compute_direction_accuracy(conn):
+    """소스×카테고리별 방향 예측 적중률 계산.
+
+    news.summary에서 방향(up/down) 파싱 → macro_trace.btc_ret_2h 부호와 비교.
+    news_source_accuracy 테이블에 UPSERT + news.direction_hit 개별 업데이트.
+    """
+    import re
+    _log('Starting direction accuracy computation...')
+    cur = conn.cursor()
+
+    # Ensure target table exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.news_source_accuracy (
+            id SERIAL PRIMARY KEY,
+            source TEXT NOT NULL,
+            category TEXT DEFAULT 'ALL',
+            total_predictions INT DEFAULT 0,
+            correct_predictions INT DEFAULT 0,
+            hit_rate NUMERIC DEFAULT 0.0,
+            last_updated TIMESTAMP DEFAULT NOW(),
+            UNIQUE(source, category)
+        );
+    """)
+    conn.commit()
+
+    # Join news + macro_trace for direction comparison
+    cur.execute("""
+        SELECT n.id, n.source, n.summary, mt.btc_ret_2h
+        FROM news n
+        JOIN macro_trace mt ON mt.news_id = n.id
+        WHERE n.ts >= now() - interval '90 days'
+          AND mt.btc_ret_2h IS NOT NULL
+          AND n.impact_score > 0
+          AND n.summary IS NOT NULL
+        ORDER BY n.ts;
+    """)
+    rows = cur.fetchall()
+    _log(f'Found {len(rows)} news+trace pairs for direction accuracy')
+
+    if not rows:
+        _log('No data for direction accuracy. Exiting.')
+        return
+
+    from collections import defaultdict
+
+    # Parse direction from summary and compare with actual ret_2h
+    source_stats = defaultdict(lambda: {'total': 0, 'correct': 0})
+    updates = []  # (direction_hit, news_id) pairs
+
+    for news_id, source, summary, ret_2h in rows:
+        # Parse direction from summary: [up] or [down]
+        if not summary:
+            continue
+        sl = summary.lower().strip()
+        if sl.startswith('[up]'):
+            predicted_dir = 1
+        elif sl.startswith('[down]'):
+            predicted_dir = -1
+        else:
+            continue  # neutral or unparseable → skip
+
+        actual_dir = 1 if float(ret_2h) > 0 else -1
+        hit = (predicted_dir == actual_dir)
+
+        # Aggregate by (source, 'ALL')
+        key = (source or 'unknown', 'ALL')
+        source_stats[key]['total'] += 1
+        if hit:
+            source_stats[key]['correct'] += 1
+
+        # Per-category aggregation
+        cat = _parse_category(summary)
+        cat_key = (source or 'unknown', cat)
+        source_stats[cat_key]['total'] += 1
+        if hit:
+            source_stats[cat_key]['correct'] += 1
+
+        updates.append((hit, news_id))
+
+    # Update news.direction_hit for individual news items
+    updated_hits = 0
+    for hit, news_id in updates:
+        try:
+            cur.execute("""
+                UPDATE news SET direction_hit = %s WHERE id = %s AND direction_hit IS NULL;
+            """, (hit, news_id))
+            if cur.rowcount > 0:
+                updated_hits += 1
+        except Exception:
+            pass
+    conn.commit()
+    _log(f'Updated {updated_hits} news.direction_hit values')
+
+    # UPSERT news_source_accuracy
+    upserted = 0
+    for (source, category), stats in source_stats.items():
+        total = stats['total']
+        correct = stats['correct']
+        if total < 3:
+            continue  # 최소 3건 이상만
+        hit_rate = round(correct / total, 4) if total > 0 else 0.0
+
+        cur.execute("""
+            INSERT INTO news_source_accuracy (source, category, total_predictions,
+                                              correct_predictions, hit_rate, last_updated)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (source, category)
+            DO UPDATE SET
+                total_predictions = EXCLUDED.total_predictions,
+                correct_predictions = EXCLUDED.correct_predictions,
+                hit_rate = EXCLUDED.hit_rate,
+                last_updated = NOW();
+        """, (source, category, total, correct, hit_rate))
+        upserted += 1
+
+    conn.commit()
+    _log(f'Upserted {upserted} source accuracy rows')
+
+    # Print summary
+    cur.execute("""
+        SELECT source, category, hit_rate, total_predictions
+        FROM news_source_accuracy
+        WHERE category = 'ALL'
+        ORDER BY total_predictions DESC;
+    """)
+    for r in cur.fetchall():
+        _log(f'  {r[0]:20s} cat={r[1]:5s} hit_rate={r[2]:.2f} n={r[3]}')
+
+
+def check_data_coverage(conn):
+    """2023-11 이후 월별 뉴스 커버리지 점검 리포트."""
+    _log('Starting data coverage check...')
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT to_char(ts, 'YYYY-MM') AS month,
+               count(*) AS news_count,
+               count(DISTINCT source) AS source_count,
+               count(*) FILTER (WHERE impact_score >= 7) AS high_impact
+        FROM news
+        WHERE ts >= '2023-11-01'
+        GROUP BY 1 ORDER BY 1;
+    """)
+    rows = cur.fetchall()
+    lines = ['월별 뉴스 커버리지:']
+    lines.append(f'{"월":>8} | {"건수":>6} | {"소스수":>5} | {"고영향":>5}')
+    lines.append('-' * 35)
+    low_months = []
+    for month, cnt, src, high in rows:
+        lines.append(f'{month:>8} | {cnt:>6} | {src:>5} | {high:>5}')
+        if cnt < 50:
+            low_months.append(month)
+    if low_months:
+        lines.append(f'\n⚠ 데이터 부족 월: {", ".join(low_months)}')
+        lines.append('  → python3 backfill_macro_events.py 실행 권장')
+    for line in lines:
+        _log(line)
+    return lines
+
+
 if __name__ == '__main__':
     conn = _db_conn()
     conn.autocommit = True
     try:
         compute_stats(conn)
+        compute_direction_accuracy(conn)
+        check_data_coverage(conn)
     finally:
         conn.close()

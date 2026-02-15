@@ -291,6 +291,23 @@ _PHRASE_EN_TO_KR = {
     'market order': '시장가 주문',
     'Limit Order': '지정가 주문',
     'limit order': '지정가 주문',
+    'Neutral Consolidation': '중립 박스권(횡보)',
+    'neutral consolidation': '중립 박스권(횡보)',
+    'Mixed Signals Low Conviction': '신호 혼재(확신 낮음)',
+    'mixed signals low conviction': '신호 혼재(확신 낮음)',
+    'Underwater': '손실 구간(물림)',
+    'underwater': '손실 구간(물림)',
+    'watchlist match': '키워드 매칭',
+    'Watchlist match': '키워드 매칭',
+    'Watch items': '모니터링 항목',
+    'watch items': '모니터링 항목',
+    'Score trace': '점수 추적',
+    'score trace': '점수 추적',
+    'Daily performance': '일일 성과',
+    'daily performance': '일일 성과',
+    'Next check': '다음 확인',
+    'next check': '다음 확인',
+    'news_event_score': '뉴스 이벤트 점수',
 }
 
 # Single-word replacements — applied with word boundary (\b) regex
@@ -349,6 +366,19 @@ _WORD_EN_TO_KR = {
     'denied': '거부',
     'Bypass': '우회',
     'bypass': '우회',
+    'Guarded': '차단됨',
+    'guarded': '차단됨',
+    'GUARDED': '차단됨',
+    'Coupled': '연동',
+    'coupled': '연동',
+    'COUPLED': '연동',
+    'Decoupled': '비연동',
+    'decoupled': '비연동',
+    'DECOUPLED': '비연동',
+    'Already': '이미',
+    'already': '이미',
+    'Applied': '적용됨',
+    'applied': '적용됨',
     'Threshold': '임계값',
     'threshold': '임계값',
     'Remaining': '잔여',
@@ -409,6 +439,22 @@ _WORD_EN_TO_KR = {
     'loss': '손실',
     'Volume': '거래량',
     'volume': '거래량',
+    'Impact': '영향',
+    'impact': '영향',
+    'Category': '카테고리',
+    'category': '카테고리',
+    'Source': '출처',
+    'source': '출처',
+    'Direction': '방향',
+    'direction': '방향',
+    'Trace': '추적',
+    'trace': '추적',
+    'Report': '리포트',
+    'report': '리포트',
+    'Consolidation': '횡보',
+    'consolidation': '횡보',
+    'Conviction': '확신',
+    'conviction': '확신',
 }
 
 # Pre-compile regex for single-word replacements (longest first to avoid partial match)
@@ -535,16 +581,36 @@ def _force_translate_remaining(text: str) -> str:
 
 
 def korean_output_guard(text: str) -> str:
-    """최종 관문: sanitize 후 영어 비율 검사, 초과 시 강제 재번역."""
+    """최종 관문: sanitize 후 영어 비율 검사, 초과 시 강제 재번역.
+
+    Phase 1: 전체 비율 체크 + aggressive 치환
+    Phase 2: 라인 단위 영어 탐지 → 개별 영어 라인 발견 시 GPT 번역
+    """
     if not text:
         return text
     result = sanitize_telegram_text(text)
+
+    # Phase 1: 전체 비율 체크 (기존)
     ratio = detect_english_ratio(result)
-    if ratio > 0.05:
+    if ratio > 0.03:
         result = _aggressive_korean_replace(result)
         ratio = detect_english_ratio(result)
-    if ratio > 0.05:
+
+    # Phase 2: 라인 단위 체크 (신규)
+    # 전체 비율이 낮아도 개별 영어 라인이 있을 수 있음
+    lines = result.split('\n')
+    has_en_line = False
+    for line in lines:
+        if not line.strip():
+            continue
+        line_ratio = detect_english_ratio(line)
+        if line_ratio > 0.10 and len(_re.findall(r'[A-Za-z]{3,}', line)) >= 2:
+            has_en_line = True
+            break
+
+    if has_en_line or ratio > 0.03:
         result = _force_translate_remaining(result)
+
     return result
 
 
@@ -1413,6 +1479,17 @@ def format_news_strategy_report(data, detail=False):
     lines.append(f'BB(mid:{bb_mid:,.0f} 폭:{bb_bw:,.0f}) '
                  f'Ich(tenkan:{tenkan:,.0f} {tk_rel} kijun:{kijun:,.0f})')
 
+    # Macro snapshot (QQQ, SPY, DXY, US10Y, VIX)
+    macro = data.get('macro_snapshot', {})
+    if macro:
+        parts = []
+        for sym in ('QQQ', 'SPY', 'DXY', 'US10Y', 'VIX'):
+            info = macro.get(sym, {})
+            if info.get('price'):
+                parts.append(f'{sym}:{info["price"]:.2f}')
+        if parts:
+            lines.append(f'거시: {" | ".join(parts)}')
+
     total = scores.get('total', 0)
     side = scores.get('dominant_side', 'LONG')
     stage = scores.get('stage', 1)
@@ -1420,19 +1497,50 @@ def format_news_strategy_report(data, detail=False):
     pos_s = scores.get('pos', 0)
     regime = scores.get('regime', 0)
     news_s = scores.get('news_event', 0)
-    lines.append(f'Score: TOTAL {total:+.1f} -> {side} stg{stage} | '
-                 f'TECH:{tech:+.0f} POS:{pos_s:+.0f} REG:{regime:+.0f} NEWS:{news_s:+.0f}')
+    # 가중치 (scores dict에서 추출 또는 기본값)
+    s_weights = scores.get('weights', {})
+    tech_w = s_weights.get('tech_w', 0.45)
+    pos_w = s_weights.get('position_w', 0.25)
+    regime_w = s_weights.get('regime_w', 0.25)
+    news_w_ax = s_weights.get('news_event_w', 0.05)
+    # 축별 가중 기여도
+    tech_c = tech * tech_w
+    pos_c = pos_s * pos_w
+    regime_c = regime * regime_w
+    news_c = news_s * news_w_ax
+    lines.append(f'Score: TOTAL {total:+.1f} → {side} stg{stage}')
+    lines.append(f'  기술({tech:+.0f}×{tech_w}={tech_c:+.1f}) '
+                 f'포지션({pos_s:+.0f}×{pos_w}={pos_c:+.1f}) '
+                 f'레짐({regime:+.0f}×{regime_w}={regime_c:+.1f}) '
+                 f'뉴스({news_s:+.0f}×{news_w_ax}={news_c:+.1f})')
 
-    # ── [📰 미국/거시 TOP N] ──
+    # 엔진 권고 vs 현재 포지션
+    pos_side = pos.get('side', '')
+    pos_qty = pos.get('qty', pos.get('total_qty', 0))
+    rec_line = f'엔진권고: {side} stg{stage} (총점 {total:+.1f})'
+    if pos_side:
+        rec_line += f' | 현재포지션: {pos_side} {pos_qty}BTC'
+    else:
+        rec_line += ' | 현재포지션: 없음'
+    lines.append(rec_line)
+
+    # 게이트 정보: 권고와 포지션 불일치 시 사유 표시
+    gate_info = scores.get('gate_info', '')
+    if gate_info:
+        lines.append(f'게이트: {gate_info}')
+    elif pos_side and pos_side != side:
+        lines.append(f'{side} 권고이나, 현재 {pos_side} 유지 중')
+
+    # ── [📰 전략반영 거시 (Tier1-2)] ──
     lines.append('')
-    lines.append(f'[📰 미국/거시 TOP {min(len(macro_news), top_n)}]')
+    lines.append(f'[📰 전략반영 거시 TOP {min(len(macro_news), top_n)}]')
     if not macro_news:
         lines.append('- 최근 6시간 거시 뉴스 없음')
     else:
         for i, n in enumerate(macro_news[:top_n], 1):
             _append_news_item(lines, i, n)
 
-    # ── [🪙 크립토 TOP N] ──
+    # ── [🪙 전략반영 크립토 (Tier1-2)] ──
     lines.append('')
     lines.append(f'[🪙 크립토 TOP {min(len(crypto_news), top_n)}]')
     if not crypto_news:
@@ -1440,6 +1548,24 @@ def format_news_strategy_report(data, detail=False):
     else:
         for i, n in enumerate(crypto_news[:top_n], 1):
             _append_news_item(lines, i, n)
+
+    # ── [제외된 뉴스] ──
+    ignored_news = data.get('ignored_news', [])
+    if ignored_news:
+        lines.append('')
+        lines.append(f'[제외된 뉴스 ({len(ignored_news)}건)]')
+        for i, n in enumerate(ignored_news[:5], 1):
+            ig_title = (n.get('title_ko') or n.get('title', ''))[:60]
+            ig_reason = _kr_ignore_reason(n.get('ignore_reason', '불명'))
+            ig_source = n.get('source', '')
+            lines.append(f'{i}) {ig_title}')
+            lines.append(f'   제외사유: {ig_reason} | {ig_source}')
+
+    # ── 매크로 데이터 경고 ──
+    if data.get('macro_stale'):
+        age_h = data.get('macro_age_hours', 0)
+        lines.append('')
+        lines.append(f'[거시데이터 {age_h}시간 경과]')
 
     # ── [🧩 뉴스→전략 TRACE] ──
     lines.append('')
@@ -1467,7 +1593,7 @@ def format_news_strategy_report(data, detail=False):
         lines.append(f'제약: 뉴스 단독 {"/".join(c_parts)}')
 
     if watch:
-        lines.append(f'watchlist: {", ".join(watch)}')
+        lines.append(f'키워드 매칭: {", ".join(watch)}')
 
     # ── [🎯 핵심 레벨] ──
     lines.append('')
@@ -1505,6 +1631,28 @@ def format_news_strategy_report(data, detail=False):
     else:
         lines.append(f'손절 기준: -{sl_pct}%')
 
+    # ── [📈 차트 흐름] ──
+    chart_flow = data.get('chart_flow', {})
+    if chart_flow:
+        lines.append('')
+        lines.append('[📈 차트 흐름]')
+        trend_4h = chart_flow.get('trend_4h', '?')
+        trend_12h = chart_flow.get('trend_12h', '?')
+        trend_4h_pct = chart_flow.get('trend_4h_pct', 0)
+        trend_12h_pct = chart_flow.get('trend_12h_pct', 0)
+        lines.append(f'추세: 4h {trend_4h}({trend_4h_pct:+.1f}%) | 12h {trend_12h}({trend_12h_pct:+.1f}%)')
+        bb_pos = chart_flow.get('bb_position', '?')
+        ich_cloud = chart_flow.get('ichimoku_cloud', '?')
+        lines.append(f'BB: {bb_pos} | Ichimoku: {ich_cloud}')
+
+    # ── [🔮 조건부 시나리오] ──
+    scenarios = data.get('conditional_scenarios', [])
+    if scenarios:
+        lines.append('')
+        lines.append('[🔮 조건부 시나리오]')
+        for i, sc in enumerate(scenarios, 1):
+            lines.append(f'{i}. {sc}')
+
     # ── [⚠ 리스크/다음 체크] ──
     lines.append('')
     lines.append('[⚠ 리스크/다음 체크]')
@@ -1519,6 +1667,17 @@ def format_news_strategy_report(data, detail=False):
             risk_level = '낮음'
     lines.append(f'리스크: {risk_level} (거시 하락 {bear}건 vs 상승 {bull}건, regime={regime:+.0f})')
 
+    # 추가 리스크 정보
+    funding = snap.get('funding_rate')
+    if funding is not None:
+        lines.append(f'펀딩비: {funding:.4f}%')
+    liq_dist = pos.get('liq_dist')
+    if liq_dist is not None:
+        lines.append(f'청산거리: {liq_dist:.1f}%')
+    leverage_used = pos.get('leverage_used')
+    if leverage_used is not None:
+        lines.append(f'레버리지 활용: {leverage_used}x')
+
     watch_items = ai.get('watch_items', [])
     next_check = ai.get('next_check', '')
     if watch_items:
@@ -1529,25 +1688,64 @@ def format_news_strategy_report(data, detail=False):
     return '\n'.join(lines)
 
 
+def _kr_ignore_reason(reason: str) -> str:
+    """영어 ignore reason을 한국어로 변환."""
+    if not reason:
+        return '불명'
+    REASON_MAP = {
+        'tier=TIERX': '노이즈(무관)',
+        'low_relevance': '낮은 연관도',
+        'tier=TIER3': '일반 시황(전략 미반영)',
+        'gossip': '가십 제외',
+        'hard_filter': '패턴 필터 제외',
+        'noise': '노이즈',
+        'no_crypto_relevance': '크립토 무관',
+        'duplicate': '중복',
+        'stale': '오래된 뉴스',
+    }
+    for key, kr in REASON_MAP.items():
+        if key in reason.lower():
+            return kr
+    return reason
+
+
 def _append_news_item(lines, idx, n):
-    """Append a single news item to report lines."""
+    """Append a single news item to report lines.
+
+    한글 번역 제목 우선 표시, 영문 원문 병기. 티어 배지 포함.
+    """
     impact = _safe_int(n.get('impact_score'))
-    title = (n.get('title_ko') or n.get('title') or '')[:70]
+    title_ko = (n.get('title_ko') or '')[:70]
+    title_en = (n.get('title') or '')[:50]
+    if title_ko:
+        title = title_ko
+        if title_en and title_en != title_ko:
+            title += f'\n    (EN: {title_en})'
+    else:
+        title = title_en or '(제목 없음)'
     cat_kr = n.get('category_kr') or CATEGORY_KR.get(
         _parse_news_category(n.get('summary', '')), '')
     direction = n.get('direction') or _parse_news_direction(n.get('summary', ''))
     source = n.get('source', '')
     ts = n.get('ts', '')
 
+    # 티어 배지
+    tier = n.get('tier', '')
+    tier_badge = f'[{tier}] ' if tier and tier not in ('UNKNOWN', '') else ''
+
     dir_str = f' / {direction}' if direction else ''
-    lines.append(f'{idx}) ({impact}/10) {title} — {cat_kr}{dir_str}')
-    lines.append(f'   {source} {ts}')
+    lines.append(f'{idx}) {tier_badge}({impact}/10) {title} — {cat_kr}{dir_str}')
+
+    # 소스 + 시간 + relevance_score
+    rel_score = n.get('relevance_score')
+    rel_str = f' | rel={rel_score:.2f}' if rel_score is not None else ''
+    lines.append(f'   {source} {ts}{rel_str}')
 
     impact_path = n.get('impact_path', '')
     if impact_path:
         lines.append(f'   {impact_path}')
 
-    # Trace data
+    # Trace data + direction_hit
     trace = n.get('trace', {})
     if trace:
         ret_30m = trace.get('btc_ret_30m')

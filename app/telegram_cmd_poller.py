@@ -117,9 +117,19 @@ HELP_TEXT = (
     "  리스크 보수적으로 바꿔\n"
     "  트럼프 감시 키워드 추가해\n"
     "  시스템 점검해줘\n\n"
-    "🔧 백업 슬래시 명령\n"
-    "  /help /status /health /db_health /claude_audit\n"
-    "  /force /detail /debug\n"
+    "🔧 슬래시 명령\n"
+    "  /help — 도움말 표시\n"
+    "  /status — 전체 시스템 현황\n"
+    "  /health — 서비스 상태 점검\n"
+    "  /score — 스코어 엔진 현황\n"
+    "  /db_health — DB 연결 상태 확인\n"
+    "  /test_report — 종합 테스트 리포트\n"
+    "  /audit — 감사 리포트\n"
+    "  /close_all — 전포지션 수동 청산\n"
+    "  /claude_audit — Claude 사용량·비용 조회\n"
+    "  /force — 즉시 전략 분석 실행\n"
+    "  /detail — 상세 뉴스→전략 리포트\n"
+    "  /debug — 디버그 모드 토글\n"
 )
 
 # ── news importance check & AI news advisory ─────────────
@@ -1203,7 +1213,7 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
     }, default=str)
 
     if action == 'REDUCE':
-        (safe, r) = safety_manager.run_all_checks(cur, 0)
+        (safe, r) = safety_manager.run_all_checks(cur, 0, manual_override=True)
         if not safe:
             _log(f'claude safety block: {r}')
             return None
@@ -1247,7 +1257,7 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
         return row[0] if row else None
 
     elif action == 'CLOSE':
-        (safe, r) = safety_manager.run_all_checks(cur, 0)
+        (safe, r) = safety_manager.run_all_checks(cur, 0, manual_override=True)
         if not safe:
             _log(f'claude safety block: {r}')
             return None
@@ -1276,7 +1286,7 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
         target_stage = parsed.get('target_stage', 1)
         add_usdt = safety_manager.get_add_slice_usdt(cur)
         target_usdt = add_usdt * target_stage
-        (safe, r) = safety_manager.run_all_checks(cur, target_usdt)
+        (safe, r) = safety_manager.run_all_checks(cur, target_usdt, manual_override=True)
         if not safe:
             _log(f'claude safety block: {r}')
             return None
@@ -1293,7 +1303,7 @@ def _enqueue_claude_action(cur, parsed, pos_state, scores, snapshot):
         return row[0] if row else None
 
     elif action == 'REVERSE':
-        (safe, r) = safety_manager.run_all_checks(cur, 0)
+        (safe, r) = safety_manager.run_all_checks(cur, 0, manual_override=True)
         if not safe:
             _log(f'claude safety block: {r}')
             return None
@@ -1816,6 +1826,49 @@ def _handle_directive_intent(intent, text):
             pass
 
 
+# ── REPORT_ONLY keyword pre-routing ────────────────────────
+# P0-1: "보고해/리포트/정리/종합" → 반드시 REPORT 경로.
+# GPT가 COMMAND/run_audit 로 오분류하는 치명적 버그 방지.
+REPORT_ONLY_KEYWORDS = frozenset({
+    '보고', '리포트', '정리해', '종합', '요약해', '브리핑',
+    '현황', '총정리', '분석해줘', '보여줘', '알려줘',
+    '분석', '왜 그래', '무슨 일', '설명', '점검',
+    '진행상황', '감사', 'audit',
+})
+# 이 키워드가 있으면 REPORT가 아니라 DIRECTIVE로 취급해야 하는 예외
+DIRECTIVE_OVERRIDE_KEYWORDS = frozenset({
+    '적용해', '반영해', '지금 반영', '실행해', '변경해',
+    '바꿔', '설정해', '추가해', '삭제해', '제거해',
+    '청산', '진입', '들어가', '줄여', '축소',
+})
+
+
+def _detect_report_only(text: str) -> str:
+    """REPORT_ONLY 키워드 사전 감지.
+    Returns: 'news_report' | 'strategy_report' | 'comprehensive_report' | ''
+    """
+    t = (text or '').strip().lower()
+    if not t:
+        return ''
+    # DIRECTIVE 키워드가 있으면 리포트 경로 차단
+    if any(kw in t for kw in DIRECTIVE_OVERRIDE_KEYWORDS):
+        return ''
+    # REPORT 키워드 매칭
+    has_report = any(kw in t for kw in REPORT_ONLY_KEYWORDS)
+    if not has_report:
+        return ''
+    # 세부 분류
+    if any(kw in t for kw in ('종합', '총정리', '브리핑', '테스트', '전체',
+                              '감사', 'audit', '점검')):
+        return 'comprehensive_report'
+    if any(kw in t for kw in ('뉴스', 'news', '크립토', '매크로')):
+        return 'news_report'
+    if any(kw in t for kw in ('전략', '매매', '포지션', 'strategy')):
+        return 'strategy_report'
+    # 기본: 뉴스 리포트
+    return 'news_report'
+
+
 # ── NL-first handler functions ────────────────────────────
 
 TRADE_INTENTS = frozenset({
@@ -2062,6 +2115,39 @@ def _footer(intent_name: str, route: str, provider: str,
         'cost': cost,
     })
 
+def _comprehensive_report(text: str) -> str:
+    """종합 리포트: 뉴스+전략+스코어+포지션+시스템 전체 현황.
+    P0-8: 테스트 종합 보고 파이프라인."""
+    parts = []
+    # 1. News strategy report
+    try:
+        news_result, news_provider = _ai_news_claude_advisory(
+            text, call_type='AUTO', detail=True)
+        parts.append(news_result)
+    except Exception as e:
+        parts.append(f'뉴스 리포트 오류: {e}')
+    # 2. Score summary
+    try:
+        score_text = local_query_executor.execute('score_summary')
+        parts.append('\n' + score_text)
+    except Exception as e:
+        parts.append(f'\n스코어 조회 오류: {e}')
+    # 3. Position info
+    try:
+        pos_text = local_query_executor.execute('position_info')
+        parts.append('\n' + pos_text)
+    except Exception as e:
+        parts.append(f'\n포지션 조회 오류: {e}')
+    # 4. System health (compact)
+    try:
+        health_text = local_query_executor.execute('health_check')
+        parts.append('\n' + health_text)
+    except Exception as e:
+        parts.append(f'\n시스템 상태 오류: {e}')
+    return '\n'.join(parts) + _footer('comprehensive_report', 'mixed',
+                                       'local+claude')
+
+
 def handle_command(text: str) -> str:
     t = (text or "").strip()
 
@@ -2083,10 +2169,49 @@ def handle_command(text: str) -> str:
         return local_query_executor.execute('db_health') + \
             _footer('db_health', 'local', 'local')
 
+    # /db_monthly_stats — DB monthly statistics (no GPT cost)
+    if t in ('/db_monthly_stats', '/db_stats', 'db_monthly_stats'):
+        return local_query_executor.execute('db_monthly_stats') + \
+            _footer('db_monthly_stats', 'local', 'local')
+
     # /claude_audit — Claude API usage audit (no GPT cost)
     if t in ('/claude_audit', '/claude', '/ai_cost', 'claude_audit'):
         return local_query_executor.execute('claude_audit') + \
             _footer('claude_audit', 'local', 'local')
+
+    # /health — 서비스 상태 점검
+    if t in ('/health', '/서비스', 'health'):
+        return local_query_executor.execute('health_check') + \
+            _footer('health_check', 'local', 'local')
+
+    # /status — 전체 시스템 현황
+    if t in ('/status', '/상태', 'status'):
+        return local_query_executor.execute('status_full') + \
+            _footer('status_full', 'local', 'local')
+
+    # /score — 스코어 엔진 현황
+    if t in ('/score', '/스코어', 'score'):
+        return local_query_executor.execute('score_summary') + \
+            _footer('score_summary', 'local', 'local')
+
+    # /test_report — 종합 테스트 리포트
+    if t in ('/test_report', '/test', '/테스트'):
+        return _comprehensive_report(t)
+
+    # /audit — 감사 리포트
+    if t in ('/audit', '/감사'):
+        return _comprehensive_report(t)
+
+    # /close_all — 전포지션 수동 청산
+    if t in ('/close_all', '/전청산'):
+        _log('/close_all command received')
+        try:
+            from position_manager import close_position
+            result = close_position(STRATEGY_SYMBOL, reason='manual_close_all')
+            return f'✅ 전포지션 청산 요청 완료\n{result}' + \
+                _footer('close_all', 'local', 'local')
+        except Exception as e:
+            return f'⚠ 청산 실패: {e}' + _footer('close_all', 'local', 'local')
 
     # /force — cooldown bypass, Claude forced
     if t == '/force' or t.startswith('/force '):
@@ -2105,6 +2230,21 @@ def handle_command(text: str) -> str:
         detail_result, detail_provider = _ai_news_claude_advisory(
             detail_text, call_type='AUTO', detail=True)
         return detail_result + _footer('detail', 'claude', detail_provider)
+
+    # P0-1: REPORT_ONLY 키워드 사전 라우팅 (GPT 분류 전)
+    # "보고해/리포트/종합 정리" 등이 COMMAND/directive로 오분류되는 버그 방지
+    report_mode = _detect_report_only(t)
+    if report_mode:
+        _log(f'REPORT_ONLY pre-route: mode={report_mode} text={t[:50]}')
+        if report_mode == 'comprehensive_report':
+            return _comprehensive_report(t)
+        elif report_mode == 'strategy_report':
+            result, provider = _ai_strategy_advisory(t, call_type='AUTO')
+            return result + _footer('strategy_report', 'claude', provider)
+        else:  # news_report
+            result, provider = _ai_news_claude_advisory(
+                t, call_type='AUTO', detail=True)
+            return result + _footer('news_report', 'claude', provider)
 
     # Phase 1: NL parser (always runs)
     try:

@@ -124,6 +124,8 @@ SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/Engl
 - 퍼센트 미지정 시 percent=null (시스템이 기본값 사용).
 - close/reverse/open은 needs_confirmation=true.
 - "테스트"/"시뮬" 포함 시 test_mode=true.
+- CRITICAL: "보고해/리포트/정리/종합/요약" 같은 리포트 요청은 type=QUESTION intent=report.
+  절대 COMMAND/run_audit로 분류하지 마세요. 리포트 요청 ≠ 시스템 점검.
 """
 
 
@@ -312,7 +314,7 @@ def _keyword_fallback(text: str) -> dict:
                 "needs_confirmation": True, "confidence": 0.7, "_fallback": True})
 
     if any(x in t for x in ["줄여", "축소", "reduce", "정리"]) and not any(
-            x in t for x in ["분석", "뉴스"]):
+            x in t for x in ["분석", "뉴스", "리포트", "보고", "종합", "요약"]):
         import re
         m = re.search(r'(\d+)\s*%', t)
         pct = int(m.group(1)) if m else None
@@ -372,6 +374,11 @@ def _keyword_fallback(text: str) -> dict:
             mode = "normal"
         return _add_legacy_fields({"type": "COMMAND", "intent": "set_risk_mode",
                 "mode": mode, "confidence": 0.7, "_fallback": True})
+
+    # P0-1: "보고/리포트/종합" → QUESTION/report (COMMAND/run_audit보다 우선)
+    if any(x in t for x in ["보고", "리포트", "종합 정리", "종합 보고", "총정리", "브리핑"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "report",
+                "confidence": 0.9, "_fallback": True})
 
     if any(x in t for x in ["감사", "audit", "오딧", "시스템점검", "점검"]):
         return _add_legacy_fields({"type": "COMMAND", "intent": "run_audit",
