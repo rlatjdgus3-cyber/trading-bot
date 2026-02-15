@@ -195,7 +195,7 @@ def _debug_line(meta: dict = None) -> str:
 def detect_english_ratio(text: str) -> float:
     """텍스트의 영어 비율 반환 (0.0~1.0).
     숫자, 기호, 공백, 약어(BTC, USD 등)는 제외.
-    순수 알파벳 단어 기준으로 비율 계산."""
+    비허용 영어 글자 수 / (한글 글자 수 + 비허용 영어 글자 수) 기준."""
     if not text:
         return 0.0
     # 허용 약어 — 이것들은 영어로 표시해도 OK
@@ -225,14 +225,28 @@ def detect_english_ratio(text: str) -> float:
         'DECRYPT', 'THEBLOCK',
         # 모델명 토큰
         'OPUS', 'SONNET', 'HAIKU', 'MINI',
+        # 내부/로그 키워드 (텔레그램 메시지에 노출될 수 있는 것들)
+        'CALLER', 'REASON', 'TRIGGER', 'TYPE', 'MODE', 'GATE',
+        'MID', 'QTY', 'ENTRY', 'EXIT', 'VOL', 'RET', 'PNL',
+        'MIN', 'MAX', 'AVG', 'SUM', 'CNT', 'PCT',
+        'PRE', 'POST', 'RAW', 'LOG', 'ERR', 'MSG',
+        'SKIP', 'DENY', 'PASS', 'FAIL', 'DONE', 'STOP', 'RUN',
+        'CAP', 'LIMIT', 'BUDGET', 'COOLDOWN',
+        'UP', 'DN', 'HIGH', 'LOW', 'LAST', 'SPIKE',
+        'SIDE', 'BUY', 'SELL', 'BID', 'ASK',
     }
+    # 한글 글자 수 (가-힣)
+    korean_chars = len(_re.findall(r'[\uac00-\ud7a3]', text))
+    # 밑줄 연결 토큰(함수명/내부키)을 먼저 제거 — 코드 토큰은 영어 비율에서 제외
+    cleaned = _re.sub(r'[A-Za-z_]+_[A-Za-z_]+', '', text)
     # 3글자 이상 순수 알파벳 단어만 추출 (해시/버전 토큰 무시)
-    words = _re.findall(r'[A-Za-z]{3,}', text)
-    if len(words) < 3:
-        # 영어 단어가 3개 미만이면 판정 불가 — 안전으로 처리
+    words = _re.findall(r'[A-Za-z]{3,}', cleaned)
+    # 비허용 영어 단어의 총 글자 수
+    en_chars = sum(len(w) for w in words if w.upper() not in ALLOWED_EN)
+    total = korean_chars + en_chars
+    if total == 0:
         return 0.0
-    en_count = sum(1 for w in words if w.upper() not in ALLOWED_EN)
-    return en_count / max(len(words), 1)
+    return en_chars / total
 
 
 # Multi-word phrases replaced first (safe substring match),
