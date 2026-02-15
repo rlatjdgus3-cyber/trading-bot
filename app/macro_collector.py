@@ -19,7 +19,7 @@ import sys
 import time
 import json
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, '/root/trading-bot/app')
 from dotenv import load_dotenv

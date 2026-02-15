@@ -717,10 +717,22 @@ def is_auto_correctable(error_code):
 def format_rejection_telegram(error_info, debug=False):
     """Format rejection message for Telegram in Korean.
     error_info: dict from map_bybit_error() or ComplianceResult.
+    Also accepts raw error string for backward compatibility.
     """
-    korean_msg = error_info.get('korean_message', '알 수 없는 오류')
+    # Handle raw string input — delegate to YAML matcher
+    if isinstance(error_info, str):
+        return format_rejection_telegram_yaml(error_info)
+
+    korean_msg = error_info.get('korean_message', '')
     suggested = error_info.get('suggested_fix', '')
     error_code = error_info.get('error_code', '')
+    raw_msg = error_info.get('raw_message', '')
+
+    # If no korean_msg from map_bybit_error, try YAML matching on raw message
+    if not korean_msg and raw_msg:
+        return format_rejection_telegram_yaml(raw_msg)
+
+    korean_msg = korean_msg or '알 수 없는 오류'
 
     lines = [
         '❌ 주문 거부',
@@ -732,9 +744,8 @@ def format_rejection_telegram(error_info, debug=False):
         lines.append(f'(에러코드: {error_code})')
 
     if debug:
-        raw = error_info.get('raw_message', '')
-        if raw:
-            lines.append(f'\n[DEBUG] {raw[:200]}')
+        if raw_msg:
+            lines.append(f'\n[DEBUG] {raw_msg[:200]}')
         category = error_info.get('category', '')
         severity = error_info.get('severity', '')
         if category:
@@ -990,10 +1001,11 @@ def _load_error_map_yaml() -> dict:
     return _yaml_error_map
 
 
-def format_rejection_telegram(error_msg: str, order_params: dict = None) -> str:
+def format_rejection_telegram_yaml(error_msg: str, order_params: dict = None) -> str:
     """Format rejection message in Korean using YAML error map.
 
     Returns formatted telegram text with: 시도 / 사유 / 카테고리 / 조치.
+    For raw error string matching. See format_rejection_telegram() for dict-based input.
     """
     import re
     error_map = _load_error_map_yaml()

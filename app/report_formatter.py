@@ -53,6 +53,14 @@ TRIGGER_KR = {
     'bb_squeeze': 'BB 스퀴즈(변동성 압축)',
     'kijun_cross': '기준선 교차',
     'ma_cross': '이동평균 교차',
+    'emergency_price_5m': '5분 긴급 가격변동',
+    'emergency_price_15m': '15분 긴급 가격변동',
+    'emergency_position_loss': '포지션 손실 긴급',
+    'emergency_liquidation_near': '청산가 근접 긴급',
+    'emergency_atr_surge': 'ATR 급등 긴급',
+    'emergency_volatility_zscore': '변동성 Z점수 긴급',
+    'emergency_volume_confirmed': '거래량 확인(긴급)',
+    'emergency_3bar_directional': '15분봉 3연속 방향성',
 }
 
 RISK_KR = {

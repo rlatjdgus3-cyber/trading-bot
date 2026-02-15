@@ -264,8 +264,11 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
             if now - last_call < 120:  # 2min dedup
                 remaining = int(120 - (now - last_call))
                 _log(f'USER_MANUAL dedup: {dedup_key} ({remaining}s remaining)')
-            else:
-                _log(f'cooldown SKIPPED (call_type=USER_MANUAL): {gate}:{cooldown_key}')
+                return {'allowed': False,
+                        'reason': f'USER_MANUAL dedup: {dedup_key} ({remaining}s remaining)',
+                        'gate': gate, 'budget_remaining': budget_remaining,
+                        'call_type': call_type}
+            _log(f'cooldown SKIPPED (call_type=USER_MANUAL): {gate}:{cooldown_key}')
         elif call_type == CALL_TYPE_AUTO_EMERGENCY:
             # AUTO_EMERGENCY: 60-second spam guard only
             cooldowns = state.get('cooldowns', {})
@@ -490,10 +493,14 @@ def _record_call_to_state(state, gate, input_tokens, output_tokens,
         ck = f'{gate}:{cooldown_key}'
         cds = state.setdefault('cooldowns', {})
         cds[ck] = now
-        # EMERGENCY: also record spam guard key
-        if call_type == CALL_TYPE_EMERGENCY:
+        # AUTO_EMERGENCY: also record spam guard key
+        if call_type == CALL_TYPE_AUTO_EMERGENCY:
             spam_key = f'emergency_spam:{cooldown_key}'
             cds[spam_key] = now
+        # USER_MANUAL: record dedup key
+        if call_type == CALL_TYPE_USER_MANUAL:
+            dedup_key = f'user_dedup:{cooldown_key}'
+            cds[dedup_key] = now
 
     # Scheduled count
     if gate == 'scheduled':

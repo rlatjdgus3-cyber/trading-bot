@@ -618,11 +618,17 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
     for k in expired:
         del _last_trigger_ts[k]
 
-    eh = compute_event_hash(surviving, symbol=symbol, price=price)
-    _log(f'EVENT: triggers={[t["type"] for t in surviving]} hash={eh[:12]}')
+    # Section 6: bundle triggers within 30s window
+    bundled = bundle_triggers(surviving)
+    if not bundled:
+        _log(f'triggers buffered for bundling: {[t["type"] for t in surviving]}')
+        return EventResult()  # still accumulating, return DEFAULT
+
+    eh = compute_event_hash(bundled, symbol=symbol, price=price)
+    _log(f'EVENT: triggers={[t["type"] for t in bundled]} hash={eh[:12]}')
     return EventResult(
         mode=MODE_EVENT,
-        triggers=surviving,
+        triggers=bundled,
         event_hash=eh,
         priority=PRIORITY_EVENT,
         call_type='AUTO',
