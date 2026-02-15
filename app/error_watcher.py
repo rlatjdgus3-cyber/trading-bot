@@ -1,5 +1,8 @@
 """
 error_watcher.py — Monitors systemd service logs for errors and sends Telegram alerts.
+- 동일 에러 5분 dedup (fingerprint에서 타임스탬프 제거)
+- 서비스별 에러 요약 1건으로 묶어서 발송
+- traceback 전문은 로그에만, 텔레그램엔 핵심 원인 1줄만
 """
 import os
 import re
@@ -29,7 +32,10 @@ WATCH_UNITS = [
 ]
 IGNORE_PATTERNS = [
     re.compile(r'executor\s+STOPPED', re.IGNORECASE),
-    re.compile(r'empty-heartbeat-file', re.IGNORECASE)]
+    re.compile(r'empty-heartbeat-file', re.IGNORECASE),
+    re.compile(r'DB 재연결 성공', re.IGNORECASE),
+    re.compile(r'DB reconnected', re.IGNORECASE),
+]
 ERROR_PATTERNS = [
     re.compile(r'\bTraceback\b'),
     re.compile(r'\bException\b'),
@@ -39,7 +45,10 @@ ERROR_PATTERNS = [
     re.compile(r'\bfailed\b', re.IGNORECASE),
     re.compile(r'\bpanic\b', re.IGNORECASE)]
 STATE_FILE = '/root/trading-bot/app/.error_watcher_state.json'
-MIN_ALERT_INTERVAL_SEC = 60
+MIN_ALERT_INTERVAL_SEC = 300  # 5분 dedup (동일 에러 반복 스팸 방지)
+
+# journalctl 타임스탬프 패턴 (Feb 15 03:10:04 hostname ...)
+_TS_PREFIX_RE = re.compile(r'^[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\S+\s+')
 
 
 def load_env(path=None):
@@ -102,6 +111,13 @@ def write_state(state=None):
         pass
 
 
+def _clean_old_state(state):
+    """7일 이상 된 fingerprint 제거 (state 비대화 방지)."""
+    now = time.time()
+    cutoff = now - 7 * 86400
+    return {k: v for k, v in state.items() if isinstance(v, (int, float)) and v > cutoff}
+
+
 def looks_like_error(line=None):
     for pat in IGNORE_PATTERNS:
         if pat.search(line):
@@ -112,8 +128,28 @@ def looks_like_error(line=None):
     return False
 
 
+def _strip_timestamp(line):
+    """journalctl 타임스탬프 + hostname 접두사 제거 → 순수 내용만 추출."""
+    return _TS_PREFIX_RE.sub('', line).strip()
+
+
+def _extract_root_cause(line):
+    """traceback/에러 라인에서 핵심 원인 1줄 추출."""
+    stripped = _strip_timestamp(line)
+    # "psycopg2.InterfaceError: connection already closed" 같은 형태
+    if ':' in stripped:
+        # 프로세스 ID 부분 제거 (python3[12345]: ...)
+        m = re.match(r'\S+\[\d+\]:\s*(.*)', stripped)
+        if m:
+            return m.group(1).strip()
+    return stripped
+
+
 def fingerprint(text=None):
-    t = text.strip()
+    """타임스탬프 제거 후 해시 → 동일 에러 올바르게 dedup."""
+    t = _strip_timestamp(text or '')
+    # 프로세스 ID도 제거 (python3[12345])
+    t = re.sub(r'\[\d+\]', '[PID]', t)
     if len(t) > 800:
         t = t[:400] + ' ... ' + t[-400:]
     return str(hash(t))
@@ -128,6 +164,7 @@ def main():
         return
 
     state = read_state()
+    state = _clean_old_state(state)
     now = time.time()
 
     for unit in WATCH_UNITS:
@@ -139,17 +176,41 @@ def main():
         except Exception:
             continue
 
-        errors = []
+        error_causes = []
+        seen_fps = set()
         for line in lines:
-            if looks_like_error(line):
-                fp = fingerprint(line)
-                last_alert = state.get(fp, 0)
-                if now - last_alert >= MIN_ALERT_INTERVAL_SEC:
-                    errors.append(line.strip())
+            if not looks_like_error(line):
+                continue
+            # Traceback 줄 자체는 건너뛰고, 실제 에러 메시지만 수집
+            stripped = _strip_timestamp(line)
+            if re.match(r'\S+\[\d+\]:\s*Traceback', stripped):
+                continue
+            if re.match(r'\S+\[\d+\]:\s*File\s+"', stripped):
+                continue
+            if re.match(r'\S+\[\d+\]:\s+\^', stripped):
+                continue
+
+            fp = fingerprint(line)
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+
+            last_alert = state.get(fp, 0)
+            if now - last_alert >= MIN_ALERT_INTERVAL_SEC:
+                cause = _extract_root_cause(line)
+                if cause:
+                    error_causes.append(cause)
                     state[fp] = now
 
-        if errors:
-            msg = f'[error_watcher] {unit}\n' + '\n'.join(errors[:5])
+        if error_causes:
+            svc_name = unit.replace('.service', '')
+            # 핵심 원인만 최대 3줄, 중복 제거
+            unique_causes = list(dict.fromkeys(error_causes))[:3]
+            suppressed = len(error_causes) - len(unique_causes)
+            cause_text = '\n'.join(f"  • {c[:200]}" for c in unique_causes)
+            msg = f"🚨 {svc_name} 장애 감지\n{cause_text}"
+            if suppressed > 0:
+                msg += f"\n  (외 {suppressed}건 동일 에러 생략)"
             send_message(token, chat_id, msg)
 
     write_state(state)

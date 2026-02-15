@@ -1,5 +1,6 @@
 import os, time, json, traceback, sys
 import feedparser
+import psycopg2
 from openai import OpenAI
 from db_config import get_conn
 NEWS_POLL_SEC = int(os.getenv("NEWS_POLL_SEC", "300"))
@@ -113,7 +114,7 @@ def llm_analyze(client, title):
 
 def ensure_table(db):
     """
-    ✅ 현재 실DB에 존재하는 스키마와 맞춤:
+    현재 실DB에 존재하는 스키마와 맞춤:
       id, ts(timestamptz), source, title, url, summary, impact_score, keywords(text[])
     (테이블이 없을 때만 생성)
     """
@@ -164,8 +165,27 @@ def run_summary_once():
     print(db_news_summary(db, minutes=minutes, limit=limit))
     db.close()
 
+
+def _ensure_conn(db):
+    """DB 커넥션 상태 확인 후 끊겼으면 재연결."""
+    if db is None or db.closed:
+        log("[news_bot] DB 재연결 시도...")
+        return get_conn(autocommit=True)
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT 1")
+        return db
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        log("[news_bot] DB 커넥션 끊김, 재연결...")
+        try:
+            db.close()
+        except Exception:
+            pass
+        return get_conn(autocommit=True)
+
+
 def main():
-    # ✅ 요약만 출력하고 종료 (텔레그램 “DB 뉴스 요약”용)
+    # 요약만 출력하고 종료 (텔레그램 "DB 뉴스 요약"용)
     if len(sys.argv) > 1 and sys.argv[1] == "--summary":
         run_summary_once()
         return
@@ -179,8 +199,17 @@ def main():
     ensure_table(db)
 
     while True:
+        try:
+            # 매 TICK마다 커넥션 상태 확인
+            db = _ensure_conn(db)
+        except Exception as e:
+            log(f"[news_bot] DB 재연결 실패: {e}")
+            time.sleep(30)
+            continue
+
         log("[news_bot] TICK")
         inserted = 0
+        db_errors = 0
         active_keywords = _load_watch_keywords(db)
         log(f"[news_bot] active keywords: {len(active_keywords)}")
 
@@ -231,20 +260,36 @@ def main():
                             kw if kw else None,
                             title_ko if title_ko else None,
                         ))
-                    db.commit()
                     inserted += 1
+
+                except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
+                    db_errors += 1
+                    if db_errors <= 1:
+                        log(f"[news_bot] DB 커넥션 오류: {db_err}")
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+                    try:
+                        db = get_conn(autocommit=True)
+                        log("[news_bot] DB 재연결 성공")
+                    except Exception as re_err:
+                        log(f"[news_bot] DB 재연결 실패: {re_err}")
+                        break
+                    continue
 
                 except Exception as ex:
                     try:
                         db.rollback()
                     except Exception:
                         pass
-                    log("[news_bot] ERROR entry process/insert (rolled back)")
-                    log(str(ex))
-                    log(traceback.format_exc())
+                    log(f"[news_bot] ERROR insert: {ex}")
                     continue
 
-        log(f"[news_bot] DONE inserted={inserted}, sleep={NEWS_POLL_SEC}s")
+        if db_errors > 0:
+            log(f"[news_bot] DONE inserted={inserted}, db_errors={db_errors}, sleep={NEWS_POLL_SEC}s")
+        else:
+            log(f"[news_bot] DONE inserted={inserted}, sleep={NEWS_POLL_SEC}s")
         time.sleep(NEWS_POLL_SEC)
 
 if __name__ == "__main__":
