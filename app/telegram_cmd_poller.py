@@ -127,17 +127,8 @@ HELP_TEXT = (
 def _check_news_importance():
     """DB에서 최근 1시간 고영향 뉴스 확인. impact_score >= 7 뉴스 반환."""
     try:
-        import psycopg2
-        db_cfg = dict(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME", "trading"),
-            user=os.getenv("DB_USER", "bot"),
-            password=os.getenv("DB_PASS", "botpass"),
-            connect_timeout=10,
-            options="-c statement_timeout=30000",
-        )
-        conn = psycopg2.connect(**db_cfg)
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("""
@@ -242,17 +233,8 @@ def _fetch_categorized_news():
              'categories': {}}
     conn = None
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME", "trading"),
-            user=os.getenv("DB_USER", "bot"),
-            password=os.getenv("DB_PASS", "botpass"),
-            connect_timeout=10,
-            options="-c statement_timeout=30000",
-        )
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             # Aggregate stats
             cur.execute("""
@@ -344,20 +326,11 @@ def _ai_news_claude_advisory(text: str, call_type: str = 'AUTO',
     no_fallback = call_type in ('USER', 'EMERGENCY')
     conn = None
     try:
-        import psycopg2
         import news_strategy_report
         import macro_trace_computer
 
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME", "trading"),
-            user=os.getenv("DB_USER", "bot"),
-            password=os.getenv("DB_PASS", "botpass"),
-            connect_timeout=10,
-            options="-c statement_timeout=30000",
-        )
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             # 1. Compute pending macro_traces
             macro_trace_computer.compute_pending_traces(cur)
@@ -547,19 +520,10 @@ def _check_auto_trading_active(cur=None):
             cur.execute('SELECT enabled FROM trade_switch ORDER BY id DESC LIMIT 1;')
             row = cur.fetchone()
         else:
-            import psycopg2
+            from db_config import get_conn
             conn = None
             try:
-                conn = psycopg2.connect(
-                    host=os.getenv('DB_HOST', 'localhost'),
-                    port=int(os.getenv('DB_PORT', '5432')),
-                    dbname=os.getenv('DB_NAME', 'trading'),
-                    user=os.getenv('DB_USER', 'bot'),
-                    password=os.getenv('DB_PASS', 'botpass'),
-                    connect_timeout=10,
-                    options='-c statement_timeout=10000',
-                )
-                conn.autocommit = True
+                conn = get_conn(autocommit=True)
                 with conn.cursor() as c:
                     c.execute('SELECT enabled FROM trade_switch ORDER BY id DESC LIMIT 1;')
                     row = c.fetchone()
@@ -1062,17 +1026,8 @@ def _build_db_context_section():
     """Build DB context section for GPT-mini prompt."""
     try:
         import position_manager as _pm
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv('DB_HOST', 'localhost'),
-            port=int(os.getenv('DB_PORT', '5432')),
-            dbname=os.getenv('DB_NAME', 'trading'),
-            user=os.getenv('DB_USER', 'bot'),
-            password=os.getenv('DB_PASS', 'botpass'),
-            connect_timeout=10,
-            options='-c statement_timeout=10000',
-        )
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             db_ctx = _pm.get_db_context_for_prompt(cur)
         conn.close()
@@ -1427,22 +1382,13 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
     """Engine-first strategy pipeline: Score → Engine final → Claude risk advice.
     Engine determines final action. Claude provides risk parameters only. Returns (text, provider)."""
     no_fallback = call_type in ('USER', 'EMERGENCY')
-    import psycopg2
     import score_engine
     import claude_api
 
     conn = None
     try:
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME", "trading"),
-            user=os.getenv("DB_USER", "bot"),
-            password=os.getenv("DB_PASS", "botpass"),
-            connect_timeout=10,
-            options="-c statement_timeout=30000",
-        )
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             # Phase 0: Real-time market snapshot
             import market_snapshot as _ms
@@ -1612,17 +1558,8 @@ def _fetch_vol_profile() -> str:
     """Fetch latest volume profile (POC/VAH/VAL) from DB."""
     conn = None
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME", "trading"),
-            user=os.getenv("DB_USER", "bot"),
-            password=os.getenv("DB_PASS", "botpass"),
-            connect_timeout=10,
-            options="-c statement_timeout=10000",
-        )
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT poc, vah, val, ts FROM vol_profile
@@ -1769,18 +1706,9 @@ def _save_advisory(kind, input_packet, response_text, metadata):
     """Save Claude/GPT advisory to DB. Silent on error."""
     conn = None
     try:
-        import psycopg2
         import save_claude_analysis
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME", "trading"),
-            user=os.getenv("DB_USER", "bot"),
-            password=os.getenv("DB_PASS", "botpass"),
-            connect_timeout=10,
-            options="-c statement_timeout=30000",
-        )
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         rec_action = metadata.get('recommended_action', 'ADVISORY')
         output = {
             'recommended_action': rec_action,
@@ -1818,18 +1746,8 @@ def _save_advisory(kind, input_packet, response_text, metadata):
 
 def _get_db_conn():
     """Get a DB connection. Unified helper for all DB operations."""
-    import psycopg2
-    conn = psycopg2.connect(
-        host=os.getenv('DB_HOST', 'localhost'),
-        port=int(os.getenv('DB_PORT', '5432')),
-        dbname=os.getenv('DB_NAME', 'trading'),
-        user=os.getenv('DB_USER', 'bot'),
-        password=os.getenv('DB_PASS', 'botpass'),
-        connect_timeout=10,
-        options='-c statement_timeout=30000',
-    )
-    conn.autocommit = True
-    return conn
+    from db_config import get_conn
+    return get_conn(autocommit=True)
 
 
 def _get_directive_conn():

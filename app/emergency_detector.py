@@ -5,20 +5,10 @@ Does NOT execute trades. Detection only.
 """
 import os
 import traceback
-import psycopg2
 from decimal import Decimal
-from dotenv import load_dotenv
-load_dotenv('/root/trading-bot/app/.env')
+from db_config import get_conn
 
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
-DB = dict(
-    host=os.getenv('DB_HOST', 'localhost'),
-    port=int(os.getenv('DB_PORT', '5432')),
-    dbname=os.getenv('DB_NAME', 'trading'),
-    user=os.getenv('DB_USER', 'bot'),
-    password=os.getenv('DB_PASS', 'botpass'),
-    connect_timeout=10,
-    options='-c statement_timeout=30000')
 
 # Aligned with event_trigger thresholds (EVENT tier)
 # NOTE: run_check() is kept for telegram UI display.
@@ -31,7 +21,7 @@ THRESHOLDS = {
 
 
 def _db():
-    return psycopg2.connect(**DB)
+    return get_conn()
 
 
 def _load_thresholds(conn=None):

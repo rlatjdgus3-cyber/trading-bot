@@ -29,8 +29,8 @@ def _log(msg):
 
 
 def _db_conn():
-    import psycopg2
-    return psycopg2.connect(host = os.getenv('DB_HOST', 'localhost'), port = int(os.getenv('DB_PORT', '5432')), dbname = os.getenv('DB_NAME', 'trading'), user = os.getenv('DB_USER', 'bot'), password = os.getenv('DB_PASS', 'botpass'), connect_timeout = 10, options = '-c statement_timeout=30000')
+    from db_config import get_conn
+    return get_conn()
 
 
 def _ensure_scheduled_orders_table(cur):
@@ -185,10 +185,14 @@ def _insert_scheduled_order(cur = None, parsed = None, execute_at = None):
 
 def cancel_scheduled_order(order_id = None):
     '''Cancel a scheduled order by ID.'''
-    conn = None
     conn = _db_conn()
     conn.autocommit = True
-# WARNING: Decompyle incomplete
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE scheduled_orders SET status='CANCELLED' WHERE id=%s AND status='PENDING'", (order_id,))
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
 def check_and_execute_scheduled_orders():
@@ -196,22 +200,95 @@ def check_and_execute_scheduled_orders():
     Also expire orders older than SCHEDULED_EXPIRY_HOURS.
     Returns list of Telegram messages to send.'''
     messages = []
-    conn = None
     conn = _db_conn()
     conn.autocommit = True
-# WARNING: Decompyle incomplete
+    try:
+        cur = conn.cursor()
+        # Expire old orders
+        cur.execute("""
+            UPDATE scheduled_orders SET status='EXPIRED'
+            WHERE status='PENDING'
+            AND created_at < now() - interval '%s hours'
+        """, (SCHEDULED_EXPIRY_HOURS,))
+        # Fetch due orders
+        cur.execute("""
+            SELECT id, side, size_percent, raw_text
+            FROM scheduled_orders
+            WHERE status='PENDING' AND execute_at <= now()
+            ORDER BY execute_at
+        """)
+        for row in cur.fetchall():
+            oid, side, size_pct, raw_text = row
+            _log(f"Executing scheduled order #{oid}: {side} {size_pct}%")
+            try:
+                result = execute_trade_command({
+                    'side': side,
+                    'size_percent': size_pct,
+                    'immediate': True,
+                    'raw_text': raw_text or '',
+                })
+                cur.execute("UPDATE scheduled_orders SET status='EXECUTED', executed_at=now(), result_msg=%s WHERE id=%s", (str(result)[:500], oid))
+                messages.append(f"예약 주문 #{oid} 실행: {result}")
+            except Exception as e:
+                cur.execute("UPDATE scheduled_orders SET status='FAILED', result_msg=%s WHERE id=%s", (str(e)[:500], oid))
+                messages.append(f"예약 주문 #{oid} 실패: {e}")
+    finally:
+        conn.close()
+    return messages
 
 
 def execute_trade_command(parsed = None):
     '''Main entry: execute a parsed trade command. Returns Telegram reply string.'''
+    if parsed is None:
+        return "파싱된 명령이 없습니다."
     side = parsed.get('side')
-    size_pct = parsed['size_percent']
+    size_pct = parsed.get('size_percent', 10)
     immediate = parsed.get('immediate', True)
     scheduled_hour = parsed.get('scheduled_hour')
     capital_limit = parsed.get('capital_limit')
     raw_text = parsed.get('raw_text', '')
-    conn = None
     conn = _db_conn()
     conn.autocommit = True
-# WARNING: Decompyle incomplete
+    try:
+        cur = conn.cursor()
+        _ensure_migrations(cur)
+        # Safety check
+        ok, reason, pos_ctx = _check_safety(cur)
+        if not ok:
+            _log_trade_process(cur, rejection_reason=reason, source='telegram_manual')
+            return f"주문 거부: {reason}"
+        # Auto direction if not specified
+        if not side:
+            try:
+                from direction_scorer import get_direction
+                side = get_direction()
+            except Exception:
+                side = 'LONG'
+        # Calculate USDT amount
+        price = _fetch_btc_price()
+        balance = _fetch_available_balance()
+        usdt_amount = balance * (size_pct / 100.0)
+        if capital_limit and usdt_amount > capital_limit:
+            usdt_amount = capital_limit
+        usdt_amount = min(usdt_amount, USDT_CAP)
+        if usdt_amount < 1:
+            return "주문 가능 금액이 부족합니다."
+        # Insert signal
+        if not immediate and scheduled_hour is not None:
+            execute_at = datetime.datetime.now(datetime.timezone.utc).replace(
+                hour=int(scheduled_hour), minute=0, second=0, microsecond=0)
+            if execute_at <= datetime.datetime.now(datetime.timezone.utc):
+                execute_at += datetime.timedelta(days=1)
+            oid = _insert_scheduled_order(cur, parsed={'side': side, 'size_percent': size_pct, 'raw_text': raw_text}, execute_at=execute_at)
+            return f"예약 주문 등록 완료 (#{oid}, {execute_at.strftime('%H:%M')} UTC)"
+        sig_id = _insert_signal(cur, direction=side, usdt_amount=usdt_amount, raw_text=raw_text, source='telegram_manual')
+        _log_trade_process(cur, signal_id=sig_id, chosen_side=side, size_percent=size_pct,
+                          capital_limit=capital_limit, source='telegram_manual',
+                          decision_context=pos_ctx)
+        return f"{side} {size_pct}% ({usdt_amount:.1f} USDT) 주문 신호 등록 완료 (#{sig_id})"
+    except Exception as e:
+        _log(f"execute_trade_command error: {e}")
+        return f"주문 실행 오류: {e}"
+    finally:
+        conn.close()
 

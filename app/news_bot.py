@@ -1,8 +1,7 @@
 import os, time, json, traceback, sys
 import feedparser
-import psycopg2
 from openai import OpenAI
-from db_config import DB_CONFIG
+from db_config import get_conn
 NEWS_POLL_SEC = int(os.getenv("NEWS_POLL_SEC", "300"))
 FEED_AGENT = os.getenv("NEWS_FEED_AGENT", "Mozilla/5.0 trading-bot-news/1.0")
 
@@ -109,7 +108,7 @@ def llm_analyze(client, title):
         if impact_path:
             summary += f" | {impact_path}"
         return impact, direction, summary, title_ko
-    except:
+    except Exception:
         return 0, "neutral", text[:200], ""
 
 def ensure_table(db):
@@ -158,7 +157,7 @@ def db_news_summary(db, minutes=60, limit=20) -> str:
         return (row[0] if row and row[0] else "📰 DB 뉴스\n• (없음)")
 
 def run_summary_once():
-    db = psycopg2.connect(**DB_CONFIG)
+    db = get_conn(autocommit=True)
     ensure_table(db)
     minutes = int(os.getenv("NEWS_SUMMARY_MINUTES", "60"))
     limit = int(os.getenv("NEWS_SUMMARY_LIMIT", "20"))
@@ -176,7 +175,7 @@ def main():
     if client is None:
         log("[news_bot] NOTE: OPENAI_API_KEY 없음/자리표시자 -> LLM 없이 저장만 진행")
 
-    db = psycopg2.connect(**DB_CONFIG)
+    db = get_conn(autocommit=True)
     ensure_table(db)
 
     while True:
@@ -222,7 +221,7 @@ def main():
                         cur.execute("""
                             INSERT INTO public.news(source, title, url, summary, impact_score, keywords, title_ko)
                             VALUES (%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (url) DO NOTHING
+                            ON CONFLICT DO NOTHING
                         """, (
                             source,
                             title,

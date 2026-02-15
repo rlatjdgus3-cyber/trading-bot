@@ -21,7 +21,7 @@ import urllib.request
 sys.path.insert(0, '/root/trading-bot/app')
 from datetime import datetime, timezone, timedelta
 import test_utils
-import psycopg2
+from db_config import get_conn
 from dotenv import load_dotenv
 load_dotenv('/root/trading-bot/app/.env')
 STATE_PATH = '/root/trading-bot/app/.test_lifecycle_state.json'
@@ -34,7 +34,7 @@ def _log(msg):
 
 
 def _db_conn():
-    return psycopg2.connect(host=os.getenv('DB_HOST', 'localhost'), port=int(os.getenv('DB_PORT', '5432')), dbname=os.getenv('DB_NAME', 'trading'), user=os.getenv('DB_USER', 'bot'), password=os.getenv('DB_PASS', 'botpass'), connect_timeout=10, options='-c statement_timeout=30000')
+    return get_conn()
 
 
 def _load_env(path=None):

@@ -12,10 +12,8 @@ from sqlalchemy import create_engine, text
 # ==============================
 # 기본 설정
 # ==============================
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgresql+psycopg2://{os.getenv('DB_USER', 'bot')}:{os.getenv('DB_PASS', 'botpass')}@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'trading')}"
-)
+from db_config import SQLALCHEMY_URL
+DATABASE_URL = os.getenv("DATABASE_URL", SQLALCHEMY_URL)
 
 DRY_RUN = os.getenv("DRY_RUN", "1").lower() in ("1", "true", "yes")
 REAL_ENABLE_ENV = os.getenv("REAL_ENABLE_ENV", "NO").lower() in ("1", "true", "yes")

@@ -20,10 +20,10 @@ import traceback
 import urllib.parse
 import urllib.request
 import ccxt
-import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv("/root/trading-bot/app/.env")
+from db_config import get_conn
 import exchange_compliance as ecl
 
 # ============================================================
@@ -39,15 +39,7 @@ EQ_DRY_RUN = os.getenv("EQ_DRY_RUN", "1") != "0"  # default True = log-only
 
 ACTION_TBL = "signals_action_v3"
 
-DB = dict(
-    host=os.getenv("DB_HOST", "localhost"),
-    port=int(os.getenv("DB_PORT", "5432")),
-    dbname=os.getenv("DB_NAME", "trading"),
-    user=os.getenv("DB_USER", "bot"),
-    password=os.getenv("DB_PASS", "botpass"),
-    connect_timeout=10,
-    options="-c statement_timeout=30000",
-)
+
 
 # ============================================================
 # Guard 1: env var gate  (checked once at startup)
@@ -65,9 +57,7 @@ def log(msg):
 
 
 def db_conn():
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
-    return conn
+    return get_conn(autocommit=True)
 
 
 _tg_config = {}

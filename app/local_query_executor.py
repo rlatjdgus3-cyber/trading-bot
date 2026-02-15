@@ -8,12 +8,9 @@ All data comes from DB, ccxt API, or systemd.
 import os
 import re
 import subprocess
-import psycopg2
-from dotenv import load_dotenv
-load_dotenv('/root/trading-bot/app/.env')
+from db_config import get_conn, DB_CONFIG
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 APP_DIR = '/root/trading-bot/app'
-DB = dict(host=os.getenv('DB_HOST', 'localhost'), port=int(os.getenv('DB_PORT', '5432')), dbname=os.getenv('DB_NAME', 'trading'), user=os.getenv('DB_USER', 'bot'), password=os.getenv('DB_PASS', 'botpass'), connect_timeout=10, options='-c statement_timeout=30000')
 WATCHED_SERVICES = [
     'candles',
     'executor',
@@ -34,9 +31,7 @@ SERVICE_NAMES_KO = {
     'pnl_watcher': '손익 감시'}
 
 def _db():
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
-    return conn
+    return get_conn(autocommit=True)
 
 
 def _run(cmd, timeout=25):
@@ -131,7 +126,7 @@ def _btc_price(_text=None):
 def _news_summary(text=None):
     (minutes, limit) = _parse_minutes_and_limit(text)
     env = os.environ.copy()
-    env['DATABASE_URL'] = f"postgresql://{DB['user']}:{DB['password']}@{DB['host']}:{DB['port']}/{DB['dbname']}"
+    env['DATABASE_URL'] = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
     env['NEWS_SUMMARY_MINUTES'] = str(minutes)
     env['NEWS_SUMMARY_LIMIT'] = str(limit)
     p = subprocess.run([

@@ -13,20 +13,7 @@ import json
 import time
 import os
 import traceback
-import psycopg2
-from dotenv import load_dotenv
-
-load_dotenv('/root/trading-bot/app/.env')
-
-DB_DSN = dict(
-    host=os.getenv('DB_HOST', 'localhost'),
-    port=int(os.getenv('DB_PORT', '5432')),
-    dbname=os.getenv('DB_NAME', 'trading'),
-    user=os.getenv('DB_USER', 'bot'),
-    password=os.getenv('DB_PASS', 'botpass'),
-    connect_timeout=10,
-    options='-c statement_timeout=30000',
-)
+from db_config import get_conn
 
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 TF = '1m'
@@ -49,9 +36,7 @@ def bucket(px):
 
 def _get_db():
     """Get DB connection with autocommit."""
-    conn = psycopg2.connect(**DB_DSN)
-    conn.autocommit = True
-    return conn
+    return get_conn(autocommit=True)
 
 
 def fetch_candles(cur):

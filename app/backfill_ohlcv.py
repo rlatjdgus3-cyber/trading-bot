@@ -14,10 +14,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, '/root/trading-bot/app')
 import ccxt
-import psycopg2
-from dotenv import load_dotenv
-
-load_dotenv('/root/trading-bot/app/.env')
+from db_config import get_conn
 
 SYMBOL = 'BTC/USDT:USDT'
 TF = '5m'
@@ -31,15 +28,7 @@ def _log(msg):
 
 
 def _db_conn():
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST', 'localhost'),
-        port=int(os.getenv('DB_PORT', '5432')),
-        dbname=os.getenv('DB_NAME', 'trading'),
-        user=os.getenv('DB_USER', 'bot'),
-        password=os.getenv('DB_PASS', 'botpass'),
-        connect_timeout=10,
-        options='-c statement_timeout=60000',
-    )
+    return get_conn()
 
 
 def _make_exchange():

@@ -11,14 +11,13 @@ import sys
 import json
 import urllib.parse
 import urllib.request
-import psycopg2
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv('/root/trading-bot/app/.env')
+from db_config import get_conn
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
-DB = dict(host=os.getenv('DB_HOST', 'localhost'), port=int(os.getenv('DB_PORT', '5432')), dbname=os.getenv('DB_NAME', 'trading'), user=os.getenv('DB_USER', 'bot'), password=os.getenv('DB_PASS', 'botpass'), connect_timeout=10, options='-c statement_timeout=30000')
 TG_ENV_PATH = '/root/trading-bot/app/telegram_cmd.env'
 
 def _load_tg_env():
@@ -65,7 +64,7 @@ def _send_telegram(text=None):
 
 
 def _db():
-    conn = psycopg2.connect(**DB)
+    conn = get_conn(autocommit=True)
     conn.autocommit = True
     return conn
 

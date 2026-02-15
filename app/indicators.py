@@ -1,20 +1,6 @@
 import os
 import time
-import psycopg2
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# =========================
-# DB 설정 (운영 기준: 5432)
-# =========================
-DB_DSN = dict(
-    host=os.getenv("DB_HOST", "localhost"),
-    port=int(os.getenv("DB_PORT", "5432")),
-    dbname=os.getenv("DB_NAME", "trading"),
-    user=os.getenv("DB_USER", "bot"),
-    password=os.getenv("DB_PASS", "botpass"),
-)
+from db_config import get_conn
 
 # =========================
 # 기본 설정
@@ -37,8 +23,7 @@ last_ts = None
 
 while True:
     try:
-        db = psycopg2.connect(**DB_DSN)
-        db.autocommit = True
+        db = get_conn(autocommit=True)
 
         with db.cursor() as cur:
             # 최신 캔들만 조회
@@ -97,11 +82,41 @@ while True:
         vol_ma20 = sma(vols[-20:])
         vol_spike = vol > vol_ma20 * 2
 
+        # RSI (14)
+        rsi_14 = None
+        if len(closes) >= 15:
+            deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+            recent = deltas[-14:]
+            gains = [d if d > 0 else 0 for d in recent]
+            losses = [-d if d < 0 else 0 for d in recent]
+            avg_gain = sum(gains) / 14
+            avg_loss = sum(losses) / 14
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                rsi_14 = 100 - 100 / (1 + rs)
+            else:
+                rsi_14 = 100.0
+
+        # ATR (14)
+        atr_14 = None
+        if len(closes) >= 15:
+            trs = []
+            for i in range(-14, 0):
+                hi = highs[i]
+                lo = lows[i]
+                prev_c = closes[i - 1]
+                tr = max(hi - lo, abs(hi - prev_c), abs(lo - prev_c))
+                trs.append(tr)
+            atr_14 = sum(trs) / 14
+
+        # MA 50 / 200
+        ma_50 = sma(closes[-50:]) if len(closes) >= 50 else None
+        ma_200 = sma(closes[-200:]) if len(closes) >= 200 else None
+
         # =========================
         # indicators 저장
         # =========================
-        db = psycopg2.connect(**DB_DSN)
-        db.autocommit = True
+        db = get_conn(autocommit=True)
 
         with db.cursor() as cur:
             cur.execute(
@@ -111,24 +126,32 @@ while True:
                     bb_mid, bb_up, bb_dn,
                     ich_tenkan, ich_kijun,
                     ich_span_a, ich_span_b,
-                    vol, vol_ma20, vol_spike
+                    vol, vol_ma20, vol_spike,
+                    rsi_14, atr_14, ma_50, ma_200
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (symbol, tf, ts) DO NOTHING
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (symbol, tf, ts) DO UPDATE SET
+                    bb_mid=EXCLUDED.bb_mid, bb_up=EXCLUDED.bb_up, bb_dn=EXCLUDED.bb_dn,
+                    ich_tenkan=EXCLUDED.ich_tenkan, ich_kijun=EXCLUDED.ich_kijun,
+                    ich_span_a=EXCLUDED.ich_span_a, ich_span_b=EXCLUDED.ich_span_b,
+                    vol=EXCLUDED.vol, vol_ma20=EXCLUDED.vol_ma20, vol_spike=EXCLUDED.vol_spike,
+                    rsi_14=EXCLUDED.rsi_14, atr_14=EXCLUDED.atr_14,
+                    ma_50=EXCLUDED.ma_50, ma_200=EXCLUDED.ma_200
                 """,
                 (
                     symbol, tf, ts,
                     mid, up, dn,
                     tenkan, kijun,
                     span_a, span_b,
-                    vol, vol_ma20, vol_spike
+                    vol, vol_ma20, vol_spike,
+                    rsi_14, atr_14, ma_50, ma_200
                 ),
             )
 
         db.close()
 
         print(
-            f"Saved indicators @ {ts} vol_spike={vol_spike}",
+            f"Saved indicators @ {ts} rsi={rsi_14} atr={atr_14} vol_spike={vol_spike}",
             flush=True
         )
 

@@ -225,18 +225,10 @@ def compute(cur=None, exchange=None):
 
 if __name__ == '__main__':
     import json
-    import psycopg2
+    from db_config import get_conn
     conn = None
     try:
-        conn = psycopg2.connect(
-            host=os.getenv('DB_HOST', 'localhost'),
-            port=int(os.getenv('DB_PORT', '5432')),
-            dbname=os.getenv('DB_NAME', 'trading'),
-            user=os.getenv('DB_USER', 'bot'),
-            password=os.getenv('DB_PASS', 'botpass'),
-            connect_timeout=10,
-            options='-c statement_timeout=30000')
-        conn.autocommit = True
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             result = compute(cur)
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

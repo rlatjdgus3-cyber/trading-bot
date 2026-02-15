@@ -29,15 +29,8 @@ def _log(msg):
 
 
 def _db_conn():
-    import psycopg2
-    return psycopg2.connect(
-        host=os.getenv('DB_HOST', 'localhost'),
-        port=int(os.getenv('DB_PORT', '5432')),
-        dbname=os.getenv('DB_NAME', 'trading'),
-        user=os.getenv('DB_USER', 'bot'),
-        password=os.getenv('DB_PASS', 'botpass'),
-        connect_timeout=10,
-        options='-c statement_timeout=30000')
+    from db_config import get_conn
+    return get_conn()
 
 
 def _compute_correlation(cur):

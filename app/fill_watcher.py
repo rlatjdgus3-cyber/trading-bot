@@ -20,10 +20,8 @@ import traceback
 import urllib.parse
 import urllib.request
 import ccxt
-import psycopg2
-from dotenv import load_dotenv
+from db_config import get_conn
 import report_formatter
-load_dotenv('/root/trading-bot/app/.env')
 
 POLL_SEC = 5
 ORDER_TIMEOUT_SEC = 60
@@ -31,14 +29,6 @@ POSITION_VERIFY_DELAY_SEC = 2
 MAX_POLLS_PER_ORDER = 30
 SYMBOL = 'BTC/USDT:USDT'
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
-DB = dict(
-    host=os.getenv('DB_HOST', 'localhost'),
-    port=int(os.getenv('DB_PORT', '5432')),
-    dbname=os.getenv('DB_NAME', 'trading'),
-    user=os.getenv('DB_USER', 'bot'),
-    password=os.getenv('DB_PASS', 'botpass'),
-    connect_timeout=10,
-    options='-c statement_timeout=30000')
 ACTION_TBL = 'signals_action_v3'
 _TG_CONFIG = {}
 
@@ -48,7 +38,7 @@ def log(msg):
 
 
 def db_conn():
-    return psycopg2.connect(**DB)
+    return get_conn()
 
 
 def _exchange():

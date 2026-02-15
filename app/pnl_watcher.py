@@ -1,16 +1,13 @@
+import os
 import time
 import traceback
 import ccxt
 
 # =========================
-# 🔑 BYBIT API KEY 설정
+# 🔑 BYBIT API KEY 설정 (.env에서 로드)
 # =========================
-# ⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇⬇
-# 여기다가 네 API KEY를 문자열로 넣어
-BYBIT_API_KEY = "NCqVE2XZnkBvKFyDtj"
-# 여기다가 네 API SECRET을 문자열로 넣어
-BYBIT_API_SECRET = "dzllyaimsVvccQJB0fI9H8E03b3K2TV0gzkA"
-# ⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆⬆
+BYBIT_API_KEY = os.getenv('BYBIT_API_KEY', '')
+BYBIT_API_SECRET = os.getenv('BYBIT_SECRET', '')
 
 # =========================
 # CONFIG
@@ -20,8 +17,8 @@ PNL_UPPER_USD = 50     # +50 USD 이상
 PNL_LOWER_USD = -50    # -50 USD 이하
 CHECK_INTERVAL = 30    # seconds
 
-if "여기에_" in BYBIT_API_KEY or "여기에_" in BYBIT_API_SECRET:
-    raise SystemExit("❌ API KEY / SECRET을 코드에 아직 안 넣었음")
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    raise SystemExit("❌ BYBIT_API_KEY / BYBIT_SECRET 환경변수가 설정되지 않음")
 
 # =========================
 # BYBIT

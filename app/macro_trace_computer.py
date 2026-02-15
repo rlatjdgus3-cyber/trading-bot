@@ -318,18 +318,8 @@ def get_traces_for_report(cur, news_ids):
 
 
 if __name__ == '__main__':
-    import psycopg2
-    from dotenv import load_dotenv
-    load_dotenv('/root/trading-bot/app/.env')
-    conn = psycopg2.connect(
-        host=os.getenv('DB_HOST', 'localhost'),
-        port=int(os.getenv('DB_PORT', '5432')),
-        dbname=os.getenv('DB_NAME', 'trading'),
-        user=os.getenv('DB_USER', 'bot'),
-        password=os.getenv('DB_PASS', 'botpass'),
-        connect_timeout=10,
-        options='-c statement_timeout=60000')
-    conn.autocommit = True
+    from db_config import get_conn
+    conn = get_conn(autocommit=True)
     with conn.cursor() as cur:
         n = compute_pending_traces(cur, lookback_hours=24)
         print(f'Computed {n} traces')
