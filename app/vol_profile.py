@@ -13,6 +13,7 @@ import json
 import time
 import os
 import traceback
+import psycopg2
 from db_config import get_conn
 
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')

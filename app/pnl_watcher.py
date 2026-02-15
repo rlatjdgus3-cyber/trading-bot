@@ -27,7 +27,7 @@ exchange = ccxt.bybit({
     "apiKey": BYBIT_API_KEY,
     "secret": BYBIT_API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "linear"},
+    "options": {"defaultType": "swap"},
 })
 
 exchange.load_markets()

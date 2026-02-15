@@ -1,5 +1,10 @@
+"""
+indicators.py — Technical indicator calculator daemon.
+Runs every ~60s: fetches latest 300 1m candles, calculates indicators, upserts to DB.
+"""
 import os
 import time
+import psycopg2
 from db_config import get_conn
 
 # =========================
@@ -20,11 +25,10 @@ def ll(xs):
 print("=== INDICATOR ENGINE STARTED ===", flush=True)
 
 last_ts = None
+db = get_conn(autocommit=True)
 
 while True:
     try:
-        db = get_conn(autocommit=True)
-
         with db.cursor() as cur:
             # 최신 캔들만 조회
             cur.execute(
@@ -38,8 +42,6 @@ while True:
                 (symbol, tf),
             )
             rows = cur.fetchall()
-
-        db.close()
 
         if len(rows) < 120:
             print("Waiting candles:", len(rows), flush=True)
@@ -116,8 +118,6 @@ while True:
         # =========================
         # indicators 저장
         # =========================
-        db = get_conn(autocommit=True)
-
         with db.cursor() as cur:
             cur.execute(
                 """
@@ -148,14 +148,25 @@ while True:
                 ),
             )
 
-        db.close()
-
         print(
             f"Saved indicators @ {ts} rsi={rsi_14} atr={atr_14} vol_spike={vol_spike}",
             flush=True
         )
 
         time.sleep(60)
+
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        print(f"DB connection lost: {e}", flush=True)
+        try:
+            db.close()
+        except Exception:
+            pass
+        try:
+            db = get_conn(autocommit=True)
+            print("DB reconnected", flush=True)
+        except Exception as re:
+            print(f"DB reconnect failed: {re}", flush=True)
+        time.sleep(10)
 
     except Exception as e:
         print("Indicator error:", e, flush=True)

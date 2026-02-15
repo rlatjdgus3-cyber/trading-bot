@@ -126,10 +126,10 @@ HELP_TEXT = (
 
 def _check_news_importance():
     """DB에서 최근 1시간 고영향 뉴스 확인. impact_score >= 7 뉴스 반환."""
+    conn = None
     try:
         from db_config import get_conn
         conn = get_conn(autocommit=True)
-        conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, title, impact_score, summary, title_ko
@@ -140,7 +140,6 @@ def _check_news_importance():
                 LIMIT 5
             """)
             rows = cur.fetchall()
-        conn.close()
         if rows:
             return [
                 {"id": r[0], "title": r[1], "impact_score": r[2], "summary": r[3],
@@ -151,6 +150,12 @@ def _check_news_importance():
     except Exception as e:
         _log(f"_check_news_importance error: {e}")
         return None
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _ai_news_advisory(text: str, high_news: list) -> tuple:
@@ -1024,13 +1029,13 @@ def _parse_claude_action(ai_text: str) -> str:
 
 def _build_db_context_section():
     """Build DB context section for GPT-mini prompt."""
+    conn = None
     try:
         import position_manager as _pm
         from db_config import get_conn
         conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             db_ctx = _pm.get_db_context_for_prompt(cur)
-        conn.close()
 
         lines = ['=== DB 컨텍스트 ===']
         lp = db_ctx.get('last_position', {})
@@ -1065,6 +1070,12 @@ def _build_db_context_section():
     except Exception as e:
         _log(f'_build_db_context_section error: {e}')
         return ''
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _build_execution_prompt(scores, pos_state, strategy_ctx, snapshot, user_text,
