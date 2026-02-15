@@ -191,13 +191,16 @@ def _cycle(conn):
         _log('KILL_SWITCH detected. Exiting.')
         sys.exit(0)
 
-    # Also check DB kill switch
-    with conn.cursor() as cur:
-        cur.execute("SELECT value FROM bot_config WHERE key='KILL_SWITCH';")
-        row = cur.fetchone()
-        if row and row[0] == 'ON':
-            _log('DB KILL_SWITCH=ON. Exiting.')
-            sys.exit(0)
+    # Also check DB kill switch (bot_config may not exist yet)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_config WHERE key='KILL_SWITCH';")
+            row = cur.fetchone()
+            if row and row[0] == 'ON':
+                _log('DB KILL_SWITCH=ON. Exiting.')
+                sys.exit(0)
+    except Exception:
+        conn.rollback()
 
     with conn.cursor() as cur:
         count = _fetch_and_upsert(cur)

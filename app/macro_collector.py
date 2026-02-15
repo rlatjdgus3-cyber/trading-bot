@@ -128,6 +128,12 @@ def _store_prices(conn, prices):
     stored = 0
     prev_autocommit = conn.autocommit
     try:
+        # Close any open transaction before switching autocommit
+        if not prev_autocommit:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         conn.autocommit = True
         with conn.cursor() as cur:
             for source_name, data in prices.items():
