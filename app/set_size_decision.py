@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import psycopg2
 from decimal import Decimal
-
-DB = dict(host='localhost', port=5433, dbname='trading', user='bot', password='botpass',
-         connect_timeout=10, options='-c statement_timeout=30000')
+from db_config import get_conn
 SYMBOL = 'BTC/USDT:USDT'
 
 def main():
@@ -20,8 +17,7 @@ def main():
     step = Decimal(args.step)
     meta = json.loads(args.meta)
 
-    db = psycopg2.connect(**DB)
-    db.autocommit = True
+    db = get_conn(autocommit=True)
     with db.cursor() as cur:
         cur.execute('''
             INSERT INTO public.position_sizing_decision(symbol, pool, step, source, reason, meta)
@@ -29,7 +25,7 @@ def main():
             RETURNING id, ts, symbol, pool, step, source, reason;
         ''', (SYMBOL, args.pool, step, args.source, args.reason, json.dumps(meta)))
         row = cur.fetchone()
-        print('OK:', row, '| db_port:', DB['port'])
+        print('OK:', row)
 
 if __name__ == '__main__':
     main()

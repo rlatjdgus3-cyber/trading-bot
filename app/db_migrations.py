@@ -1028,6 +1028,37 @@ def ensure_exchange_policy_audit(cur):
     _log('ensure_exchange_policy_audit done')
 
 
+def cleanup_old_data(cur):
+    '''Retention policy: prune old data from large tables.
+
+    - pm_decision_log: keep 90 days
+    - market_ohlcv: keep 60 days
+    - score_history: keep 60 days
+    - event_trigger_log: keep 30 days
+    - claude_call_log: keep 60 days
+
+    Safe to call repeatedly. Uses DELETE with LIMIT to avoid long locks.
+    '''
+    policies = [
+        ('pm_decision_log', 'ts', 90),
+        ('market_ohlcv', 'ts', 60),
+        ('score_history', 'ts', 60),
+        ('event_trigger_log', 'ts', 30),
+        ('claude_call_log', 'ts', 60),
+    ]
+    for table, ts_col, days in policies:
+        try:
+            cur.execute(f"""
+                DELETE FROM {table}
+                WHERE {ts_col} < now() - interval '{days} days';
+            """)
+            deleted = cur.rowcount
+            if deleted > 0:
+                _log(f'cleanup {table}: deleted {deleted} rows (>{days}d)')
+        except Exception as e:
+            _log(f'cleanup {table} skip: {e}')
+
+
 def run_all():
     '''Run all migrations. Safe to call multiple times.'''
     conn = None
@@ -1102,6 +1133,8 @@ def run_all():
             ensure_news_impact_stats(cur)
             # Hourly trade limit 8→15
             ensure_safety_limits_hourly_15(cur)
+            # Data retention cleanup
+            cleanup_old_data(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

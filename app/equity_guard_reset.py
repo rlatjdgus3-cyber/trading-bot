@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 import os
-import psycopg2
 from decimal import Decimal
-
-DB = dict(host="localhost", port=5433, dbname="trading", user="bot", password="botpass",
-         connect_timeout=10, options="-c statement_timeout=30000")
+from db_config import get_conn
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT:USDT")
 
 def q1(cur, sql, params=()):
@@ -12,8 +9,7 @@ def q1(cur, sql, params=()):
     return cur.fetchone()
 
 def main():
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
+    conn = get_conn(autocommit=True)
     with conn.cursor() as cur:
         # 최신 cash
         row = q1(cur, "SELECT capital_usdt FROM public.virtual_capital ORDER BY id DESC LIMIT 1;")

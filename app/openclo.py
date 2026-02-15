@@ -9,6 +9,7 @@ import secrets
 import requests
 import psycopg2
 import datetime
+from db_config import get_conn
 import decimal
 from dotenv import load_dotenv
 load_dotenv('/root/trading-bot/app/.env')
@@ -35,8 +36,7 @@ if ANTHROPIC_KEY == 'DISABLED':
     ANTHROPIC_KEY = None
 ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
 ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514')
-db = psycopg2.connect(host='localhost', dbname='trading', user='bot', password='botpass')
-db.autocommit = True
+db = get_conn(autocommit=True)
 
 
 def _db_reconnect():
@@ -45,8 +45,7 @@ def _db_reconnect():
         db.close()
     except Exception:
         pass
-    db = psycopg2.connect(host='localhost', dbname='trading', user='bot', password='botpass')
-    db.autocommit = True
+    db = get_conn(autocommit=True)
 
 
 def _db_query(func):

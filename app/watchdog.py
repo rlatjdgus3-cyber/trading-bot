@@ -3,8 +3,8 @@
 
 import time
 import subprocess
-import psycopg2
-db = psycopg2.connect(host = 'localhost', dbname = 'trading', user = 'bot', password = 'botpass')
+from db_config import get_conn
+db = get_conn()
 SERVICES = {
     'price_signals': 'python3 -u /root/trading-bot/app/main.py',
     'candles': 'python3 -u /root/trading-bot/app/candles.py',

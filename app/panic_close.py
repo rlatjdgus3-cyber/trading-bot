@@ -16,27 +16,15 @@ import os
 import sys
 import time
 import ccxt
-import psycopg2
 from dotenv import load_dotenv
+from db_config import get_conn
 
 load_dotenv("/root/trading-bot/app/.env")
 
 SYMBOL = "BTC/USDT:USDT"
 
-DB = dict(
-    host="localhost",
-    port=5433,
-    dbname="trading",
-    user="bot",
-    password="botpass",
-    connect_timeout=10,
-    options="-c statement_timeout=30000",
-)
-
 def db_conn():
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
-    return conn
+    return get_conn(autocommit=True)
 
 def set_trade_switch(enabled: bool):
     with db_conn() as db:

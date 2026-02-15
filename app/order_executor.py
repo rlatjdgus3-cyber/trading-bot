@@ -2,11 +2,8 @@
 import os
 import time
 import json
-import psycopg2
 from decimal import Decimal
-
-DB = dict(host='localhost', port=5433, dbname='trading', user='bot', password='botpass',
-         connect_timeout=10, options='-c statement_timeout=30000')
+from db_config import get_conn
 
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 DRY_RUN = os.getenv('DRY_RUN', '1') == '1'
@@ -223,12 +220,11 @@ def main():
         raise SystemExit('This executor currently supports DRY_RUN only (set DRY_RUN=1).')
 
     last_decision_id = 0
-    print('[order_executor] DRY_RUN=1 symbol=', SYMBOL, 'db_port=', DB['port'])
+    print('[order_executor] DRY_RUN=1 symbol=', SYMBOL)
 
     while True:
         try:
-            conn = psycopg2.connect(**DB)
-            conn.autocommit = True
+            conn = get_conn(autocommit=True)
             last_decision_id = run_once(conn, last_decision_id)
             conn.close()
         except Exception as e:

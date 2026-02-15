@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, text
 # ==============================
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg2://bot:kimss321@localhost:5433/trading"
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'bot')}:{os.getenv('DB_PASS', 'botpass')}@{os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'trading')}"
 )
 
 DRY_RUN = os.getenv("DRY_RUN", "1").lower() in ("1", "true", "yes")

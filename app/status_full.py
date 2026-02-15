@@ -5,28 +5,16 @@ import os
 import sys
 import json
 import ccxt
-import psycopg2
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from db_config import get_conn
 
 load_dotenv("/root/trading-bot/app/.env")
 
 SYMBOL = "BTC/USDT:USDT"
 
-DB = dict(
-    host="localhost",
-    port=5433,
-    dbname="trading",
-    user="bot",
-    password="botpass",
-    connect_timeout=10,
-    options="-c statement_timeout=30000",
-)
-
 def db_conn():
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
-    return conn
+    return get_conn(autocommit=True)
 
 def q1(sql, params=None):
     conn = db_conn()

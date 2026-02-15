@@ -13,11 +13,20 @@ import urllib.request
 ENV_PATH = '/root/trading-bot/app/telegram_cmd.env'
 WATCH_UNITS = [
     'candles.service',
-    'executor.service',
     'indicators.service',
     'vol_profile.service',
     'news_bot.service',
-    'signal_logger.service']
+    'fill_watcher.service',
+    'live_event_detector.service',
+    'live_order_executor.service',
+    'macro_collector.service',
+    'order_executor.service',
+    'pnl_watcher.service',
+    'position_watcher.service',
+    'position_manager.service',
+    'dry_run_close_executor.service',
+    'autopilot.service',
+]
 IGNORE_PATTERNS = [
     re.compile(r'executor\s+STOPPED', re.IGNORECASE),
     re.compile(r'empty-heartbeat-file', re.IGNORECASE)]

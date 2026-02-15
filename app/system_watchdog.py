@@ -156,11 +156,8 @@ def _send_telegram(text: str):
 def _check_db_connection() -> tuple:
     """Check PostgreSQL connectivity. Returns (ok, detail)."""
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host='localhost', dbname='trading', user='bot', password='botpass',
-            connect_timeout=5, options='-c statement_timeout=5000')
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             cur.execute('SELECT 1;')
         conn.close()
@@ -189,11 +186,8 @@ def _check_bybit_connection() -> tuple:
 def _check_execution_queue_health() -> tuple:
     """Check for stuck PENDING items older than 10 minutes."""
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host='localhost', dbname='trading', user='bot', password='botpass',
-            connect_timeout=5, options='-c statement_timeout=5000')
-        conn.autocommit = True
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT count(*) FROM execution_queue

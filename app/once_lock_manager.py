@@ -6,9 +6,9 @@ import os
 import time
 import subprocess
 from datetime import datetime, timezone, timedelta
+from db_config import get_conn
 TEST_PATH = '/root/trading-bot/app/test_mode.json'
 SYMBOL = 'BTC/USDT:USDT'
-DB_CMD = "PGPASSWORD='botpass' psql -h localhost -p 5432 -U bot -d trading -P pager=off -t -c"
 
 def sh(cmd, timeout=30):
     p = subprocess.run([
@@ -41,20 +41,27 @@ def has_position():
 
 
 def get_lock_opened_at():
-    (rc, out) = sh(f'{DB_CMD} "SELECT opened_at FROM public.live_order_once_lock WHERE symbol=\'{SYMBOL}\' LIMIT 1;" ')
-    if rc != 0:
-        return None
-    s = out.strip()
-    if not s:
-        return None
     try:
-        return datetime.fromisoformat(s.replace(' ', 'T').replace('+00', '+00:00'))
+        conn = get_conn(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT opened_at FROM public.live_order_once_lock WHERE symbol=%s LIMIT 1;", (SYMBOL,))
+            row = cur.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return None
+        return row[0]
     except Exception:
         return None
 
 
 def delete_lock():
-    sh(f'{DB_CMD} "DELETE FROM public.live_order_once_lock WHERE symbol=\'{SYMBOL}\';" ')
+    try:
+        conn = get_conn(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.live_order_once_lock WHERE symbol=%s;", (SYMBOL,))
+        conn.close()
+    except Exception:
+        pass
 
 
 def main():

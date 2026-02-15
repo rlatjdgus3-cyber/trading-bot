@@ -4,10 +4,10 @@
 import os
 import time
 import requests
-import psycopg2
 from dotenv import load_dotenv
+from db_config import get_conn
 load_dotenv()
-db = psycopg2.connect(host='localhost', dbname='trading', user='bot', password='botpass', connect_timeout=10, options='-c statement_timeout=30000')
+db = get_conn()
 KEY = os.getenv('ALPHAVANTAGE_API_KEY')
 URL = 'https://www.alphavantage.co/query'
 SYMBOL = 'QQQ'

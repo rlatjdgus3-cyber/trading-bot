@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-import psycopg2
+from db_config import get_conn
 from decimal import Decimal
 
-DB = dict(host='localhost', port=5433, dbname='trading', user='bot', password='botpass',
-         connect_timeout=10, options='-c statement_timeout=30000')
 SYMBOL = 'BTC/USDT:USDT'
 
 BASE_RATIO = Decimal('0.70')
 DCA_RATIO  = Decimal('0.30')
 
 def main():
-    db = psycopg2.connect(**DB)
-    db.autocommit = True
+    db = get_conn(autocommit=True)
     with db.cursor() as cur:
         cur.execute('SELECT capital_usdt FROM public.virtual_capital ORDER BY id DESC LIMIT 1;')
         row = cur.fetchone()
@@ -40,7 +37,6 @@ def main():
         order_usdt = pool_amt * step
 
         print('=== ORDER SIZE CALC (NO ORDER) ===')
-        print('db_port:', DB['port'])
         print('symbol:', SYMBOL)
         print('virtual_capital:', capital)
         print('base_pool(70%):', base_pool.quantize(Decimal('0.01')))

@@ -3,8 +3,8 @@
 
 import json
 import time
-import psycopg2
-db = psycopg2.connect(host = 'localhost', dbname = 'trading', user = 'bot', password = 'botpass')
+from db_config import get_conn
+db = get_conn()
 symbol = 'BTC/USDT:USDT'
 tf = '1m'
 NEWS_THRESHOLD = 6

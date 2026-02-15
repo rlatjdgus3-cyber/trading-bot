@@ -21,8 +21,8 @@ def get_btc_price():
 
 
 def db_connect():
-    import psycopg2
-    return psycopg2.connect(host='localhost', dbname='trading', user='bot', password='botpass', connect_timeout=10, options='-c statement_timeout=30000')
+    from db_config import get_conn
+    return get_conn()
 
 
 def fetch_latest_news(limit=5):

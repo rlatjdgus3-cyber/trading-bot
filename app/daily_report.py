@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 import os
-import psycopg2
 from decimal import Decimal
 from dotenv import load_dotenv
 import ccxt
-
-DB = dict(host="localhost", port=5433, dbname="trading", user="bot", password="botpass",
-         connect_timeout=10, options="-c statement_timeout=30000")
+from db_config import get_conn
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT:USDT")
 DAY_DD = Decimal(os.getenv("EQUITY_GUARD_DAY_DD", "0.03"))
 TOTAL_DD = Decimal(os.getenv("EQUITY_GUARD_TOTAL_DD", "0.06"))
@@ -50,8 +47,7 @@ def main():
     ex = make_exchange()
     px = now_price(ex)
 
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
+    conn = get_conn(autocommit=True)
     with conn.cursor() as cur:
         cash_row = q1(cur, "SELECT capital_usdt FROM public.virtual_capital ORDER BY id DESC LIMIT 1;")
         cash = Decimal(str(cash_row[0])) if cash_row else Decimal('0')

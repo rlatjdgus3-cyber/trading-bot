@@ -4,8 +4,8 @@
 import os
 import time
 import ccxt
-import psycopg2
 from dotenv import load_dotenv
+from db_config import get_conn
 load_dotenv()
 exchange = ccxt.bybit({
     'apiKey': os.getenv('BYBIT_API_KEY'),
@@ -13,7 +13,7 @@ exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {
         'defaultType': 'swap' } })
-db = psycopg2.connect(host = 'localhost', dbname = 'trading', user = 'bot', password = 'botpass', connect_timeout = 10, options = '-c statement_timeout=30000')
+db = get_conn()
 symbol = 'BTC/USDT:USDT'
 print('=== SIGNAL LOGGER STARTED ===')
 ticker = exchange.fetch_ticker(symbol)

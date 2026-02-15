@@ -3,24 +3,15 @@ import time
 import traceback
 
 import ccxt
-import psycopg2
 from psycopg2 import OperationalError, InterfaceError
 from dotenv import load_dotenv
+from db_config import get_conn
 
 load_dotenv()
 
 SYMBOL = "BTC/USDT:USDT"
 TF = "1m"
 LIMIT = 200
-
-DB_DSN = {
-    "host": "localhost",
-    "dbname": "trading",
-    "user": "bot",
-    "password": "botpass",
-    "connect_timeout": 10,
-    "options": "-c statement_timeout=30000",
-}
 
 def make_exchange():
     return ccxt.bybit({
@@ -32,9 +23,7 @@ def make_exchange():
     })
 
 def connect_db():
-    conn = psycopg2.connect(**DB_DSN)
-    conn.autocommit = False
-    return conn
+    return get_conn(autocommit=False)
 
 def upsert_ohlcv(conn, ohlcv):
     with conn.cursor() as cur:

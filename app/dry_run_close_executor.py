@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 import os, time, json
-import psycopg2
 from decimal import Decimal
 from dotenv import load_dotenv
 import ccxt
-
-DB = dict(host="localhost", port=5433, dbname="trading", user="bot", password="botpass",
-         connect_timeout=10, options="-c statement_timeout=30000")
+from db_config import get_conn
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT:USDT")
 POLL_SEC = int(os.getenv("DRY_RUN_CLOSE_POLL_SEC", "3"))
 
@@ -101,8 +98,7 @@ def main():
 
     while True:
         try:
-            conn = psycopg2.connect(**DB)
-            conn.autocommit = True
+            conn = get_conn(autocommit=True)
             with conn.cursor() as cur:
                 ensure_state(cur)
 

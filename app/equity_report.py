@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 import os
 import json
-import psycopg2
 from decimal import Decimal
 from dotenv import load_dotenv
 import ccxt
-
-DB = dict(host="localhost", port=5433, dbname="trading", user="bot", password="botpass",
-         connect_timeout=10, options="-c statement_timeout=30000")
+from db_config import get_conn
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT:USDT")
 
 def q1(cur, sql, params=()):
@@ -59,8 +56,7 @@ def now_price(ex) -> Decimal:
 
 def main():
     ex = make_exchange()
-    conn = psycopg2.connect(**DB)
-    conn.autocommit = True
+    conn = get_conn(autocommit=True)
     with conn.cursor() as cur:
         cash = get_cash(cur)
         pos = get_pos(cur)
