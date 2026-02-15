@@ -2,9 +2,7 @@ import os, time, json, traceback, sys
 import feedparser
 import psycopg2
 from openai import OpenAI
-
-# ✅ IPv6(::1) 혼선 방지: 기본값은 127.0.0.1로 고정
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://bot:botpass@127.0.0.1:5432/trading")
+from db_config import DB_CONFIG
 NEWS_POLL_SEC = int(os.getenv("NEWS_POLL_SEC", "300"))
 FEED_AGENT = os.getenv("NEWS_FEED_AGENT", "Mozilla/5.0 trading-bot-news/1.0")
 
@@ -160,7 +158,7 @@ def db_news_summary(db, minutes=60, limit=20) -> str:
         return (row[0] if row and row[0] else "📰 DB 뉴스\n• (없음)")
 
 def run_summary_once():
-    db = psycopg2.connect(DATABASE_URL, connect_timeout=10, options="-c statement_timeout=30000")
+    db = psycopg2.connect(**DB_CONFIG)
     ensure_table(db)
     minutes = int(os.getenv("NEWS_SUMMARY_MINUTES", "60"))
     limit = int(os.getenv("NEWS_SUMMARY_LIMIT", "20"))
@@ -173,12 +171,12 @@ def main():
         run_summary_once()
         return
 
-    log(f"[news_bot] START db={DATABASE_URL} poll={NEWS_POLL_SEC}s")
+    log(f"[news_bot] START poll={NEWS_POLL_SEC}s")
     client = get_openai()
     if client is None:
         log("[news_bot] NOTE: OPENAI_API_KEY 없음/자리표시자 -> LLM 없이 저장만 진행")
 
-    db = psycopg2.connect(DATABASE_URL, connect_timeout=10, options="-c statement_timeout=30000")
+    db = psycopg2.connect(**DB_CONFIG)
     ensure_table(db)
 
     while True:
