@@ -29,7 +29,12 @@ CONSECUTIVE_HOLD_LIMIT = 2     # 2 consecutive HOLDs → suppress
 
 # Telegram suppression notification dedup (in-memory, per-process)
 _suppress_notify_ts = {}       # {lock_key: last_notify_timestamp}
-SUPPRESS_NOTIFY_COOLDOWN_SEC = 300  # max 1 notification per lock key per 5 min
+SUPPRESS_NOTIFY_COOLDOWN_SEC = 900  # max 1 notification per trigger type per 15 min
+
+# Suppression accumulator: count per trigger_type, flush every 15 min
+_suppress_accumulator = {}     # {trigger_type: count}
+_suppress_accumulator_ts = 0   # last flush timestamp
+SUPPRESS_ACCUMULATOR_SEC = 900 # 15 min accumulator window
 
 # Telegram env cache
 _tg_env_cache = {}
@@ -478,7 +483,7 @@ def _send_tg(text):
         return
     import urllib.parse
     import urllib.request
-    text = report_formatter.sanitize_telegram_text(text)
+    text = report_formatter.korean_output_guard(text)
     url = f'https://api.telegram.org/bot{token}/sendMessage'
     data = urllib.parse.urlencode({
         'chat_id': chat_id,
@@ -500,29 +505,39 @@ def _notify_hold_suppress(symbol, count, ttl_sec, trigger_types):
 
 
 def notify_event_suppressed(symbol, lock_info, trigger_types, caller='unknown'):
-    """Send telegram notification for event suppression due to active lock.
-    Deduped: max 1 notification per lock_key per 5 min.
+    """Accumulate suppression events and send summary every 15 min.
+
+    Instead of individual notifications, counts suppressions per trigger type
+    and sends a single summary message every 15 minutes.
     """
-    lock_key = lock_info.get('lock_key', 'unknown')
+    global _suppress_accumulator_ts
     now = time.time()
-    last_ts = _suppress_notify_ts.get(lock_key, 0)
-    if now - last_ts < SUPPRESS_NOTIFY_COOLDOWN_SEC:
-        return  # already notified recently
-    _suppress_notify_ts[lock_key] = now
 
-    # Purge old entries
-    expired = [k for k, v in _suppress_notify_ts.items()
-               if now - v > SUPPRESS_NOTIFY_COOLDOWN_SEC * 2]
-    for k in expired:
-        del _suppress_notify_ts[k]
+    # Accumulate counts per trigger type
+    for t in (trigger_types or ['unknown']):
+        _suppress_accumulator[t] = _suppress_accumulator.get(t, 0) + 1
 
+    # Initialize accumulator timestamp
+    if _suppress_accumulator_ts == 0:
+        _suppress_accumulator_ts = now
+
+    # Check if 15 min window passed → flush summary
+    if now - _suppress_accumulator_ts < SUPPRESS_ACCUMULATOR_SEC:
+        return  # still accumulating
+
+    # Flush accumulated counts as a summary message
     try:
         import report_formatter
-        remaining = lock_info.get('remaining_sec', 0)
-        lock_caller = lock_info.get('caller', '?')
-        text = report_formatter.format_event_suppressed(
-            trigger_types, 'db_event_lock', remaining_sec=remaining,
-            detail={'caller': caller, 'lock_owner': lock_caller})
-        _send_tg(text)
+        if _suppress_accumulator:
+            parts = []
+            for trigger_type, count in sorted(_suppress_accumulator.items()):
+                kr = report_formatter.TRIGGER_KR.get(trigger_type, trigger_type)
+                parts.append(f'{kr} {count}회')
+            text = f'🚫 최근 {SUPPRESS_ACCUMULATOR_SEC // 60}분 억제 요약: {", ".join(parts)}'
+            _send_tg(text)
     except Exception as e:
         _log(f'telegram notify error: {e}')
+    finally:
+        # Reset accumulator
+        _suppress_accumulator.clear()
+        _suppress_accumulator_ts = now

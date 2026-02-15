@@ -25,12 +25,19 @@ MAX_SIMILAR_EVENTS = 3
 MAX_SCHEDULED_PER_DAY = 2
 CLAUDE_MODEL = 'claude-sonnet-4-20250514'
 
-# Call type constants
-CALL_TYPE_AUTO = 'AUTO'
-CALL_TYPE_USER = 'USER'
-CALL_TYPE_EMERGENCY = 'EMERGENCY'
-VALID_CALL_TYPES = {CALL_TYPE_AUTO, CALL_TYPE_USER, CALL_TYPE_EMERGENCY}
+# Call type constants — 3-class system
+CALL_TYPE_NORMAL = 'NORMAL'
+CALL_TYPE_USER_MANUAL = 'USER_MANUAL'
+CALL_TYPE_AUTO_EMERGENCY = 'AUTO_EMERGENCY'
+# Backward compatibility aliases
+CALL_TYPE_AUTO = CALL_TYPE_NORMAL
+CALL_TYPE_USER = CALL_TYPE_USER_MANUAL
+CALL_TYPE_EMERGENCY = CALL_TYPE_AUTO_EMERGENCY
+VALID_CALL_TYPES = {CALL_TYPE_NORMAL, CALL_TYPE_USER_MANUAL, CALL_TYPE_AUTO_EMERGENCY,
+                    'AUTO', 'USER', 'EMERGENCY'}  # accept old names too
 EMERGENCY_SPAM_SEC = 60
+AUTO_EMERGENCY_DAILY_CAP = 30  # 폭주 방지 (AUTO_EMERGENCY)
+AUTO_EMERGENCY_DEDUP_SEC = 60  # 동일 이벤트 60초 dedup
 
 # Sonnet pricing (per token)
 INPUT_COST_PER_MTOK = 3.0         # $3 / 1M input tokens
@@ -55,6 +62,16 @@ GATE_COOLDOWNS = {
 }
 
 EVENT_DEDUP_WINDOW_SEC = 300              # 5 min — event hash dedup
+
+
+def _normalize_call_type(call_type: str) -> str:
+    """Normalize legacy call_type names to new 3-class names."""
+    mapping = {
+        'AUTO': CALL_TYPE_NORMAL,
+        'USER': CALL_TYPE_USER_MANUAL,
+        'EMERGENCY': CALL_TYPE_AUTO_EMERGENCY,
+    }
+    return mapping.get(call_type, call_type)
 
 
 def _log(msg):
@@ -180,11 +197,12 @@ def request(gate: str, cooldown_key: str = '', context: dict = None,
 
 def _request_inner(gate: str, cooldown_key: str, context: dict,
                    call_type: str = 'AUTO') -> dict:
+    call_type = _normalize_call_type(call_type)
     state = _load_state()
     today = _today()
     month = _this_month()
     now = time.time()
-    bypass = call_type in (CALL_TYPE_USER, CALL_TYPE_EMERGENCY)
+    bypass = call_type in (CALL_TYPE_USER_MANUAL, CALL_TYPE_AUTO_EMERGENCY)
 
     budget_remaining = {}
 
@@ -211,8 +229,8 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                 'gate': gate, 'budget_remaining': budget_remaining,
                 'call_type': call_type}
 
-    # Stage 3.5: Event hash dedup (AUTO only)
-    if call_type == CALL_TYPE_AUTO:
+    # Stage 3.5: Event hash dedup (NORMAL only; AUTO_EMERGENCY uses shorter dedup)
+    if call_type == CALL_TYPE_NORMAL:
         event_hash = context.get('event_hash')
         if event_hash:
             dedup_hashes = state.get('event_hashes', {})
@@ -224,10 +242,10 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                         'gate': gate, 'budget_remaining': budget_remaining,
                         'call_type': call_type}
 
-    # Stage 4: Cooldown check — call_type branching
+    # Stage 4: Cooldown check — 3-class call_type branching
     if cooldown_key:
-        if call_type == CALL_TYPE_AUTO:
-            # Full cooldown
+        if call_type == CALL_TYPE_NORMAL:
+            # Full cooldown for NORMAL
             cooldowns = state.get('cooldowns', {})
             ck = f'{gate}:{cooldown_key}'
             last_call = cooldowns.get(ck, 0)
@@ -238,20 +256,28 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                         'reason': f'cooldown active: {ck} ({remaining}s remaining)',
                         'gate': gate, 'budget_remaining': budget_remaining,
                         'call_type': call_type}
-        elif call_type == CALL_TYPE_USER:
-            _log(f'cooldown SKIPPED (call_type=USER): {gate}:{cooldown_key}')
-        elif call_type == CALL_TYPE_EMERGENCY:
-            # 60-second spam protection only
+        elif call_type == CALL_TYPE_USER_MANUAL:
+            # USER_MANUAL: skip cooldown, 2min request cache dedup only
+            cooldowns = state.get('cooldowns', {})
+            dedup_key = f'user_dedup:{cooldown_key}'
+            last_call = cooldowns.get(dedup_key, 0)
+            if now - last_call < 120:  # 2min dedup
+                remaining = int(120 - (now - last_call))
+                _log(f'USER_MANUAL dedup: {dedup_key} ({remaining}s remaining)')
+            else:
+                _log(f'cooldown SKIPPED (call_type=USER_MANUAL): {gate}:{cooldown_key}')
+        elif call_type == CALL_TYPE_AUTO_EMERGENCY:
+            # AUTO_EMERGENCY: 60-second spam guard only
             cooldowns = state.get('cooldowns', {})
             spam_key = f'emergency_spam:{cooldown_key}'
             last_call = cooldowns.get(spam_key, 0)
-            if now - last_call < EMERGENCY_SPAM_SEC:
-                remaining = int(EMERGENCY_SPAM_SEC - (now - last_call))
+            if now - last_call < AUTO_EMERGENCY_DEDUP_SEC:
+                remaining = int(AUTO_EMERGENCY_DEDUP_SEC - (now - last_call))
                 return {'allowed': False,
                         'reason': f'emergency spam guard: {spam_key} ({remaining}s remaining)',
                         'gate': gate, 'budget_remaining': budget_remaining,
                         'call_type': call_type}
-            _log(f'cooldown REDUCED (call_type=EMERGENCY, {EMERGENCY_SPAM_SEC}s spam only): {gate}:{cooldown_key}')
+            _log(f'cooldown REDUCED (call_type=AUTO_EMERGENCY, {AUTO_EMERGENCY_DEDUP_SEC}s spam only): {gate}:{cooldown_key}')
 
     # Stage 5: Daily budget check
     daily_calls = state.get('daily_calls', {}).get(today, 0)
@@ -259,7 +285,8 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
     budget_remaining['daily_calls'] = DAILY_CALL_LIMIT - daily_calls
     budget_remaining['daily_cost_usd'] = round(DAILY_COST_LIMIT - daily_cost, 4)
 
-    if not bypass:
+    if call_type == CALL_TYPE_NORMAL:
+        # NORMAL: strict daily cap + cost limit
         if daily_calls >= DAILY_CALL_LIMIT:
             _notify_budget_exceeded(state, f'daily call limit ({daily_calls}/{DAILY_CALL_LIMIT})')
             _save_state(state)
@@ -267,7 +294,6 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                     'reason': f'daily call limit ({daily_calls}/{DAILY_CALL_LIMIT})',
                     'gate': gate, 'budget_remaining': budget_remaining,
                     'call_type': call_type}
-
         if daily_cost >= DAILY_COST_LIMIT:
             _notify_budget_exceeded(state, f'daily cost limit (${daily_cost:.2f}/${DAILY_COST_LIMIT})')
             _save_state(state)
@@ -275,27 +301,39 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                     'reason': f'daily cost limit (${daily_cost:.2f}/${DAILY_COST_LIMIT})',
                     'gate': gate, 'budget_remaining': budget_remaining,
                     'call_type': call_type}
-    else:
-        _log(f'budget BYPASSED (call_type={call_type}): daily_calls={daily_calls} daily_cost=${daily_cost:.4f}')
+    elif call_type == CALL_TYPE_AUTO_EMERGENCY:
+        # AUTO_EMERGENCY: bypass daily 50 cap, but has own 30/day cap
+        emerg_daily = state.get('call_type_counts', {}).get(today, {}).get(CALL_TYPE_AUTO_EMERGENCY, 0)
+        if emerg_daily >= AUTO_EMERGENCY_DAILY_CAP:
+            _log(f'AUTO_EMERGENCY daily cap reached ({emerg_daily}/{AUTO_EMERGENCY_DAILY_CAP})')
+            return {'allowed': False,
+                    'reason': f'AUTO_EMERGENCY daily cap ({emerg_daily}/{AUTO_EMERGENCY_DAILY_CAP})',
+                    'gate': gate, 'budget_remaining': budget_remaining,
+                    'call_type': call_type}
+        _log(f'daily budget BYPASSED (call_type=AUTO_EMERGENCY): daily_calls={daily_calls} emerg={emerg_daily}')
+    elif call_type == CALL_TYPE_USER_MANUAL:
+        # USER_MANUAL: no cap
+        _log(f'budget BYPASSED (call_type=USER_MANUAL): daily_calls={daily_calls} daily_cost=${daily_cost:.4f}')
 
     # Stage 6: Monthly budget check
     monthly_cost = state.get('monthly_cost', {}).get(month, 0.0)
     budget_remaining['monthly_cost_usd'] = round(MONTHLY_COST_LIMIT - monthly_cost, 4)
 
-    if not bypass:
-        if monthly_cost >= MONTHLY_COST_LIMIT:
+    # Monthly budget: enforced for ALL types (including AUTO_EMERGENCY)
+    if monthly_cost >= MONTHLY_COST_LIMIT:
+        if call_type == CALL_TYPE_USER_MANUAL:
+            _log(f'monthly budget WARNING (USER_MANUAL bypass): ${monthly_cost:.4f}/${MONTHLY_COST_LIMIT}')
+        else:
             _notify_budget_exceeded(state, f'monthly cost limit (${monthly_cost:.2f}/${MONTHLY_COST_LIMIT})')
             _save_state(state)
             return {'allowed': False,
                     'reason': f'monthly cost limit (${monthly_cost:.2f}/${MONTHLY_COST_LIMIT})',
                     'gate': gate, 'budget_remaining': budget_remaining,
                     'call_type': call_type}
-    else:
-        _log(f'monthly budget BYPASSED (call_type={call_type}): monthly_cost=${monthly_cost:.4f}')
 
     # Stage 7: Scheduled limit check (only for 'scheduled' gate)
     if gate == 'scheduled':
-        if not bypass:
+        if call_type == CALL_TYPE_NORMAL:
             scheduled = state.get('scheduled_today', {}).get(today, 0)
             if scheduled >= MAX_SCHEDULED_PER_DAY:
                 return {'allowed': False,

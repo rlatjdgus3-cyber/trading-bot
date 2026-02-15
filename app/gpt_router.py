@@ -41,7 +41,8 @@ COMMAND_INTENTS = (
 QUESTION_INTENTS = (
     "status", "price", "indicators", "news_analysis", "strategy",
     "emergency", "score", "report", "health", "errors",
-    "volatility", "db_health", "claude_audit", "general")
+    "volatility", "db_health", "claude_audit", "general",
+    "macro_summary", "db_monthly_stats")
 
 # Legacy mapping: new QUESTION intent → (route, local_query_type)
 QUESTION_ROUTE_MAP = {
@@ -58,6 +59,8 @@ QUESTION_ROUTE_MAP = {
     'volatility': ('local', 'volatility_summary'),
     'db_health': ('local', 'db_health'),
     'claude_audit': ('local', 'claude_audit'),
+    'macro_summary': ('local', 'macro_summary'),
+    'db_monthly_stats': ('local', 'db_monthly_stats'),
     'general': ('none', ''),
 }
 
@@ -94,6 +97,8 @@ SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/Engl
 - volatility: 변동성 요약
 - db_health: DB 상태/테이블 점검
 - claude_audit: Claude API 사용량/비용 감사
+- macro_summary: 매크로/거시경제 지표 요약 (나스닥, DXY, VIX 등)
+- db_monthly_stats: DB 월별 데이터량/통계
 - general: 기타 질문
 
 ## Output JSON (ONLY valid JSON, no text)
@@ -441,6 +446,22 @@ def _keyword_fallback(text: str) -> dict:
     if any(x in t for x in ["매매"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "strategy",
                 "confidence": 0.6, "_fallback": True})
+
+    # ── New intents ──
+    if any(x in t for x in ["매크로", "거시", "나스닥", "미국 지표", "qqq", "dxy",
+                             "vix", "us10y", "spy", "macro"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "macro_summary",
+                "confidence": 0.8, "_fallback": True})
+
+    if any(x in t for x in ["월별", "monthly", "데이터량", "db 통계", "데이터 통계",
+                             "저장량", "db월별", "월간 데이터"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "db_monthly_stats",
+                "confidence": 0.8, "_fallback": True})
+
+    if any(x in t for x in ["클로드로 분석", "심층 분석", "claude 분석", "상세 분석",
+                             "자세히 분석"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "strategy",
+                "use_claude": True, "confidence": 0.8, "_fallback": True})
 
     return _add_legacy_fields({"type": "QUESTION", "intent": "general",
             "confidence": 0.3, "_fallback": True})

@@ -975,6 +975,15 @@ def ensure_pm_decision_log_extended(cur):
     _log('ensure_pm_decision_log_extended done')
 
 
+def ensure_safety_limits_hourly_15(cur):
+    '''Update max_hourly_trades from 8 to 15.'''
+    cur.execute("""
+        UPDATE safety_limits SET max_hourly_trades = 15
+        WHERE max_hourly_trades = 8;
+    """)
+    _log('ensure_safety_limits_hourly_15 done')
+
+
 def ensure_news_impact_stats(cur):
     '''Aggregated news impact statistics per event_type/region/regime.'''
     cur.execute("""
@@ -1091,6 +1100,8 @@ def run_all():
             ensure_pm_decision_log_extended(cur)
             # News impact stats table
             ensure_news_impact_stats(cur)
+            # Hourly trade limit 8→15
+            ensure_safety_limits_hourly_15(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

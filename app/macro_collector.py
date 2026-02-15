@@ -117,35 +117,34 @@ def _fetch_prices():
 
 
 def _store_prices(conn, prices):
-    """Store fetched prices into macro_data table."""
+    """Store fetched prices into macro_data table.
+
+    Uses autocommit for per-row independence so one failure doesn't
+    rollback all rows. ON CONFLICT DO UPDATE to refresh same-ts data.
+    """
     if not prices:
         return 0
 
     stored = 0
-    with conn.cursor() as cur:
-        for source_name, data in prices.items():
-            try:
-                cur.execute("""
-                    INSERT INTO macro_data (ts, source, price, metadata)
-                    VALUES (now(), %s, %s, %s::jsonb)
-                    ON CONFLICT (source, ts) DO NOTHING;
-                """, (source_name, data['price'],
-                      json.dumps(data.get('metadata', {}))))
-                stored += 1
-            except Exception as e:
-                _log(f'store {source_name} error: {e}')
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+    prev_autocommit = conn.autocommit
     try:
-        conn.commit()
-    except Exception as e:
-        _log(f'commit error: {e}')
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for source_name, data in prices.items():
+                try:
+                    cur.execute("""
+                        INSERT INTO macro_data (ts, source, price, metadata)
+                        VALUES (now(), %s, %s, %s::jsonb)
+                        ON CONFLICT (source, ts)
+                        DO UPDATE SET price = EXCLUDED.price,
+                                      metadata = EXCLUDED.metadata;
+                    """, (source_name, data['price'],
+                          json.dumps(data.get('metadata', {}))))
+                    stored += 1
+                except Exception as e:
+                    _log(f'store {source_name} error: {e}')
+    finally:
+        conn.autocommit = prev_autocommit
     return stored
 
 
@@ -218,6 +217,167 @@ def run_once(conn=None):
                 conn.close()
             except Exception:
                 pass
+
+
+# ─── Macro Event Calendar ────────────────────────────────────────────
+# FOMC/CPI/PPI/고용지표 일정 (UTC dates)
+# 해당 일정 전후 구간에서 AUTO_EMERGENCY 민감도 상향
+
+MACRO_EVENT_CALENDAR_2025 = [
+    # FOMC decisions (announcement dates)
+    ('2025-01-29', 'FOMC'),
+    ('2025-03-19', 'FOMC'),
+    ('2025-05-07', 'FOMC'),
+    ('2025-06-18', 'FOMC'),
+    ('2025-07-30', 'FOMC'),
+    ('2025-09-17', 'FOMC'),
+    ('2025-10-29', 'FOMC'),
+    ('2025-12-17', 'FOMC'),
+    # CPI releases
+    ('2025-01-15', 'CPI'),
+    ('2025-02-12', 'CPI'),
+    ('2025-03-12', 'CPI'),
+    ('2025-04-10', 'CPI'),
+    ('2025-05-13', 'CPI'),
+    ('2025-06-11', 'CPI'),
+    ('2025-07-15', 'CPI'),
+    ('2025-08-12', 'CPI'),
+    ('2025-09-10', 'CPI'),
+    ('2025-10-14', 'CPI'),
+    ('2025-11-12', 'CPI'),
+    ('2025-12-10', 'CPI'),
+    # PPI releases
+    ('2025-01-14', 'PPI'),
+    ('2025-02-13', 'PPI'),
+    ('2025-03-13', 'PPI'),
+    ('2025-04-11', 'PPI'),
+    ('2025-05-15', 'PPI'),
+    ('2025-06-12', 'PPI'),
+    ('2025-07-15', 'PPI'),
+    ('2025-08-14', 'PPI'),
+    ('2025-09-11', 'PPI'),
+    ('2025-10-15', 'PPI'),
+    ('2025-11-13', 'PPI'),
+    ('2025-12-11', 'PPI'),
+    # Non-Farm Payrolls (NFP)
+    ('2025-01-10', 'NFP'),
+    ('2025-02-07', 'NFP'),
+    ('2025-03-07', 'NFP'),
+    ('2025-04-04', 'NFP'),
+    ('2025-05-02', 'NFP'),
+    ('2025-06-06', 'NFP'),
+    ('2025-07-03', 'NFP'),
+    ('2025-08-01', 'NFP'),
+    ('2025-09-05', 'NFP'),
+    ('2025-10-03', 'NFP'),
+    ('2025-11-07', 'NFP'),
+    ('2025-12-05', 'NFP'),
+]
+
+MACRO_EVENT_CALENDAR_2026 = [
+    # FOMC decisions
+    ('2026-01-28', 'FOMC'),
+    ('2026-03-18', 'FOMC'),
+    ('2026-04-29', 'FOMC'),
+    ('2026-06-17', 'FOMC'),
+    ('2026-07-29', 'FOMC'),
+    ('2026-09-16', 'FOMC'),
+    ('2026-10-28', 'FOMC'),
+    ('2026-12-16', 'FOMC'),
+    # CPI releases (estimated)
+    ('2026-01-13', 'CPI'),
+    ('2026-02-11', 'CPI'),
+    ('2026-03-11', 'CPI'),
+    ('2026-04-14', 'CPI'),
+    ('2026-05-12', 'CPI'),
+    ('2026-06-10', 'CPI'),
+    ('2026-07-14', 'CPI'),
+    ('2026-08-12', 'CPI'),
+    ('2026-09-15', 'CPI'),
+    ('2026-10-13', 'CPI'),
+    ('2026-11-10', 'CPI'),
+    ('2026-12-09', 'CPI'),
+    # PPI releases (estimated)
+    ('2026-01-14', 'PPI'),
+    ('2026-02-12', 'PPI'),
+    ('2026-03-12', 'PPI'),
+    ('2026-04-09', 'PPI'),
+    ('2026-05-14', 'PPI'),
+    ('2026-06-11', 'PPI'),
+    ('2026-07-16', 'PPI'),
+    ('2026-08-13', 'PPI'),
+    ('2026-09-10', 'PPI'),
+    ('2026-10-14', 'PPI'),
+    ('2026-11-12', 'PPI'),
+    ('2026-12-10', 'PPI'),
+    # NFP (estimated — first Friday)
+    ('2026-01-09', 'NFP'),
+    ('2026-02-06', 'NFP'),
+    ('2026-03-06', 'NFP'),
+    ('2026-04-03', 'NFP'),
+    ('2026-05-01', 'NFP'),
+    ('2026-06-05', 'NFP'),
+    ('2026-07-02', 'NFP'),
+    ('2026-08-07', 'NFP'),
+    ('2026-09-04', 'NFP'),
+    ('2026-10-02', 'NFP'),
+    ('2026-11-06', 'NFP'),
+    ('2026-12-04', 'NFP'),
+]
+
+# Pre-parsed set for fast lookup
+_MACRO_EVENT_DATES = {}
+for _date_str, _etype in MACRO_EVENT_CALENDAR_2025 + MACRO_EVENT_CALENDAR_2026:
+    _MACRO_EVENT_DATES.setdefault(_date_str, []).append(_etype)
+
+# Window: event day -1h ~ +4h (UTC) around typical release time (13:30 UTC for most)
+MACRO_EVENT_WINDOW_HOURS_BEFORE = 1
+MACRO_EVENT_WINDOW_HOURS_AFTER = 4
+
+
+def is_macro_event_window() -> dict:
+    """Check if current time is within a macro event window.
+
+    Returns:
+        dict with 'active': bool, 'events': list of event types, 'date': str
+        e.g. {'active': True, 'events': ['CPI'], 'date': '2026-02-11'}
+    """
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime('%Y-%m-%d')
+    yesterday_str = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # Check today and yesterday (for late-night events)
+    for date_str in (today_str, yesterday_str):
+        if date_str in _MACRO_EVENT_DATES:
+            # Typical release time: 13:30 UTC (8:30 ET)
+            event_dt = datetime.strptime(date_str, '%Y-%m-%d').replace(
+                hour=13, minute=30, tzinfo=timezone.utc
+            )
+            window_start = event_dt - timedelta(hours=MACRO_EVENT_WINDOW_HOURS_BEFORE)
+            window_end = event_dt + timedelta(hours=MACRO_EVENT_WINDOW_HOURS_AFTER)
+
+            if window_start <= now <= window_end:
+                return {
+                    'active': True,
+                    'events': _MACRO_EVENT_DATES[date_str],
+                    'date': date_str,
+                }
+
+    return {'active': False, 'events': [], 'date': ''}
+
+
+def get_upcoming_macro_events(days_ahead: int = 7) -> list:
+    """Return macro events within the next N days.
+
+    Returns list of {'date': str, 'events': list[str]}.
+    """
+    now = datetime.now(timezone.utc)
+    result = []
+    for d in range(days_ahead + 1):
+        date_str = (now + timedelta(days=d)).strftime('%Y-%m-%d')
+        if date_str in _MACRO_EVENT_DATES:
+            result.append({'date': date_str, 'events': _MACRO_EVENT_DATES[date_str]})
+    return result
 
 
 def run_daemon():

@@ -965,3 +965,143 @@ def run_10day_audit(cur):
     except Exception as e:
         _log(f'10-day audit error: {e}')
         return {'error': str(e), 'report_text': f'감사 오류: {e}'}
+
+
+# ── YAML error map loader ────────────────────────────────
+
+_yaml_error_map = None
+_YAML_PATH = '/root/trading-bot/app/bybit_error_map.yaml'
+
+
+def _load_error_map_yaml() -> dict:
+    """Load error map from YAML. Fallback to empty dict."""
+    global _yaml_error_map
+    if _yaml_error_map is not None:
+        return _yaml_error_map
+    try:
+        import yaml
+        with open(_YAML_PATH, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        _yaml_error_map = data.get('errors', {})
+        _log(f'YAML error map loaded: {len(_yaml_error_map)} entries')
+    except Exception as e:
+        _log(f'YAML error map load failed (using fallback): {e}')
+        _yaml_error_map = {}
+    return _yaml_error_map
+
+
+def format_rejection_telegram(error_msg: str, order_params: dict = None) -> str:
+    """Format rejection message in Korean using YAML error map.
+
+    Returns formatted telegram text with: 시도 / 사유 / 카테고리 / 조치.
+    """
+    import re
+    error_map = _load_error_map_yaml()
+    matched = None
+    for _name, entry in error_map.items():
+        pattern = entry.get('pattern', '')
+        if pattern and re.search(pattern, error_msg, re.IGNORECASE):
+            matched = entry
+            break
+
+    if matched:
+        lines = [
+            f'❌ 주문 거부',
+            f'- 사유: {matched["korean_message"]}',
+            f'- 심각도: {matched["severity"]}',
+            f'- 조치: {matched["suggested_fix"]}',
+        ]
+    else:
+        lines = [
+            f'❌ 주문 거부',
+            f'- 사유: {error_msg[:200]}',
+            f'- 조치: 수동 확인 필요',
+        ]
+
+    if order_params:
+        action = order_params.get('action_type', '?')
+        qty = order_params.get('target_qty', '?')
+        lines.append(f'- 시도: {action} {qty} BTC')
+
+    return '\n'.join(lines)
+
+
+# ── 10-day rule freshness check ──────────────────────────
+
+_last_rule_check_ts = 0
+RULE_CHECK_INTERVAL_SEC = 10 * 24 * 3600  # 10 days
+
+
+def check_exchange_rules_freshness(exchange=None) -> dict:
+    """Check if market info cache is older than 10 days.
+
+    If stale, force refresh and report changes via telegram.
+    Called periodically from position_manager main loop.
+    """
+    global _last_rule_check_ts
+    now = time.time()
+
+    if now - _last_rule_check_ts < RULE_CHECK_INTERVAL_SEC:
+        return {'checked': False, 'reason': 'not due yet'}
+
+    _last_rule_check_ts = now
+    _log('10-day rule freshness check triggered')
+
+    old_hash = _markets_hash
+    try:
+        if exchange:
+            force_refresh_market_info(exchange, reason='10-day rule check')
+        new_hash = _markets_hash
+        changed = old_hash and new_hash != old_hash
+        if changed:
+            _log(f'market rules CHANGED: old={old_hash[:12]} new={new_hash[:12]}')
+            # Send telegram notification about rule change
+            try:
+                _send_rule_change_notification()
+            except Exception as e:
+                _log(f'rule change notification error: {e}')
+        return {
+            'checked': True,
+            'changed': changed,
+            'old_hash': old_hash,
+            'new_hash': new_hash,
+        }
+    except Exception as e:
+        _log(f'rule freshness check error: {e}')
+        return {'checked': True, 'error': str(e)}
+
+
+def _send_rule_change_notification():
+    """Send telegram notification about exchange rule changes."""
+    import urllib.parse
+    import urllib.request
+    env = {}
+    try:
+        with open('/root/trading-bot/app/telegram_cmd.env', 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                env[k.strip()] = v.strip()
+    except Exception:
+        return
+    token = env.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = env.get('TELEGRAM_ALLOWED_CHAT_ID', '')
+    if not token or not chat_id:
+        return
+    text = ('⚠️ 거래소 규정 변경 감지\n'
+            '- Bybit BTC/USDT:USDT 마켓 규정이 업데이트됨\n'
+            '- 최소 주문량/호가 단위/레버리지 변경 가능\n'
+            '- 자동 갱신 완료')
+    try:
+        from report_formatter import korean_output_guard
+        text = korean_output_guard(text)
+    except Exception:
+        pass
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    data = urllib.parse.urlencode({
+        'chat_id': chat_id, 'text': text,
+    }).encode('utf-8')
+    req = urllib.request.Request(url, data=data, method='POST')
+    urllib.request.urlopen(req, timeout=10)

@@ -75,6 +75,10 @@ SUPPRESS_REASON_KR = {
     'local_dedupe': '로컬 중복 필터',
     'local_hold_repeat': 'HOLD 반복 필터',
     'local_consecutive_hold': '연속 HOLD 스킵',
+    'event_dedup': '이벤트 중복 필터',
+    'cooldown_active': '쿨다운 대기 중',
+    'daily_cap_exceeded': '일일 한도 초과',
+    'budget_exceeded': '예산 초과',
 }
 
 MODEL_LABEL_KR = {
@@ -99,6 +103,15 @@ REASON_KR = {
     'MOMENTUM_DIVERGENCE': '모멘텀 괴리',
     'LIQUIDITY_CONCERN': '유동성 우려',
     'NEWS_DRIVEN_CAUTION': '뉴스 기반 경계',
+    'MARKET_UNCERTAINTY': '시장 불확실성',
+    'AWAITING_CONFIRMATION': '확인 대기 중',
+    'OVEREXTENDED': '과열 상태',
+    'MEAN_REVERSION_LIKELY': '평균 회귀 예상',
+    'DIVERGENCE_DETECTED': '다이버전스 감지',
+    'SUPPORT_HOLDING': '지지선 유지 중',
+    'RESISTANCE_REJECTED': '저항선 반등 실패',
+    'BREAKOUT_CONFIRMED': '돌파 확인',
+    'BREAKDOWN_CONFIRMED': '이탈 확인',
 }
 
 SAFETY_REASON_KR = {
@@ -234,6 +247,28 @@ _PHRASE_EN_TO_KR = {
     'risk level': '위험도',
     'No position': '포지션 없음',
     'no position': '포지션 없음',
+    'hourly trade limit': '시간당 주문 제한',
+    'daily trade limit': '일일 주문 제한',
+    'EVENT suppressed': '이벤트 억제',
+    'consecutive hold': '연속 HOLD',
+    'Short Underwater': '숏 포지션 수중(미실현 손실)',
+    'Long Underwater': '롱 포지션 수중(미실현 손실)',
+    'circuit breaker': '서킷 브레이커',
+    'error block': '오류 차단',
+    'daily call limit': '일일 호출 한도',
+    'monthly cost limit': '월간 비용 한도',
+    'daily cost limit': '일일 비용 한도',
+    'all checks passed': '모든 검사 통과',
+    'budget would exceed': '예산 초과',
+    'total exposure': '총 노출',
+    'Funding Rate': '펀딩비',
+    'funding rate': '펀딩비',
+    'Open Interest': '미결제약정',
+    'open interest': '미결제약정',
+    'Market Order': '시장가 주문',
+    'market order': '시장가 주문',
+    'Limit Order': '지정가 주문',
+    'limit order': '지정가 주문',
 }
 
 # Single-word replacements — applied with word boundary (\b) regex
@@ -276,6 +311,82 @@ _WORD_EN_TO_KR = {
     'pending': '대기 중',
     'Completed': '완료',
     'completed': '완료',
+    'Budget': '예산',
+    'budget': '예산',
+    'Cooldown': '쿨다운',
+    'cooldown': '쿨다운',
+    'Mode': '모드',
+    'mode': '모드',
+    'Emergency': '긴급',
+    'emergency': '긴급',
+    'Suppressed': '억제됨',
+    'suppressed': '억제됨',
+    'Gate': '게이트',
+    'gate': '게이트',
+    'Denied': '거부',
+    'denied': '거부',
+    'Bypass': '우회',
+    'bypass': '우회',
+    'Threshold': '임계값',
+    'threshold': '임계값',
+    'Remaining': '잔여',
+    'remaining': '잔여',
+    'Expired': '만료',
+    'expired': '만료',
+    'Queue': '대기열',
+    'queue': '대기열',
+    'Approved': '승인',
+    'approved': '승인',
+    'Rejected': '거부됨',
+    'rejected': '거부됨',
+    'Blocked': '차단',
+    'blocked': '차단',
+    'Allowed': '허용',
+    'allowed': '허용',
+    'Limit': '제한',
+    'limit': '제한',
+    'Exceeded': '초과',
+    'exceeded': '초과',
+    'Canceled': '취소됨',
+    'canceled': '취소됨',
+    'Timeout': '시간초과',
+    'timeout': '시간초과',
+    'Verified': '검증됨',
+    'verified': '검증됨',
+    'Unverified': '미검증',
+    'unverified': '미검증',
+    'Insufficient': '부족',
+    'insufficient': '부족',
+    'Balance': '잔고',
+    'balance': '잔고',
+    'Margin': '마진',
+    'margin': '마진',
+    'Leverage': '레버리지',
+    'leverage': '레버리지',
+    'Volatility': '변동성',
+    'volatility': '변동성',
+    'Momentum': '모멘텀',
+    'momentum': '모멘텀',
+    'Trend': '추세',
+    'trend': '추세',
+    'Reversal': '반전',
+    'reversal': '반전',
+    'Breakout': '돌파',
+    'breakout': '돌파',
+    'Resistance': '저항',
+    'resistance': '저항',
+    'Support': '지지',
+    'support': '지지',
+    'Bullish': '강세',
+    'bullish': '강세',
+    'Bearish': '약세',
+    'bearish': '약세',
+    'Profit': '수익',
+    'profit': '수익',
+    'Loss': '손실',
+    'loss': '손실',
+    'Volume': '거래량',
+    'volume': '거래량',
 }
 
 # Pre-compile regex for single-word replacements (longest first to avoid partial match)
@@ -302,6 +413,116 @@ def sanitize_telegram_text(text: str) -> str:
                   f'text_preview={result[:80]!r}', flush=True)
         except Exception:
             pass
+    return result
+
+
+# ── 내부키→한국어 매핑 (format 함수에서 노출되는 raw key) ─────
+_INTERNAL_KEY_KR = {
+    'caller': '호출자',
+    'local_hold_repeat': 'HOLD 반복 필터',
+    'local_dedupe': '로컬 중복 필터',
+    'local_consecutive_hold': '연속 HOLD 스킵',
+    'db_event_lock': 'DB 이벤트 락',
+    'db_hash_lock': 'DB 해시 락',
+    'db_hold_suppress': 'DB HOLD 억제',
+    'event_dedup': '이벤트 중복',
+    'cooldown_active': '쿨다운 대기',
+    'gate_reason': '게이트 사유',
+    'trigger_type': '트리거 유형',
+    'ret_5m': '5분 수익률',
+    'ret_1m': '1분 수익률',
+    'ret_15m': '15분 수익률',
+    'vol_ratio': '거래량 비율',
+    'atr_14': 'ATR(14)',
+    'rsi_14': 'RSI(14)',
+    'bb_bandwidth': 'BB 밴드폭',
+    'sl_dist_pct': '손절 거리(%)',
+    'liq_dist': '청산 거리',
+    'position_manager': '포지션 매니저',
+    'event_trigger': '이벤트 트리거',
+    'score_engine': '스코어 엔진',
+}
+
+# ── 추가 영어→한국어 매핑 (aggressive replace) ─────────────
+_AGGRESSIVE_EN_TO_KR = {
+    'Could not parse directive': '명령을 인식하지 못했습니다',
+    'Unknown command': '알 수 없는 명령',
+    'Not found': '찾을 수 없음',
+    'Permission denied': '권한 없음',
+    'Connection refused': '연결 거부',
+    'Request timeout': '요청 시간초과',
+    'Service unavailable': '서비스 이용 불가',
+    'Internal error': '내부 오류',
+    'Rate limited': '요청 제한됨',
+    'Insufficient margin': '마진 부족',
+    'Order rejected': '주문 거부',
+    'already exists': '이미 존재',
+    'not enough': '부족',
+    'too many': '너무 많음',
+    'spam guard': '스팸 방지',
+    'error block active': '오류 차단 활성',
+}
+
+
+def _aggressive_korean_replace(text: str) -> str:
+    """추가 매핑으로 영어 비율을 더 낮춤."""
+    result = text
+    for en, kr in _AGGRESSIVE_EN_TO_KR.items():
+        result = result.replace(en, kr)
+    # 내부키 노출 방지: key=value 패턴에서 key를 한국어로 변환
+    for en_key, kr_key in _INTERNAL_KEY_KR.items():
+        result = result.replace(f'{en_key}=', f'{kr_key}=')
+        result = result.replace(f'{en_key}:', f'{kr_key}:')
+    return result
+
+
+def _force_translate_remaining(text: str) -> str:
+    """최후 수단: GPT-mini로 남은 영어 부분만 번역. 실패 시 원문 유지."""
+    try:
+        import openai
+        client = openai.OpenAI()
+        # 영어 문장만 추출
+        lines = text.split('\n')
+        en_lines = []
+        en_indices = []
+        for i, line in enumerate(lines):
+            ratio = detect_english_ratio(line)
+            if ratio > 0.1 and len(_re.findall(r'[A-Za-z]{3,}', line)) >= 2:
+                en_lines.append(line)
+                en_indices.append(i)
+        if not en_lines:
+            return text
+        prompt = ('다음 텍스트를 한국어로 번역하세요. '
+                  'BTC/ETH/USDT/LONG/SHORT/HOLD 등 약어와 숫자는 유지하세요.\n\n'
+                  + '\n'.join(en_lines))
+        resp = client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=500,
+            temperature=0.1,
+        )
+        translated = resp.choices[0].message.content.strip().split('\n')
+        result_lines = list(lines)
+        for idx, tr_line in zip(en_indices, translated):
+            if tr_line.strip():
+                result_lines[idx] = tr_line
+        return '\n'.join(result_lines)
+    except Exception as e:
+        print(f'[report_formatter] force_translate error: {e}', flush=True)
+        return text
+
+
+def korean_output_guard(text: str) -> str:
+    """최종 관문: sanitize 후 영어 비율 검사, 초과 시 강제 재번역."""
+    if not text:
+        return text
+    result = sanitize_telegram_text(text)
+    ratio = detect_english_ratio(result)
+    if ratio > 0.05:
+        result = _aggressive_korean_replace(result)
+        ratio = detect_english_ratio(result)
+    if ratio > 0.05:
+        result = _force_translate_remaining(result)
     return result
 
 
@@ -729,7 +950,8 @@ def format_emergency_pre_alert(trigger_type, trigger_detail):
     if isinstance(trigger_detail, dict):
         parts = []
         for k, v in list(trigger_detail.items())[:4]:
-            parts.append(f'{k}={v}')
+            kr_key = _INTERNAL_KEY_KR.get(k, k)
+            parts.append(f'{kr_key}={v}')
         detail_str = ', '.join(parts)
     else:
         detail_str = str(trigger_detail)[:200]

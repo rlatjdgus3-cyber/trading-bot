@@ -59,7 +59,9 @@ def execute(query_type=None, original_text=None):
         'position_info': _position_info,
         'score_summary': _score_summary,
         'db_health': _db_health,
-        'claude_audit': _claude_audit}
+        'claude_audit': _claude_audit,
+        'macro_summary': _macro_summary,
+        'db_monthly_stats': _db_monthly_stats}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -532,3 +534,77 @@ def _parse_minutes_and_limit(text=None):
     minutes = max(5, min(minutes, 10080))
     limit = max(1, min(limit, 50))
     return (minutes, limit)
+
+
+def _macro_summary(_text=None):
+    """매크로/거시경제 지표 최신 값 조회."""
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (source) source, price, ts
+                FROM macro_data
+                ORDER BY source, ts DESC;
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return '📊 매크로 데이터 없음'
+        lines = ['📊 거시경제 지표 현황']
+        source_kr = {
+            'QQQ': 'QQQ(나스닥 추종)',
+            'SPY': 'SPY(S&P500)',
+            'DXY': 'DXY(달러 인덱스)',
+            'US10Y': 'US10Y(미국 10년물)',
+            'VIX': 'VIX(공포 지수)',
+        }
+        for row in rows:
+            src = row[0]
+            price = float(row[1]) if row[1] else 0
+            ts = str(row[2])[:16] if row[2] else '?'
+            label = source_kr.get(src, src)
+            lines.append(f'- {label}: {price:,.2f} ({ts})')
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ 매크로 조회 오류: {e}'
+
+
+def _db_monthly_stats(_text=None):
+    """월별 데이터 저장량 리포트."""
+    try:
+        conn = _db()
+        tables = [
+            ('candles', 'ts'),
+            ('news', 'ts'),
+            ('indicators', 'ts'),
+            ('events', 'start_ts'),
+            ('pm_decision_log', 'ts'),
+            ('macro_data', 'ts'),
+            ('score_history', 'ts'),
+        ]
+        lines = ['📊 월별 DB 데이터량']
+        with conn.cursor() as cur:
+            for table, ts_col in tables:
+                try:
+                    cur.execute(f"""
+                        SELECT date_trunc('month', {ts_col}) AS month,
+                               count(*) AS cnt
+                        FROM {table}
+                        GROUP BY month
+                        ORDER BY month DESC
+                        LIMIT 6;
+                    """)
+                    rows = cur.fetchall()
+                    lines.append(f'\n[{table}]')
+                    if not rows:
+                        lines.append('  데이터 없음')
+                    else:
+                        for row in rows:
+                            month_str = str(row[0])[:7] if row[0] else '?'
+                            lines.append(f'  {month_str}: {row[1]:,}건')
+                except Exception:
+                    lines.append(f'\n[{table}] 조회 실패')
+        conn.close()
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ 월별 통계 오류: {e}'

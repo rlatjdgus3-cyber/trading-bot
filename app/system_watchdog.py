@@ -121,6 +121,11 @@ def _record_restart(state: dict, unit: str):
 def _send_telegram(text: str):
     """Send alert via Telegram. No LLM."""
     try:
+        from report_formatter import korean_output_guard
+        text = korean_output_guard(text)
+    except Exception:
+        pass
+    try:
         env = {}
         with open('/root/trading-bot/app/telegram_cmd.env', 'r') as f:
             for line in f:

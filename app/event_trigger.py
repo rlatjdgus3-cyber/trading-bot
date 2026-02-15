@@ -49,7 +49,7 @@ REGIME_SCORE_CHANGE_MIN = 15
 ATR_INCREASE_PCT = 30
 
 # ── emergency escalation ──────────────────────────────────
-EMERGENCY_5M_RET_PCT = 2.0
+EMERGENCY_5M_RET_PCT = 1.0  # 요구: 5분 ≥ 1.0% → AUTO_EMERGENCY
 EMERGENCY_15M_RET_PCT = 3.5
 EMERGENCY_LOSS_PCT = 2.0
 EMERGENCY_LIQ_DIST_PCT = 3.0
@@ -84,6 +84,13 @@ ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD = 40  # 조건C: |news_event_score| >= 40
 # ── Telegram throttle ────────────────────────────────────
 TELEGRAM_EVENT_THROTTLE_SEC = 600  # same event type: max once per 10 min
 
+# ── Event bundling (30s window) ──────────────────────────
+BUNDLE_WINDOW_SEC = 30
+_event_bundle = {
+    'triggers': [],
+    'first_ts': 0,
+}
+
 # ── emergency lock state ──────────────────────────────────
 _emergency_lock = {}           # {symbol: expire_timestamp}
 _last_emergency_action = {}    # {symbol: {'action': str, 'direction': str, 'ts': float}}
@@ -105,9 +112,14 @@ _event_hash_history = {}       # {event_hash: timestamp}
 # ── Telegram event throttle ──────────────────────────────
 _telegram_event_ts = {}        # {trigger_type_key: timestamp}
 
-# ── HOLD repeat suppression (§3) ────────────────────────
-HOLD_REPEAT_LIMIT = 3             # N consecutive HOLDs → lock
-HOLD_LOCK_SEC = 900               # 15-min lock after N consecutive HOLDs
+# ── HOLD repeat suppression (§3) — progressive locking ───
+HOLD_REPEAT_LIMIT = 2             # first lock at 2 consecutive HOLDs
+# Progressive lock durations (seconds)
+HOLD_LOCK_PROGRESSIVE = {
+    2: 600,    # 2회: 10분
+    3: 1200,   # 3회: 20분
+    4: 1800,   # 4회+: 30분
+}
 
 _last_hold_state = {
     'action': None,            # last Claude action ('HOLD', 'CLOSE', etc.)
@@ -170,12 +182,16 @@ def record_claude_result(action, trigger_types, position):
     if action == 'HOLD':
         # 컨텍스트 무관하게 모든 HOLD를 카운트 (트리거 변경 시에도 누적)
         _last_hold_state['consecutive_holds'] += 1
+        count = _last_hold_state['consecutive_holds']
 
-        # After N consecutive HOLDs, apply 15-min lock
-        if _last_hold_state['consecutive_holds'] >= HOLD_REPEAT_LIMIT:
-            _last_hold_state['lock_until'] = time.time() + HOLD_LOCK_SEC
-            _log(f'HOLD loop lock ACTIVATED: {_last_hold_state["consecutive_holds"]} '
-                 f'consecutive HOLDs → {HOLD_LOCK_SEC}s lock')
+        # Progressive locking: 2→10m, 3→20m, 4+→30m
+        if count >= HOLD_REPEAT_LIMIT:
+            lock_sec = HOLD_LOCK_PROGRESSIVE.get(
+                min(count, max(HOLD_LOCK_PROGRESSIVE.keys())),
+                HOLD_LOCK_PROGRESSIVE[max(HOLD_LOCK_PROGRESSIVE.keys())])
+            _last_hold_state['lock_until'] = time.time() + lock_sec
+            _log(f'HOLD loop lock ACTIVATED: {count} '
+                 f'consecutive HOLDs → {lock_sec}s lock (progressive)')
     else:
         # 비-HOLD 액션(REDUCE/CLOSE 등)이면 카운터 리셋
         _last_hold_state['consecutive_holds'] = 0
@@ -423,6 +439,43 @@ def record_event_hash(event_hash):
 
 # ── Telegram event throttle ──────────────────────────────
 
+def bundle_triggers(new_triggers) -> list:
+    """Bundle triggers within 30s window into a single event.
+
+    Returns combined triggers if window expired, else empty list (still accumulating).
+    """
+    now = time.time()
+    if not new_triggers:
+        # Check if bundle has accumulated triggers past window
+        if _event_bundle['triggers'] and now - _event_bundle['first_ts'] >= BUNDLE_WINDOW_SEC:
+            result = list(_event_bundle['triggers'])
+            _event_bundle['triggers'] = []
+            _event_bundle['first_ts'] = 0
+            return result
+        return []
+
+    if not _event_bundle['triggers']:
+        _event_bundle['first_ts'] = now
+
+    # Merge new triggers (avoid dups by type)
+    existing_types = {t.get('type') for t in _event_bundle['triggers']}
+    for t in new_triggers:
+        if t.get('type') not in existing_types:
+            _event_bundle['triggers'].append(t)
+            existing_types.add(t.get('type'))
+
+    # If window expired, flush
+    if now - _event_bundle['first_ts'] >= BUNDLE_WINDOW_SEC:
+        result = list(_event_bundle['triggers'])
+        _event_bundle['triggers'] = []
+        _event_bundle['first_ts'] = 0
+        if len(result) > 1:
+            _log(f'event bundle flushed: {len(result)} triggers bundled')
+        return result
+
+    return []  # still accumulating
+
+
 def should_send_telegram_event(trigger_types) -> bool:
     """Check if Telegram event notification should be sent.
     Same event type(s) limited to once per 10 min.
@@ -524,7 +577,7 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
             triggers=emergency_triggers,
             event_hash=eh,
             priority=PRIORITY_EMERGENCY,
-            call_type='EMERGENCY',
+            call_type='AUTO_EMERGENCY',
             should_call_claude=True,
             position_critical=has_pos_critical,
         )
@@ -719,6 +772,32 @@ def _check_regime_change(snapshot, prev_scores=None) -> list:
     return triggers
 
 
+def _check_3bar_directional(snapshot) -> list:
+    """Check if last 3 15m bars are in same direction with cumulative >= 1.2%.
+    If True, returns an emergency trigger for AUTO_EMERGENCY."""
+    bar_15m = snapshot.get('bar_15m_returns', []) if snapshot else []
+    if len(bar_15m) < 3:
+        return []
+    last3 = bar_15m[:3]
+    all_positive = all(b > 0 for b in last3)
+    all_negative = all(b < 0 for b in last3)
+    if not (all_positive or all_negative):
+        return []
+    cumulative = abs(sum(last3))
+    if cumulative < 1.2:
+        return []
+    direction = 'up' if all_positive else 'down'
+    _log(f'3-bar directional trigger: {direction} cumulative={cumulative:.2f}% bars={last3}')
+    return [{
+        'type': 'emergency_3bar_directional',
+        'value': round(cumulative, 2),
+        'threshold': 1.2,
+        'direction': direction,
+        'bars': last3,
+        'position_critical': False,
+    }]
+
+
 def _check_emergency_escalation(snapshot, position=None, prev_scores=None) -> list:
     """Check for emergency-level conditions.
 
@@ -813,6 +892,11 @@ def _check_emergency_escalation(snapshot, position=None, prev_scores=None) -> li
                     'position_critical': True,
                 })
 
+    # ── 3-bar directional trigger (independent) ──
+    bar3_triggers = _check_3bar_directional(snapshot)
+    if bar3_triggers:
+        market_critical_signals.extend(bar3_triggers)
+
     # ── Volatility zscore trigger (independent) ──
     vol_zscore_triggered = False
     if prev_scores:
@@ -847,8 +931,19 @@ def _check_emergency_escalation(snapshot, position=None, prev_scores=None) -> li
         return market_critical_signals
 
     # Market-critical signals require vol_ratio >= 2.5x gate
-    if vol_ratio < EMERGENCY_VOL_SPIKE_RATIO:
-        _log(f'emergency signals found but vol_ratio={vol_ratio:.2f} < {EMERGENCY_VOL_SPIKE_RATIO} — suppressed '
+    # During macro event windows (FOMC/CPI/PPI/NFP), lower the gate to 1.5x
+    effective_vol_gate = EMERGENCY_VOL_SPIKE_RATIO
+    try:
+        from macro_collector import is_macro_event_window
+        macro_window = is_macro_event_window()
+        if macro_window.get('active'):
+            effective_vol_gate = 1.5
+            _log(f'macro event window active ({macro_window["events"]}) — vol gate lowered to {effective_vol_gate}')
+    except Exception:
+        pass
+
+    if vol_ratio < effective_vol_gate:
+        _log(f'emergency signals found but vol_ratio={vol_ratio:.2f} < {effective_vol_gate} — suppressed '
              f'(signals={[s["type"] for s in market_critical_signals]})')
         return []
 

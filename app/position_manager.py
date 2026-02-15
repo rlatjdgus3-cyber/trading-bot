@@ -132,7 +132,7 @@ def _send_telegram(text=None):
     if not token or not chat_id:
         return None
     try:
-        text = report_formatter.sanitize_telegram_text(text)
+        text = report_formatter.korean_output_guard(text)
         url = f'https://api.telegram.org/bot{token}/sendMessage'
         data = urllib.parse.urlencode({
             'chat_id': chat_id,
@@ -143,6 +143,25 @@ def _send_telegram(text=None):
     except Exception:
         pass
     return None
+
+
+# ── Telegram throttle (non-urgent messages: 2min per msg_type) ──
+_tg_throttle_ts = {}  # {msg_type: last_send_timestamp}
+_TG_THROTTLE_SEC = 120  # 2 min
+_URGENT_MSG_TYPES = {'emergency', 'trade_execution', 'error', 'fill', 'close'}
+
+
+def _send_telegram_throttled(text, msg_type='info'):
+    """Throttled telegram wrapper. Non-urgent: max 1 per msg_type per 2 min."""
+    import time as _time
+    if msg_type in _URGENT_MSG_TYPES:
+        return _send_telegram(text)
+    now = _time.time()
+    last = _tg_throttle_ts.get(msg_type, 0)
+    if now - last < _TG_THROTTLE_SEC:
+        return None  # throttled
+    _tg_throttle_ts[msg_type] = now
+    return _send_telegram(text)
 
 
 def _fetch_position(ex=None):
@@ -670,9 +689,9 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
 
     trigger_types = [t.get('type', '?') for t in event_result.triggers]
     if _et.should_send_telegram_event(trigger_types):
-        _send_telegram(report_formatter.format_event_pre_alert(
+        _send_telegram_throttled(report_formatter.format_event_pre_alert(
             trigger_types, event_result.mode, model='claude',
-            snapshot=snapshot))
+            snapshot=snapshot), msg_type='event_pre_alert')
 
     try:
         result = claude_api.event_trigger_analysis(ctx, snapshot, event_result)
@@ -843,9 +862,9 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
 
     # Telegram throttle: only send pre-alert if not throttled
     if _et.should_send_telegram_event(trigger_types):
-        _send_telegram(report_formatter.format_event_pre_alert(
+        _send_telegram_throttled(report_formatter.format_event_pre_alert(
             trigger_types, event_result.mode, model='gpt-mini',
-            snapshot=snapshot))
+            snapshot=snapshot), msg_type='event_pre_alert')
 
     try:
         result = claude_api.event_trigger_analysis_mini(ctx, snapshot, event_result)
@@ -1783,7 +1802,7 @@ def _cycle():
                 # Log Claude call
                 event_lock.log_claude_call(
                     caller=CALLER, gate_type='emergency',
-                    call_type='EMERGENCY', trigger_types=em_types,
+                    call_type='AUTO_EMERGENCY', trigger_types=em_types,
                     action_result=em_action, allowed=True, conn=conn)
 
                 if em_action and em_action != 'HOLD':

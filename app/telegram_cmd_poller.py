@@ -1906,6 +1906,8 @@ NL_LOCAL_MAP = {
     'volatility': 'volatility_summary',
     'db_health': 'db_health',
     'claude_audit': 'claude_audit',
+    'macro_summary': 'macro_summary',
+    'db_monthly_stats': 'db_monthly_stats',
 }
 
 
@@ -1931,8 +1933,8 @@ def _execute_trade_command(parsed, text):
 
     # 1. use_claude → delegate to Claude strategy pipeline
     if use_claude:
-        result, provider = _ai_strategy_advisory(text, call_type='USER')
-        return result + _footer('strategy', 'claude', provider, call_type='USER')
+        result, provider = _ai_strategy_advisory(text, call_type='USER_MANUAL')
+        return result + _footer('strategy', 'claude', provider, call_type='USER_MANUAL')
 
     # 2. Safety check: auto-trading active?
     conn = _get_db_conn()
@@ -2105,8 +2107,8 @@ def _handle_nl_question(parsed, text):
 
     # 3. Emergency
     if intent == 'emergency':
-        result, provider = _ai_emergency_advisory(text, call_type='USER')
-        return result + _footer('emergency', 'claude', provider, call_type='USER')
+        result, provider = _ai_emergency_advisory(text, call_type='USER_MANUAL')
+        return result + _footer('emergency', 'claude', provider, call_type='USER_MANUAL')
 
     # 4. Local queries
     if intent in NL_LOCAL_MAP:
@@ -2165,7 +2167,7 @@ def handle_command(text: str) -> str:
         ai_result, ai_provider = _ai_advisory(force_intent, force_text,
                                                no_fallback=True, force=True)
         return ai_result + _footer('force_strategy', 'claude', ai_provider,
-                                   call_type='USER', bypass=True)
+                                   call_type='USER_MANUAL', bypass=True)
 
     # /detail — expanded news report
     if t == '/detail' or t.startswith('/detail '):

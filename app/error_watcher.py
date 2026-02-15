@@ -58,6 +58,11 @@ def tg_api_call(token=None, method=None, params=None):
 
 
 def send_message(token=None, chat_id=None, text=None):
+    try:
+        from report_formatter import korean_output_guard
+        text = korean_output_guard(text or '')
+    except Exception:
+        pass
     chunks = []
     s = text
     while len(s) > 3800:

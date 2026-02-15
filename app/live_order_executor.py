@@ -89,12 +89,14 @@ def _load_tg_config():
 
 
 def _send_telegram(text):
+    from report_formatter import korean_output_guard
     cfg = _load_tg_config()
     token = cfg.get('TELEGRAM_BOT_TOKEN', '')
     chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
     if not token or not chat_id:
         return
     try:
+        text = korean_output_guard(text or '')
         url = f'https://api.telegram.org/bot{token}/sendMessage'
         data = urllib.parse.urlencode({
             'chat_id': chat_id,

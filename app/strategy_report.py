@@ -42,11 +42,12 @@ def _load_tg_env():
 
 
 def _send_telegram(text=None):
+    from report_formatter import korean_output_guard
     (token, chat_id) = _load_tg_env()
     if not token or not chat_id:
         print('[strategy_report] SKIP: telegram env missing', flush=True)
         return None
-    s = text or ''
+    s = korean_output_guard(text or '')
     chunks = []
     while len(s) > 3800:
         chunks.append(s[:3800])
@@ -77,7 +78,7 @@ def gather_data():
         with conn.cursor() as cur:
             # Top news
             cur.execute("""
-                SELECT title, impact_score
+                SELECT COALESCE(title_ko, title) AS title, impact_score
                 FROM news
                 WHERE ts > now() - interval '12 hours'
                   AND impact_score >= 6
@@ -122,6 +123,52 @@ def gather_data():
             pr = cur.fetchone()
             if pr and pr[0]:
                 data['1h_range'] = {'low': str(pr[0]), 'high': str(pr[1]), 'last': str(pr[2])}
+
+            # Macro data (QQQ, SPY, DXY, US10Y, VIX)
+            try:
+                cur.execute("""
+                    SELECT DISTINCT ON (source) source, price
+                    FROM macro_data
+                    ORDER BY source, ts DESC;
+                """)
+                macro_rows = cur.fetchall()
+                data['macro'] = {r[0]: float(r[1]) for r in macro_rows if r[1]}
+            except Exception:
+                pass
+
+            # Score history (latest)
+            try:
+                cur.execute("""
+                    SELECT total_score, dominant_side, computed_stage
+                    FROM score_history
+                    ORDER BY ts DESC LIMIT 1;
+                """)
+                sc = cur.fetchone()
+                if sc:
+                    data['score'] = {
+                        'total': float(sc[0]) if sc[0] else 0,
+                        'side': sc[1] or 'LONG',
+                        'stage': int(sc[2]) if sc[2] else 1,
+                    }
+            except Exception:
+                pass
+
+            # 24h trade summary
+            try:
+                cur.execute("""
+                    SELECT count(*), COALESCE(sum(realized_pnl), 0)
+                    FROM execution_log
+                    WHERE ts > now() - interval '24 hours'
+                      AND realized_pnl IS NOT NULL;
+                """)
+                tr = cur.fetchone()
+                if tr:
+                    data['trades_24h'] = {
+                        'count': int(tr[0]),
+                        'pnl': float(tr[1]),
+                    }
+            except Exception:
+                pass
     except Exception as e:
         data['error'] = str(e)
     finally:
@@ -136,7 +183,7 @@ def generate_report(data=None):
     data_str = json.dumps(data, ensure_ascii=False, default=str)
     if len(data_str) > 2000:
         data_str = data_str[:2000] + '...'
-    prompt = f'다음 트레이딩봇 데이터를 기반으로 한국어 전략 리포트를 작성하세요.\n\n데이터:\n{data_str}\n\n리포트 형식:\n1. 주요 뉴스 영향 요약 (2~3줄)\n2. 현재 추세/국면 분석 (볼린저밴드 위치, 이치모쿠 크로스 상태)\n3. 변동성 평가\n4. 핵심 지지/저항 레벨\n5. 전략 시나리오 2~3개\n6. 급변 시 대응 포인트\n\n총 800자 이내. 불릿 포인트 사용.\n※ 매매 실행 권한 없음. 분석/권고만.'
+    prompt = f'다음 트레이딩봇 데이터를 기반으로 한국어 전략 리포트를 작성하세요.\n\n데이터:\n{data_str}\n\n리포트 형식:\n1. 주요 뉴스 영향 요약 (미국/거시/나스닥 우선)\n2. 거시경제 환경 (QQQ, DXY, VIX, US10Y 포함)\n3. 현재 추세/국면 분석\n4. 뉴스→BTC 영향 경로 + 시나리오/확률\n5. 현재 포지션/리스크/예산(70%) 현황\n6. 대응전략 (포지션/손절/익절/추가진입 조건)\n\n총 1000자 이내. 불릿 포인트 사용. 100% 한국어로 작성.\n※ 매매 실행 권한 없음. 분석/권고만.'
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY, timeout=20)
@@ -248,7 +295,9 @@ def main():
     report = generate_report(data)
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.now(kst)
-    header = f"📊 전략 리포트 ({now_kst.strftime('%m/%d %H:%M')} KST)\n{'━━━━━━━━━━━━━━━━━━━━━━'}\n\n"
+    hour_kst = now_kst.hour
+    period = "아침" if hour_kst < 12 else "저녁"
+    header = f"📊 {period} 전략 리포트 ({now_kst.strftime('%m/%d %H:%M')} KST)\n{'━━━━━━━━━━━━━━━━━━━━━━'}\n\n"
     full_msg = header + report
     print(full_msg, flush=True)
     _send_telegram(full_msg)

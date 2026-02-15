@@ -59,9 +59,9 @@ def check():
 
             # Check action distribution
             cur.execute("""
-                SELECT action, COUNT(*) FROM trade_process_log
+                SELECT chosen_side, COUNT(*) FROM trade_process_log
                 WHERE ts > now() - interval '1 hour'
-                GROUP BY action ORDER BY COUNT(*) DESC LIMIT 5;
+                GROUP BY chosen_side ORDER BY COUNT(*) DESC LIMIT 5;
             """)
             action_rows = cur.fetchall()
             action_dist_str = ', '.join([f'{a}={c}' for a, c in action_rows]) if action_rows else 'none'
@@ -115,7 +115,8 @@ def should_alert(state=None):
 
 
 def send_alert(token=None, chat_id=None, info=None):
-    text = f"⚠️ STOPPED 상태가 지속되고 있습니다.\n- 최근 거래: {info['minutes_ago']}분 전\n- trade_switch: {info['trade_sw']}\n- executor_state: {info['exec_mode']}\n- 최근 action 분포: {info['action_dist_str']}\n- 지표 업데이트: {'정상' if info['ind_ok'] else '지연/이상'}\n\n아래 버튼을 누르면 자동 해결을 실행합니다."
+    from report_formatter import korean_output_guard
+    text = korean_output_guard(f"⚠️ STOPPED 상태가 지속되고 있습니다.\n- 최근 거래: {info['minutes_ago']}분 전\n- trade_switch: {info['trade_sw']}\n- executor_state: {info['exec_mode']}\n- 최근 action 분포: {info['action_dist_str']}\n- 지표 업데이트: {'정상' if info['ind_ok'] else '지연/이상'}\n\n아래 버튼을 누르면 자동 해결을 실행합니다.")
     keyboard = {
         'inline_keyboard': [
             [
