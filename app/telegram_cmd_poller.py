@@ -1880,6 +1880,12 @@ def _handle_directive_intent(intent, text):
 import hashlib as _hashlib
 
 DETERMINISTIC_ROUTES = [
+    # POSITION_STATUS: position queries — Korean NL phrases
+    ('POSITION_STATUS', [
+        '포지션 어때', '포지션 상태', '지금 포지션', '현재 포지션',
+        '포지 어때', '포지 상태', '포지션 현황', '포지션 확인',
+        '포지션은', '내 포지션',
+    ]),
     # HEALTH: service status — only explicit Korean phrases
     ('HEALTH', [
         '서비스 상태', '헬스체크', '서비스 점검', '서비스점검',
@@ -1910,6 +1916,7 @@ DETERMINISTIC_ROUTES = [
 
 # Handler dispatch map for deterministic routes
 DETERMINISTIC_HANDLERS = {
+    'POSITION_STATUS': lambda text: local_query_executor.execute('fact_snapshot', original_text=text),
     'HEALTH': lambda text: local_query_executor.execute('health_check', original_text=text),
     'TEST_REPORT': lambda text: local_query_executor.execute('test_report_full', original_text=text),
     'NEWS_APPLIED': lambda text: local_query_executor.execute('news_applied', original_text=text),
@@ -2443,13 +2450,19 @@ def _toggle_trading(parsed, text):
     else:
         enable = False  # default: pause
 
+    import trade_switch_recovery
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE trade_switch SET enabled = %s "
-                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
-                (enable,))
+            if not enable:
+                trade_switch_recovery.set_off_with_reason(cur, 'manual', manual_ttl_minutes=30)
+            else:
+                trade_switch_recovery._ensure_columns(cur)
+                cur.execute(
+                    "UPDATE trade_switch SET enabled = %s, off_reason = NULL, "
+                    "manual_off_until = NULL "
+                    "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
+                    (enable,))
             if cur.rowcount == 0:
                 return "⚠️ trade_switch 레코드가 없습니다." + \
                     _footer('toggle_trading', 'error', 'local')
@@ -2604,11 +2617,18 @@ def _trade_switch_set(enable: bool) -> str:
             except Exception as e:
                 _log(f'trade_switch gate check error: {e}')
 
+        import trade_switch_recovery
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE trade_switch SET enabled = %s "
-                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
-                (enable,))
+            if not enable:
+                # Manual OFF with 30min TTL protection (blocks auto-recovery)
+                trade_switch_recovery.set_off_with_reason(cur, 'manual', manual_ttl_minutes=30)
+            else:
+                trade_switch_recovery._ensure_columns(cur)
+                cur.execute(
+                    "UPDATE trade_switch SET enabled = %s, off_reason = NULL, "
+                    "manual_off_until = NULL "
+                    "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
+                    (enable,))
             if cur.rowcount == 0:
                 return '⚠️ trade_switch 레코드가 없습니다.' + \
                     _footer('trade_switch', 'error', 'local')
@@ -2616,10 +2636,11 @@ def _trade_switch_set(enable: bool) -> str:
             row = cur.fetchone()
         state_str = 'ON' if enable else 'OFF'
         updated = str(row[1])[:19] if row else '?'
+        ttl_note = '\n  ⏱ 30분간 자동복구 차단 (수동 OFF 보호)' if not enable else ''
         return (
             f'✅ entry_enabled={state_str}\n'
             f'  exit_enabled=항상ON (CLOSE/손절 허용)\n'
-            f'  updated_at={updated}'
+            f'  updated_at={updated}{ttl_note}'
         ) + _footer('trade_switch', 'local', 'local')
     finally:
         conn.close()
@@ -2629,11 +2650,10 @@ def _trade_flatten() -> str:
     """Flatten all positions + set entry_enabled=false."""
     conn = _get_db_conn()
     try:
-        # 1. Disable entry
+        # 1. Disable entry (manual flatten = 30min TTL)
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE trade_switch SET enabled = false "
-                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);")
+            import trade_switch_recovery
+            trade_switch_recovery.set_off_with_reason(cur, 'manual', manual_ttl_minutes=30)
 
         # 2. Close position
         try:
@@ -2692,10 +2712,15 @@ def _trade_full_status(chat_id: int) -> str:
             if end_utc:
                 lines.append(f'  end_utc: {end_utc}')
 
-            # 4. Capital
-            from live_order_executor import USDT_CAP, CAPITAL_CAP_USDT, ALLOWED_SYMBOLS
-            lines.append(f'cap: per_order={USDT_CAP} total={CAPITAL_CAP_USDT}')
-            lines.append(f'allowed_symbols: {", ".join(ALLOWED_SYMBOLS)}')
+            # 4. Capital (dynamic from safety_manager)
+            try:
+                import safety_manager
+                from trading_config import ALLOWED_SYMBOLS
+                eq = safety_manager.get_equity_limits(cur)
+                lines.append(f'cap: slice={eq["slice_usdt"]:.0f} total={eq["operating_cap"]:.0f} (equity={eq["equity"]:.0f}, src={eq["source"]})')
+                lines.append(f'allowed_symbols: {", ".join(ALLOWED_SYMBOLS)}')
+            except Exception as e:
+                lines.append(f'cap: (조회 오류: {e})')
 
             # 5. Live position
             try:
@@ -2713,7 +2738,7 @@ def _trade_full_status(chat_id: int) -> str:
             try:
                 cur.execute("""
                     SELECT id, order_type, direction, status, requested_qty,
-                           to_char(created_at, 'MM-DD HH24:MI') as ts
+                           to_char(order_sent_at, 'MM-DD HH24:MI') as ts
                     FROM execution_log
                     ORDER BY id DESC LIMIT 5;
                 """)
@@ -3166,12 +3191,24 @@ def main():
         if not text:
             continue
 
-        try:
-            reply = handle_command(text, chat_id=chat_id)
-        except Exception as e:
-            _log(f"handle_command error: {e}")
-            _log_err(f"handle_command error: {e}")
-            reply = f"⚠️ 명령 처리 중 오류: {e}"
+        # Multi-line: split and handle each line as a separate command
+        cmd_lines = [l.strip() for l in text.split('\n') if l.strip()]
+        if len(cmd_lines) > 1:
+            replies = []
+            for line in cmd_lines[:5]:  # max 5 commands per message
+                try:
+                    r = handle_command(line, chat_id=chat_id)
+                    replies.append(r)
+                except Exception as e:
+                    replies.append(f'⚠️ {line}: {e}')
+            reply = '\n━━━━━━━━━━━━━━━━━━\n'.join(replies)
+        else:
+            try:
+                reply = handle_command(text, chat_id=chat_id)
+            except Exception as e:
+                _log(f"handle_command error: {e}")
+                _log_err(f"handle_command error: {e}")
+                reply = f"⚠️ 명령 처리 중 오류: {e}"
         try:
             send_message(token, chat_id, reply)
         except Exception as e:

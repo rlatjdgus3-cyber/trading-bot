@@ -13,6 +13,9 @@ from db_config import get_conn, DB_CONFIG
 import exchange_reader
 import response_envelope
 
+def _log(msg):
+    print(f'[local_query] {msg}', flush=True)
+
 _process_start_time = _time.time()
 
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
@@ -232,18 +235,20 @@ def get_service_health_snapshot():
 
     # heartbeat DB
     heartbeats = {}
+    hb_counts = {}
     hb_error = None
     conn = None
     try:
         conn = _db()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT service, MAX(ts) AS last_ts
+                SELECT service, MAX(ts) AS last_ts, COUNT(*)
                 FROM service_health_log
                 GROUP BY service;
             """)
-            for svc, last_ts in cur.fetchall():
+            for svc, last_ts, cnt in cur.fetchall():
                 heartbeats[svc] = last_ts
+                hb_counts[svc] = cnt
     except Exception as e:
         hb_error = str(e)
     finally:
@@ -266,6 +271,7 @@ def get_service_health_snapshot():
         hb_state = None
         hb_reason = None
         age_sec = None
+        hb_cnt = hb_counts.get(svc, 0)
         if hb_error:
             hb_reason = f'db_error:{hb_error[:40]}'
         elif hb_ts:
@@ -273,16 +279,25 @@ def get_service_health_snapshot():
                 hb_ts = hb_ts.replace(tzinfo=timezone.utc)
             age_sec = int((now_utc - hb_ts).total_seconds())
             if expected_interval > 0:
-                if age_sec < 2 * expected_interval:
+                stale_threshold = 3 * expected_interval
+                if age_sec < stale_threshold:
                     hb_state = 'OK'
                     hb_reason = f'heartbeat_fresh (age={age_sec}s)'
+                elif hb_cnt <= 1 and age_sec < stale_threshold:
+                    # Warmup: only 1 heartbeat row and within threshold → UNKNOWN
+                    hb_state = 'UNKNOWN'
+                    hb_reason = f'warmup (age={age_sec}s, rows={hb_cnt})'
                 else:
                     hb_state = 'DOWN'
-                    hb_reason = f'heartbeat_stale (age={age_sec}s)'
+                    hb_reason = f'heartbeat_stale (age={age_sec}s, threshold={stale_threshold}s)'
             else:
                 hb_reason = 'missing_expected_interval'
         else:
-            hb_reason = 'no_heartbeat_rows'
+            if hb_cnt <= 1:
+                hb_state = 'UNKNOWN'
+                hb_reason = 'warmup (no_heartbeat_rows)'
+            else:
+                hb_reason = 'no_heartbeat_rows'
 
         # ── Check 2: systemctl process ──
         proc_state = None
@@ -317,10 +332,14 @@ def get_service_health_snapshot():
                 else:
                     proc_reason = f'parse_unknown'
 
-        # ── Final verdict: heartbeat wins if available, then process ──
+        # ── Final verdict: process alive + hb stale → OK+WARN (not DOWN) ──
         if hb_state == 'OK':
             state = 'OK'
             reason = hb_reason
+        elif proc_state == 'OK' and hb_state == 'DOWN':
+            # Process is alive but heartbeat stale → trust process, WARN only
+            state = 'OK'
+            reason = f'WARN: {hb_reason} (process alive)'
         elif proc_state == 'OK':
             state = 'OK'
             reason = proc_reason
@@ -653,6 +672,7 @@ def _snapshot(_text=None):
     gate_status = None
     switch_status = None
     wait_reason = None
+    capital_info = None
     try:
         conn = _db()
         with conn.cursor() as cur:
@@ -664,6 +684,30 @@ def _snapshot(_text=None):
             switch_status = row[0] if row else None
             wr = exchange_reader.compute_wait_reason(cur, gate_status=gate_status)
             wait_reason = wr[0] if isinstance(wr, tuple) else wr
+
+            # Capital info for display
+            try:
+                eq = safety_manager.get_equity_limits(cur)
+                cur.execute('SELECT capital_used_usdt, stage FROM position_state WHERE symbol = %s;',
+                            ('BTC/USDT:USDT',))
+                ps_row = cur.fetchone()
+                used = float(ps_row[0]) if ps_row and ps_row[0] else 0
+                stage = int(ps_row[1]) if ps_row and ps_row[1] else 0
+                # leverage from already-fetched exchange position (avoid redundant API call)
+                lev = exch_pos.get('leverage', 0) if exch_pos.get('data_status') == 'OK' else 0
+                lev_min = eq.get('leverage_min', 3)
+                lev_max = eq.get('leverage_max', 8)
+                capital_info = {
+                    **eq,
+                    'used_usdt': used,
+                    'remaining_usdt': round(max(0, eq['operating_cap'] - used), 2),
+                    'stage': stage,
+                    'max_stages': 7,
+                    'leverage_current': lev,
+                    'leverage_rule': f'{lev_min}-{lev_max}x',
+                }
+            except Exception:
+                pass
     except Exception as e:
         _log(f'_snapshot gate/switch error: {e}')
         if gate_status is None:
@@ -676,7 +720,8 @@ def _snapshot(_text=None):
                 pass
 
     return response_envelope.format_snapshot(
-        exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason)
+        exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason,
+        capital_info=capital_info)
 
 
 def _score_summary(_text=None):
@@ -1778,12 +1823,13 @@ def _debug_health(_text=None):
                 hb_ts = hb_ts.replace(tzinfo=timezone.utc)
             age_sec = int((now_utc - hb_ts).total_seconds())
             if expected_interval > 0:
-                if age_sec < 2 * expected_interval:
+                stale_threshold = 3 * expected_interval
+                if age_sec < stale_threshold:
                     hb_state = 'OK'
-                    hb_reason = f'heartbeat_fresh (age={age_sec}s < {2*expected_interval}s)'
+                    hb_reason = f'heartbeat_fresh (age={age_sec}s < {stale_threshold}s)'
                 else:
                     hb_state = 'DOWN'
-                    hb_reason = f'heartbeat_stale (age={age_sec}s >= {2*expected_interval}s)'
+                    hb_reason = f'heartbeat_stale (age={age_sec}s >= {stale_threshold}s)'
             else:
                 hb_reason = 'missing_expected_interval'
         else:
@@ -1824,10 +1870,13 @@ def _debug_health(_text=None):
 
         check_ms = (_time.time() - t1) * 1000
 
-        # ── Final verdict: heartbeat wins if available, then process ──
+        # ── Final verdict: process alive + hb stale → OK+WARN (not DOWN) ──
         if hb_state == 'OK':
             state = 'OK'
             reason = hb_reason
+        elif proc_state == 'OK' and hb_state == 'DOWN':
+            state = 'OK'
+            reason = f'WARN: {hb_reason} (process alive)'
         elif proc_state == 'OK':
             state = 'OK'
             reason = proc_reason
@@ -3109,12 +3158,20 @@ def _debug_state(_text=None):
     lines.append('')
     lines.append('[exposure_cap]')
     try:
-        from live_order_executor import ALLOWED_SYMBOLS, CAPITAL_CAP_USDT
+        from trading_config import ALLOWED_SYMBOLS
+        import safety_manager
+        eq = safety_manager.get_equity_limits()
         lines.append(f'  ALLOWED_SYMBOLS: {", ".join(sorted(ALLOWED_SYMBOLS))}')
-        lines.append(f'  CAPITAL_CAP_USDT: {CAPITAL_CAP_USDT}')
+        lines.append(f'  operating_cap: {eq["operating_cap"]} (equity={eq["equity"]}, src={eq["source"]})')
     except Exception:
-        lines.append('  (live_order_executor import 실패)')
+        lines.append('  (equity_limits 조회 실패)')
     conn2 = None
+    try:
+        import safety_manager as _sm
+        _eq = _sm.get_equity_limits()
+        _cap = _eq['operating_cap']
+    except Exception:
+        _cap = 900  # fallback
     try:
         conn2 = _db()
         with conn2.cursor() as cur2:
@@ -3127,13 +3184,12 @@ def _debug_state(_text=None):
                 side_str = ps[0]
                 qty_val = float(ps[1] or 0)
                 cap_used = float(ps[2] or 0)
-                from live_order_executor import CAPITAL_CAP_USDT as _cap
                 remaining = max(0, _cap - cap_used)
                 lines.append(f'  position: {side_str} qty={qty_val} capital_used={cap_used:.1f}')
                 lines.append(f'  remaining_cap: {remaining:.1f} USDT')
             else:
                 lines.append('  position: FLAT')
-                lines.append(f'  remaining_cap: {CAPITAL_CAP_USDT} USDT')
+                lines.append(f'  remaining_cap: {_cap} USDT')
             # Cap block/shrink counts
             cur2.execute("""
                 SELECT event, count(*)
