@@ -26,6 +26,7 @@ __pycache__/
 # Runtime state
 *.db
 .chat_history.json
+.chat_agent_gpt_fails.json
 .error_watcher_state.json
 .gpt_router_state.json
 .claude_gate_state.json
