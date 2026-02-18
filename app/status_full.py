@@ -85,7 +85,8 @@ def main():
             "📌 STATUS (FULL)",
             f"- time: {now}",
             f"- LIVE_TRADING: {'ON' if live else 'OFF'}",
-            f"- trade_switch: {'ON' if sw_enabled else 'OFF'} (updated_at={sw_updated})",
+            f"- entry_enabled: {'ON' if sw_enabled else 'OFF'} (updated_at={sw_updated})",
+            f"- exit_enabled: ON (always)",
             f"- once_lock rows: {lock_rows} (first={lock_first}, last={lock_last})",
             f"- {pos_line}",
         ])

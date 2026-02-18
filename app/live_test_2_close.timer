@@ -1,0 +1,9 @@
+[Unit]
+Description=Live Test 2 close timer — 2026-02-20 08:30 UTC (17:30 KST)
+
+[Timer]
+OnCalendar=2026-02-20 08:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

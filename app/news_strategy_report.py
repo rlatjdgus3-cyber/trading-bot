@@ -437,6 +437,15 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
         # 3. Position
         position = _fetch_position(cur)
 
+        # 3b. Exchange reality check (FACT source)
+        exchange_block = {}
+        try:
+            import exchange_reader
+            exchange_block = exchange_reader.build_report_exchange_block()
+        except Exception as e:
+            _log(f'exchange_block error: {e}')
+            exchange_block = {'exch_position': 'UNKNOWN', 'reconcile': 'UNKNOWN'}
+
         # 4. Market snapshot
         snapshot = _fetch_snapshot(cur)
         # Fill price from score engine if missing
@@ -567,6 +576,7 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
                 'entry': position.get('entry', 0),
                 **pos_data,
             },
+            'exchange_block': exchange_block,
             'macro_news': macro_news,
             'crypto_news': crypto_news,
             'ignored_news': ignored_news,
@@ -591,6 +601,7 @@ def build_report_data(cur, exchange=None, max_news=5, detail=False):
                        'dynamic_sl': 2.0, 'news_guarded': False,
                        'news_components': {}, 'weights': {}},
             'position': {},
+            'exchange_block': {'exch_position': 'UNKNOWN', 'reconcile': 'UNKNOWN'},
             'macro_news': [],
             'crypto_news': [],
             'ignored_news': [],

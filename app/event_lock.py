@@ -34,7 +34,15 @@ SUPPRESS_NOTIFY_COOLDOWN_SEC = 900  # max 1 notification per trigger type per 15
 # Suppression accumulator: count per trigger_type, flush every 15 min
 _suppress_accumulator = {}     # {trigger_type: count}
 _suppress_accumulator_ts = 0   # last flush timestamp
-SUPPRESS_ACCUMULATOR_SEC = 900 # 15 min accumulator window
+SUPPRESS_ACCUMULATOR_SEC = int(os.getenv('SUPPRESS_ACCUMULATOR_SEC', '900'))
+
+# Emergency triggers that bypass accumulation and send immediately
+IMMEDIATE_PASS_TRIGGERS = {
+    'emergency_position_loss',
+    'emergency_liquidation_near',
+    'emergency_price_5m',
+    'emergency_price_15m',
+}
 
 # Telegram env cache
 _tg_env_cache = {}
@@ -498,35 +506,59 @@ def _notify_hold_suppress(symbol, count, ttl_sec, trigger_types):
 
 
 def notify_event_suppressed(symbol, lock_info, trigger_types, caller='unknown'):
-    """Accumulate suppression events and send summary every 15 min.
+    """Accumulate suppression events and send summary every window period.
 
-    Instead of individual notifications, counts suppressions per trigger type
-    and sends a single summary message every 15 minutes.
+    긴급 트리거는 즉시 전송, 나머지는 누적 후 배치 요약.
     """
     global _suppress_accumulator_ts
     now = time.time()
+    trigger_types = trigger_types or ['unknown']
+
+    # 9-1: 긴급 이벤트 즉시 전송
+    immediate = [t for t in trigger_types if t in IMMEDIATE_PASS_TRIGGERS]
+    if immediate:
+        try:
+            import report_formatter
+            kr_types = [report_formatter.TRIGGER_KR.get(t, t) for t in immediate]
+            remaining = lock_info.get('remaining_sec', 0) if isinstance(lock_info, dict) else 0
+            text = f'🚨 긴급 이벤트 억제 (즉시 알림)\n'
+            text += f'- 트리거: {", ".join(kr_types)}\n'
+            if remaining > 0:
+                text += f'- 잔여 락: {remaining}초\n'
+            text += f'- 종목: {symbol}'
+            _send_tg(text)
+        except Exception as e:
+            _log(f'telegram immediate notify error: {e}')
+        # Don't accumulate immediate triggers
+        trigger_types = [t for t in trigger_types if t not in IMMEDIATE_PASS_TRIGGERS]
+        if not trigger_types:
+            return
 
     # Accumulate counts per trigger type
-    for t in (trigger_types or ['unknown']):
+    for t in trigger_types:
         _suppress_accumulator[t] = _suppress_accumulator.get(t, 0) + 1
 
     # Initialize accumulator timestamp
     if _suppress_accumulator_ts == 0:
         _suppress_accumulator_ts = now
 
-    # Check if 15 min window passed → flush summary
-    if now - _suppress_accumulator_ts < SUPPRESS_ACCUMULATOR_SEC:
+    # Check if window passed → flush summary
+    window = SUPPRESS_ACCUMULATOR_SEC
+    if now - _suppress_accumulator_ts < window:
         return  # still accumulating
 
-    # Flush accumulated counts as a summary message
+    # 9-2: Flush with improved batch format
     try:
         import report_formatter
         if _suppress_accumulator:
-            parts = []
-            for trigger_type, count in sorted(_suppress_accumulator.items()):
+            total = sum(_suppress_accumulator.values())
+            # Sort by count descending, limit to top 5
+            sorted_items = sorted(_suppress_accumulator.items(),
+                                  key=lambda x: x[1], reverse=True)[:5]
+            text = f'🚫 억제 요약 ({window // 60}분): 총 {total}건\n'
+            for trigger_type, count in sorted_items:
                 kr = report_formatter.TRIGGER_KR.get(trigger_type, trigger_type)
-                parts.append(f'{kr} {count}회')
-            text = f'🚫 최근 {SUPPRESS_ACCUMULATOR_SEC // 60}분 억제 요약: {", ".join(parts)}'
+                text += f'  • {kr} {count}회\n'
             _send_tg(text)
     except Exception as e:
         _log(f'telegram notify error: {e}')

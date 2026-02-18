@@ -19,6 +19,7 @@ import urllib.request
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[autopilot]'
 SYMBOL = 'BTC/USDT:USDT'
+ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
 USDT_CAP = 900
 POLL_SEC = 60
 COOLDOWN_SEC = 300
@@ -26,8 +27,97 @@ MAX_DAILY_TRADES = 10
 MIN_CONFIDENCE = 15
 DEFAULT_SIZE_PCT = 10
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
+TRADE_SWITCH_DEDUP_KEY = 'autopilot:risk_check:trade_switch_off'
+LOG_COOLDOWN_SEC = 1800  # 30min log dedup (non-trade_switch reasons)
 _migrations_done = False
 _exchange = None
+
+
+def _db_check_trade_switch_transition(cur):
+    """Detect trade_switch ON→OFF transition via DB state.
+    Returns True if transition detected (= immediate alert needed).
+    Also updates prev_state to 'OFF'."""
+    try:
+        key = TRADE_SWITCH_DEDUP_KEY
+        # Check existing state
+        cur.execute("""
+            SELECT prev_state FROM alert_dedup_state WHERE key = %s;
+        """, (key,))
+        row = cur.fetchone()
+
+        if not row:
+            # First time: no row → treat as transition (new OFF event)
+            cur.execute("""
+                INSERT INTO alert_dedup_state (key, prev_state, last_sent_ts)
+                VALUES (%s, 'OFF', now())
+                ON CONFLICT (key) DO NOTHING;
+            """, (key,))
+            return True
+
+        prev = row[0]
+        if prev != 'OFF':
+            # Transition ON→OFF: mark state + reset send timer
+            cur.execute("""
+                UPDATE alert_dedup_state
+                SET prev_state = 'OFF', last_sent_ts = now(),
+                    last_seen_ts = now(), suppressed_count = 0
+                WHERE key = %s;
+            """, (key,))
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _db_reset_trade_switch(cur):
+    """Reset trade_switch dedup state to ON (called when switch is active)."""
+    try:
+        cur.execute("""
+            UPDATE alert_dedup_state SET prev_state = 'ON'
+            WHERE key = %s AND (prev_state IS NULL OR prev_state = 'OFF');
+        """, (TRADE_SWITCH_DEDUP_KEY,))
+    except Exception:
+        pass
+
+
+def _db_should_log_risk(cur, reason):
+    """DB-based risk failure log dedup. Returns (should_log, summary).
+    Uses alert_dedup_state for cross-process persistence."""
+    key = f'autopilot:risk:{reason.replace(" ", "_").lower()}'
+    try:
+        cur.execute("""
+            INSERT INTO alert_dedup_state (key, last_sent_ts, suppressed_count)
+            VALUES (%s, NULL, 0)
+            ON CONFLICT (key) DO NOTHING;
+        """, (key,))
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (now() - last_sent_ts))::int,
+                   suppressed_count
+            FROM alert_dedup_state WHERE key = %s;
+        """, (key,))
+        row = cur.fetchone()
+        elapsed = row[0]
+        suppressed = row[1] or 0
+
+        if elapsed is None or elapsed >= LOG_COOLDOWN_SEC:
+            summary = ''
+            if suppressed > 0:
+                summary = f' (suppressed={suppressed} in last {LOG_COOLDOWN_SEC // 60}m)'
+            cur.execute("""
+                UPDATE alert_dedup_state
+                SET last_sent_ts = now(), last_seen_ts = now(), suppressed_count = 0
+                WHERE key = %s;
+            """, (key,))
+            return (True, summary)
+        else:
+            cur.execute("""
+                UPDATE alert_dedup_state
+                SET last_seen_ts = now(), suppressed_count = suppressed_count + 1
+                WHERE key = %s;
+            """, (key,))
+            return (False, '')
+    except Exception:
+        return (True, '')
 
 
 def _get_exchange():
@@ -101,6 +191,7 @@ def _check_autopilot_enabled(cur=None):
         db_migrations.ensure_autopilot_config(cur)
         db_migrations.ensure_trade_process_log(cur)
         db_migrations.ensure_stage_column(cur)
+        db_migrations.ensure_alert_dedup_state(cur)
         _migrations_done = True
     cur.execute('SELECT enabled FROM autopilot_config ORDER BY id DESC LIMIT 1;')
     row = cur.fetchone()
@@ -191,6 +282,9 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None):
 
 def _create_autopilot_signal(cur=None, side=None, scores=None):
     '''Create OPEN signal for autopilot. Returns signal_id.'''
+    if SYMBOL not in ALLOWED_SYMBOLS:
+        _log(f'SYMBOL_NOT_ALLOWED: {SYMBOL} — signal skipped')
+        return 0
     import datetime
     import safety_manager
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -267,8 +361,25 @@ def _cycle():
 
             (ok, reason) = _risk_checks(cur)
             if not ok:
-                _log(f'risk check failed: {reason}')
+                if 'trade_switch' in reason.lower():
+                    # Transition ON→OFF: immediate Telegram alert
+                    is_transition = _db_check_trade_switch_transition(cur)
+                    if is_transition:
+                        _log('⚠ trade_switch OFF 전환 감지')
+                        _notify_telegram(
+                            '⚠ trade_switch OFF 전환\n'
+                            'autopilot 매매 일시 중지됨')
+                    # Steady OFF: log only (error_watcher handles 6h remind)
+                    # No stdout noise — error_watcher dedup prevents Telegram spam
+                else:
+                    # Non-trade_switch reasons: DB-based log dedup
+                    should_log, summary = _db_should_log_risk(cur, reason)
+                    if should_log:
+                        _log(f'INFO: risk check skipped: {reason}{summary}')
                 return
+
+            # Risk checks passed → trade_switch is ON: reset transition state
+            _db_reset_trade_switch(cur)
 
             import direction_scorer
             scores = direction_scorer.compute_scores()

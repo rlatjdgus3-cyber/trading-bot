@@ -68,14 +68,14 @@ EMERGENCY_LOCK_SEC = 180       # 3 min lock after emergency execution
 MIN_ORDER_QTY_BTC = 0.001     # Bybit BTC/USDT:USDT minimum
 
 # ── EVENT Claude escalation gate ─────────────────────────
-EVENT_CLAUDE_COOLDOWN_SEC = 900   # 15 min minimum between EVENT Claude calls
-EVENT_CLAUDE_DAILY_CAP = 20       # max EVENT Claude calls per day
+EVENT_CLAUDE_COOLDOWN_SEC = 300   # 5 min minimum between EVENT Claude calls
+# EVENT_CLAUDE_DAILY_CAP: 삭제됨 (claude_gate의 비용 기반 제어에 위임)
 EVENT_CLAUDE_MIN_RET_5M = 1.2     # abs(ret_5m) >= 1.2%
 EVENT_CLAUDE_MIN_VOL_RATIO = 2.5  # vol_spike >= 2.5x
 EVENT_CLAUDE_MIN_CONFIDENCE = 0.75  # trigger confidence threshold
 
 # ── Async Claude escalation (need_claude) ───────────────
-ASYNC_CLAUDE_COOLDOWN_SEC = 1800       # 30분 쿨다운
+ASYNC_CLAUDE_COOLDOWN_SEC = 600        # 10분 쿨다운
 ASYNC_CLAUDE_RET_5M_THRESHOLD = 1.0    # 조건A: |ret_5m| >= 1.0%
 ASYNC_CLAUDE_CONFIDENCE_THRESHOLD = 70  # 조건A: GPT confidence < 70
 ASYNC_CLAUDE_BAR_15M_CUMULATIVE = 1.5  # 조건B: 누적 >=1.5% (같은 방향)
@@ -265,54 +265,53 @@ def should_use_claude_for_event(snapshot, triggers) -> tuple:
 
     Returns (use_claude: bool, reason: str).
 
-    Claude is allowed ONLY when ALL of:
-      1. abs(ret_5m) >= 1.2%
-      2. vol_ratio >= 2.5x
-      3. level break sustained (vah_break/val_break in triggers, 3-candle)
-         OR trigger confidence >= 0.75 (high zscore)
-      4. 15-min cooldown since last EVENT Claude call
-      5. Daily cap not exceeded (20/day)
+    시장 조건 A/B/C 충족 시 → 무조건 True
+    미충족이지만 abs(ret_5m) >= 0.8% AND vol_ratio >= 2.0 → True
+    최종 승인은 claude_gate.request()에 위임.
     """
     _check_daily_reset()
     now = time.time()
 
-    # ── Gate 5: daily cap ──
-    if _event_claude_state['daily_count'] >= EVENT_CLAUDE_DAILY_CAP:
-        return False, f'daily_cap_exceeded ({_event_claude_state["daily_count"]}/{EVENT_CLAUDE_DAILY_CAP})'
-
-    # ── Gate 4: 15-min cooldown ──
+    # 쿨다운 체크 (5분)
     elapsed = now - _event_claude_state['last_call_ts']
     if _event_claude_state['last_call_ts'] > 0 and elapsed < EVENT_CLAUDE_COOLDOWN_SEC:
         return False, f'cooldown ({int(elapsed)}s/{EVENT_CLAUDE_COOLDOWN_SEC}s)'
 
-    # ── Gate 1: ret_5m ──
     returns = snapshot.get('returns', {}) if snapshot else {}
     ret_5m = returns.get('ret_5m')
-    if ret_5m is None or abs(ret_5m) < EVENT_CLAUDE_MIN_RET_5M:
-        return False, f'ret_5m={ret_5m} < {EVENT_CLAUDE_MIN_RET_5M}%'
-
-    # ── Gate 2: vol_ratio ──
+    ret_10m = returns.get('ret_10m')
     vol_ratio = snapshot.get('vol_ratio', 0) if snapshot else 0
-    if vol_ratio < EVENT_CLAUDE_MIN_VOL_RATIO:
-        return False, f'vol_ratio={vol_ratio:.2f} < {EVENT_CLAUDE_MIN_VOL_RATIO}'
 
-    # ── Gate 3: level break sustained OR high confidence ──
-    trigger_types = [t.get('type', '') for t in (triggers or [])]
-    has_level_break = any(t in ('vah_break', 'val_break') for t in trigger_types)
-    # Check confidence from trigger values (e.g. zscore_band)
-    max_confidence = 0
-    for t in (triggers or []):
-        # Derive confidence from trigger strength
-        val = abs(t.get('value', 0) or 0)
-        thresh = abs(t.get('threshold', 1) or 1)
-        if thresh > 0:
-            max_confidence = max(max_confidence, val / thresh)
-    has_high_confidence = max_confidence >= (EVENT_CLAUDE_MIN_CONFIDENCE / 0.5)  # normalized
+    # 시장 조건 바이패스 체크
+    # 조건 A: abs(ret_5m) >= 1.0% 또는 abs(ret_10m) >= 1.0%
+    if (ret_5m is not None and abs(ret_5m) >= 1.0) or \
+       (ret_10m is not None and abs(ret_10m) >= 1.0):
+        return True, 'market_condition_bypass (ret >= 1.0%)'
 
-    if not has_level_break and not has_high_confidence:
-        return False, f'no level_break and confidence={max_confidence:.2f} too low'
+    # 조건 B: 15분봉 3연속 + 누적 1.5%
+    bar_15m = snapshot.get('bar_15m_returns', []) if snapshot else []
+    if len(bar_15m) >= 3:
+        last3 = bar_15m[:3]
+        all_pos = all(b > 0 for b in last3)
+        all_neg = all(b < 0 for b in last3)
+        if all_pos or all_neg:
+            cumulative = abs(sum(last3))
+            if cumulative >= 1.5:
+                return True, f'market_condition_bypass (3bar cumulative={cumulative:.2f}%)'
 
-    return True, 'all gates passed'
+    # 조건 C: 포지션 위험
+    position_loss = snapshot.get('position_loss_pct') if snapshot else None
+    liq_dist = snapshot.get('liq_dist_pct') if snapshot else None
+    if position_loss is not None and abs(position_loss) >= 2.0:
+        return True, f'market_condition_bypass (loss={position_loss:.2f}%)'
+    if liq_dist is not None and liq_dist <= 3.0:
+        return True, f'market_condition_bypass (liq_dist={liq_dist:.2f}%)'
+
+    # 일반 이벤트: ret_5m >= 0.8% AND vol_ratio >= 2.0
+    if ret_5m is not None and abs(ret_5m) >= 0.8 and vol_ratio >= 2.0:
+        return True, f'high_event (ret_5m={ret_5m:.2f}%, vol={vol_ratio:.2f}x)'
+
+    return False, f'below threshold (ret_5m={ret_5m}, vol={vol_ratio:.2f}x)'
 
 
 def need_claude(snapshot, mini_result, scores) -> tuple:
@@ -334,9 +333,7 @@ def need_claude(snapshot, mini_result, scores) -> tuple:
     if _event_claude_state['last_call_ts'] > 0 and elapsed < ASYNC_CLAUDE_COOLDOWN_SEC:
         return False, f'async_cooldown ({int(elapsed)}s/{ASYNC_CLAUDE_COOLDOWN_SEC}s)'
 
-    # ── 일일 캡 ──
-    if _event_claude_state['daily_count'] >= EVENT_CLAUDE_DAILY_CAP:
-        return False, f'daily_cap ({_event_claude_state["daily_count"]}/{EVENT_CLAUDE_DAILY_CAP})'
+    # 일일 캡: claude_gate 비용 기반 제어에 위임
 
     # ── 조건A: |ret_5m| >= 1.0% AND confidence < 70 ──
     returns = snapshot.get('returns', {}) if snapshot else {}
@@ -379,7 +376,7 @@ def record_event_claude_call():
     _event_claude_state['last_call_ts'] = time.time()
     _event_claude_state['daily_count'] += 1
     _log(f'EVENT Claude call recorded: '
-         f'{_event_claude_state["daily_count"]}/{EVENT_CLAUDE_DAILY_CAP} today')
+         f'{_event_claude_state["daily_count"]} today')
 
 
 def get_event_claude_stats() -> dict:
@@ -387,8 +384,8 @@ def get_event_claude_stats() -> dict:
     _check_daily_reset()
     return {
         'daily_count': _event_claude_state['daily_count'],
-        'daily_cap': EVENT_CLAUDE_DAILY_CAP,
-        'daily_remaining': max(0, EVENT_CLAUDE_DAILY_CAP - _event_claude_state['daily_count']),
+        'daily_cap': 999,  # claude_gate 비용 기반 제어에 위임
+        'daily_remaining': max(0, 999 - _event_claude_state['daily_count']),
         'cap_notified': _event_claude_state['cap_notified'],
         'last_call_ts': _event_claude_state['last_call_ts'],
         'cooldown_remaining': max(0, int(

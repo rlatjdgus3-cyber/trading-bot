@@ -29,6 +29,7 @@ sys.path.insert(0, '/root/trading-bot/app')
 
 LOG_PREFIX = '[ecl]'
 SYMBOL = 'BTC/USDT:USDT'
+ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
 
 # Rate limit: minimum seconds between orders to same symbol
 RATE_LIMIT_SEC = 1.0
@@ -435,6 +436,16 @@ def validate_bybit_compliance(exchange, order_params, symbol=None):
     Returns ComplianceResult.
     """
     sym = symbol or SYMBOL
+
+    # ── Symbol whitelist check (hard block) ──
+    if sym not in ALLOWED_SYMBOLS:
+        _log(f'SYMBOL_NOT_ALLOWED: {sym}')
+        return ComplianceResult(
+            ok=False,
+            reason=f'symbol {sym} not in ALLOWED_SYMBOLS',
+            reject_reason='허용되지 않은 심볼',
+            suggested_fix=f'허용 심볼: {", ".join(sorted(ALLOWED_SYMBOLS))}')
+
     info = _load_market_info(exchange, sym)
 
     qty = order_params.get('qty', 0)
@@ -1036,6 +1047,91 @@ def format_rejection_telegram_yaml(error_msg: str, order_params: dict = None) ->
         lines.append(f'- 시도: {action} {qty} BTC')
 
     return '\n'.join(lines)
+
+
+# ── YAML-based error action handler ──────────────────────
+
+def handle_error_action(error_code, error_msg=''):
+    """Bybit 에러 코드 → YAML 매핑 → 구조화된 응답 반환.
+
+    Returns: {action, delay_sec, korean_msg, severity, max_retry}
+    """
+    error_map = _load_error_map_yaml()
+    if not error_map:
+        return {
+            'action': 'SKIP_AND_ALERT',
+            'delay_sec': 0,
+            'korean_msg': f'알 수 없는 오류 (code={error_code})',
+            'severity': 'MEDIUM',
+            'max_retry': 0,
+        }
+
+    # Match by error code first, then by pattern
+    for key, entry in error_map.items():
+        if isinstance(entry, dict):
+            if entry.get('code') and str(entry['code']) == str(error_code):
+                return _build_error_response(entry)
+            pattern = entry.get('pattern', '')
+            if pattern and _re_match(pattern, str(error_msg)):
+                return _build_error_response(entry)
+
+    # No match found
+    return {
+        'action': 'SKIP_AND_ALERT',
+        'delay_sec': 0,
+        'korean_msg': f'매핑되지 않은 오류 (code={error_code}: {str(error_msg)[:100]})',
+        'severity': 'MEDIUM',
+        'max_retry': 0,
+    }
+
+
+def _build_error_response(entry):
+    """YAML entry → structured response."""
+    return {
+        'action': entry.get('action_code', 'SKIP_AND_ALERT'),
+        'delay_sec': entry.get('retry_after_sec', 0),
+        'korean_msg': entry.get('korean_message', '알 수 없는 오류'),
+        'severity': entry.get('severity', 'MEDIUM'),
+        'max_retry': entry.get('max_retry', 0),
+    }
+
+
+def _re_match(pattern, text):
+    """Simple regex/substring pattern matching."""
+    import re
+    try:
+        return bool(re.search(pattern, text, re.IGNORECASE))
+    except Exception:
+        return pattern.lower() in text.lower()
+
+
+# ── 슬라이딩 윈도우 레이트 리미터 ──────────────────────────
+
+SLIDING_RATE_LIMITS = {
+    'order': {'window': 10, 'max': 10},
+    'query': {'window': 5, 'max': 20},
+}
+_sliding_rate_window = {}  # {category: [timestamps]}
+
+
+def check_sliding_rate_limit(category='order') -> bool:
+    """Pre-flight 레이트 체크. True면 OK, False면 대기 필요."""
+    now = time.time()
+    config = SLIDING_RATE_LIMITS.get(category, {'window': 10, 'max': 10})
+    window = config['window']
+    max_calls = config['max']
+
+    timestamps = _sliding_rate_window.get(category, [])
+    # 윈도우 밖의 타임스탬프 제거
+    timestamps = [t for t in timestamps if now - t < window]
+    _sliding_rate_window[category] = timestamps
+
+    if len(timestamps) >= max_calls:
+        _log(f'rate limit hit: {category} ({len(timestamps)}/{max_calls} in {window}s)')
+        return False
+
+    timestamps.append(now)
+    return True
 
 
 # ── 10-day rule freshness check ──────────────────────────

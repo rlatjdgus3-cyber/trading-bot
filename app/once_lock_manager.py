@@ -69,20 +69,19 @@ def main():
         'enabled': False})
     if not in_test_window(test):
         return None
-    cooldown_min = int(os.getenv('ONCE_LOCK_COOLDOWN_MIN', '30'))
     if has_position():
         return None
-    opened_at = get_lock_opened_at()
-    if not opened_at:
-        return None
-    now = datetime.now(timezone.utc)
-    age = now - opened_at
-    age_min = age.total_seconds() / 60
-    if age_min < cooldown_min:
-        print(f'[once_lock_manager] Lock age={age_min:.1f}m < cooldown={cooldown_min}m, skip', flush=True)
-        return None
-    print(f'[once_lock_manager] Lock age={age_min:.1f}m >= cooldown={cooldown_min}m, deleting lock', flush=True)
-    delete_lock()
+    # TTL-based cleanup: delete all expired locks
+    try:
+        conn = get_conn(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.live_order_once_lock WHERE expires_at IS NOT NULL AND expires_at <= now();")
+            deleted = cur.rowcount
+        conn.close()
+        if deleted > 0:
+            print(f'[once_lock_manager] TTL cleanup: deleted {deleted} expired lock(s)', flush=True)
+    except Exception as e:
+        print(f'[once_lock_manager] TTL cleanup error: {e}', flush=True)
 
 if __name__ == '__main__':
     main()

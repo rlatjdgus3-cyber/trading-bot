@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading Bot Data Pipeline Scheduler
+After=network.target postgresql.service
+Wants=news_bot.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-bot/app
+ExecStart=/usr/bin/python3 /root/trading-bot/app/backfill_scheduler.py --loop
+Restart=always
+RestartSec=60
+EnvironmentFile=/root/trading-bot/app/.env
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

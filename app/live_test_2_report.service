@@ -1,0 +1,9 @@
+[Unit]
+Description=Live Test 2 — 18:00 KST comprehensive report (2026-02-20)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/trading-bot/app
+ExecStart=/usr/bin/python3 /root/trading-bot/app/strategy_report.py live_test_2
+EnvironmentFile=/root/trading-bot/app/.env

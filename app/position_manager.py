@@ -70,6 +70,7 @@ _prev_scores = {}  # Previous cycle scores for regime change detection
 _recent_claude_actions = []
 CONSECUTIVE_HOLD_LIMIT = 3
 _prev_position_side = None
+_reconcile_cycle_count = 0
 _last_cleanup_ts = 0
 CLEANUP_INTERVAL_SEC = 300  # cleanup expired locks every 5 min
 
@@ -310,6 +311,38 @@ def _build_context(cur=None, pos=None, snapshot=None):
         ctx['funding_rate'] = float(funding_data.get('fundingRate', 0))
     except Exception:
         ctx['funding_rate'] = 0
+
+    # ── 시장 조건 컨텍스트 (claude_gate 시장 바이패스용) ──
+    if snapshot:
+        returns = snapshot.get('returns', {})
+        ctx['returns'] = returns
+        ctx['bar_15m_returns'] = snapshot.get('bar_15m_returns', [])
+
+        # 포지션 손실률 / 청산거리
+        ps = ctx.get('pos_state', {})
+        price = ctx.get('price', 0)
+        entry = ps.get('avg_entry', 0)
+        side = ps.get('side', '')
+        if entry and entry > 0 and price and price > 0 and side:
+            if side.lower() == 'long':
+                ctx['position_loss_pct'] = round((entry - price) / entry * 100, 2)
+            else:
+                ctx['position_loss_pct'] = round((price - entry) / entry * 100, 2)
+        else:
+            ctx['position_loss_pct'] = 0
+
+        # 청산거리 계산
+        bybit_pos = pos or {}
+        liq_price = float(bybit_pos.get('liquidationPrice', 0) or 0)
+        if liq_price > 0 and price > 0:
+            if side and side.lower() == 'long':
+                ctx['liq_dist_pct'] = round((price - liq_price) / price * 100, 2)
+            elif side and side.lower() == 'short':
+                ctx['liq_dist_pct'] = round((liq_price - price) / price * 100, 2)
+            else:
+                ctx['liq_dist_pct'] = 999
+        else:
+            ctx['liq_dist_pct'] = 999
 
     # Decision history for GPT-mini context
     try:
@@ -1303,7 +1336,14 @@ def _decide(ctx=None):
         if dominant == direction:
             relevant = long_score if direction == 'LONG' else short_score
             if relevant >= 65:
-                return ('ADD', f'score {relevant} favors {direction}, stage={stage}')
+                # News counter-signal guard (Section B.3)
+                news_score = scores.get('news_event_score', 0)
+                if direction == 'LONG' and news_score <= -40:
+                    _log(f'ADD blocked: bearish news_event_score={news_score} vs LONG')
+                elif direction == 'SHORT' and news_score >= 40:
+                    _log(f'ADD blocked: bullish news_event_score={news_score} vs SHORT')
+                else:
+                    return ('ADD', f'score {relevant} favors {direction}, stage={stage}')
 
     # Reduce on strong counter signal
     if side == 'long' and short_score >= 65 and long_score <= 40:
@@ -1995,6 +2035,25 @@ def _cycle():
 
             # Sync position state
             _sync_position_state(cur, pos)
+
+            # RECONCILE auto-recovery (every 5th cycle ≈ 50-75s)
+            global _reconcile_cycle_count
+            _reconcile_cycle_count += 1
+            if _reconcile_cycle_count % 5 == 0:
+                try:
+                    import exchange_reader
+                    exch_data = exchange_reader.fetch_position()
+                    strat_data = exchange_reader.fetch_position_strat()
+                    recovered, rec_action, rec_detail = exchange_reader.check_and_recover_mismatch(
+                        cur, exch_data, strat_data, ttl_minutes=10)
+                    if recovered:
+                        _log(f'RECONCILE recovery: {rec_action} — {rec_detail}')
+                        _send_telegram_throttled(
+                            f'⚠ MISMATCH 자동복구: {rec_action}\n{rec_detail}',
+                            msg_type='warn')
+                except Exception as e:
+                    _log(f'RECONCILE check error: {e}')
+
             _prev_scores = ctx.get('scores', {})
             if snapshot and snapshot.get('atr_14') is not None:
                 _prev_scores['atr_14'] = snapshot.get('atr_14')

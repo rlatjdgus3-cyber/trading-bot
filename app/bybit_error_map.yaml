@@ -6,6 +6,9 @@ errors:
     severity: "MEDIUM"
     suggested_fix: "N분 후 자동 재시도 / 긴급 시 우회 가능"
     retry_policy: "wait_period"
+    action_code: PAUSE_TRADING
+    retry_after_sec: 60
+    max_retry: 3
 
   daily_trade_limit:
     pattern: "daily trade limit"
@@ -14,6 +17,9 @@ errors:
     severity: "MEDIUM"
     suggested_fix: "내일 자동 재설정 / 긴급 시 우회 가능"
     retry_policy: "wait_period"
+    action_code: PAUSE_TRADING
+    retry_after_sec: 60
+    max_retry: 3
 
   rate_limit_429:
     pattern: "Too many requests|429"
@@ -22,6 +28,9 @@ errors:
     severity: "MEDIUM"
     suggested_fix: "자동 재시도 (지수 백오프)"
     retry_policy: "exponential_backoff"
+    action_code: RETRY_WITH_BACKOFF
+    retry_after_sec: 10
+    max_retry: 5
 
   insufficient_balance:
     pattern: "Insufficient|margin not enough|130052"
@@ -30,6 +39,9 @@ errors:
     severity: "HIGH"
     suggested_fix: "주문 수량 축소 또는 기존 포지션 정리 필요"
     retry_policy: "reduce_qty"
+    action_code: REDUCE_SIZE
+    retry_after_sec: 0
+    max_retry: 1
 
   order_not_found:
     pattern: "Order not found|110001"
@@ -38,6 +50,9 @@ errors:
     severity: "LOW"
     suggested_fix: "이미 체결/취소된 주문 — 무시 가능"
     retry_policy: "none"
+    action_code: SKIP_AND_ALERT
+    retry_after_sec: 0
+    max_retry: 0
 
   position_mode_mismatch:
     pattern: "position mode|110025"
@@ -46,6 +61,9 @@ errors:
     severity: "HIGH"
     suggested_fix: "거래소 설정에서 단방향/양방향 모드 확인"
     retry_policy: "manual"
+    action_code: ESCALATE_TO_CLAUDE
+    retry_after_sec: 0
+    max_retry: 0
 
   min_order_qty:
     pattern: "qty not valid|110017|min.*qty"
@@ -54,6 +72,9 @@ errors:
     severity: "MEDIUM"
     suggested_fix: "주문 수량을 최소 단위 이상으로 조정"
     retry_policy: "adjust_qty"
+    action_code: REDUCE_SIZE
+    retry_after_sec: 0
+    max_retry: 1
 
   leverage_mismatch:
     pattern: "leverage|110043"
@@ -62,6 +83,9 @@ errors:
     severity: "MEDIUM"
     suggested_fix: "레버리지 재설정 후 재시도"
     retry_policy: "reconfigure"
+    action_code: RETRY_WITH_BACKOFF
+    retry_after_sec: 5
+    max_retry: 2
 
   api_key_invalid:
     pattern: "Invalid API|10003|api-key"
@@ -70,6 +94,9 @@ errors:
     severity: "CRITICAL"
     suggested_fix: "API 키 재발급 또는 IP 화이트리스트 확인"
     retry_policy: "manual"
+    action_code: ESCALATE_TO_CLAUDE
+    retry_after_sec: 0
+    max_retry: 0
 
   network_error:
     pattern: "ConnectionError|Timeout|ETIMEDOUT"
@@ -78,6 +105,9 @@ errors:
     severity: "MEDIUM"
     suggested_fix: "자동 재시도 (3회까지)"
     retry_policy: "retry_3x"
+    action_code: RETRY_WITH_BACKOFF
+    retry_after_sec: 5
+    max_retry: 3
 
   circuit_breaker:
     pattern: "circuit breaker"
@@ -86,6 +116,9 @@ errors:
     severity: "HIGH"
     suggested_fix: "5분 대기 후 자동 해제"
     retry_policy: "wait_period"
+    action_code: PAUSE_TRADING
+    retry_after_sec: 60
+    max_retry: 3
 
   daily_loss_limit:
     pattern: "daily loss limit"
@@ -94,3 +127,66 @@ errors:
     severity: "CRITICAL"
     suggested_fix: "당일 매매 중단 — 수동 확인 필요"
     retry_policy: "manual"
+    action_code: ESCALATE_TO_CLAUDE
+    retry_after_sec: 0
+    max_retry: 0
+
+  qty_exceeds_max:
+    code: 130006
+    pattern: "qty exceeds max|maximum quantity"
+    category: ORDER_PARAMS
+    korean_message: "주문 수량이 최대 한도를 초과했습니다"
+    severity: MEDIUM
+    suggested_fix: "수량을 최대 허용량 이하로 줄이세요"
+    retry_policy: reduce_qty
+    action_code: REDUCE_SIZE
+    retry_after_sec: 0
+    max_retry: 1
+
+  position_mode_mismatch_order:
+    code: 130021
+    pattern: "position mode|hedge mode|one-way"
+    category: CONFIG
+    korean_message: "포지션 모드 불일치 — 자동 보정 시도"
+    severity: HIGH
+    suggested_fix: "포지션 모드를 확인하고 재설정하세요"
+    retry_policy: reconfigure
+    action_code: RETRY_WITH_BACKOFF
+    retry_after_sec: 5
+    max_retry: 2
+
+  leverage_limit_exceeded:
+    code: 130074
+    pattern: "leverage|max leverage"
+    category: CONFIG
+    korean_message: "레버리지 한도 초과 — 자동 조정 시도"
+    severity: HIGH
+    suggested_fix: "레버리지를 허용 범위로 조정하세요"
+    retry_policy: reconfigure
+    action_code: RETRY_WITH_BACKOFF
+    retry_after_sec: 3
+    max_retry: 2
+
+  invalid_parameter:
+    code: 10002
+    pattern: "invalid param|invalid parameter"
+    category: ORDER_PARAMS
+    korean_message: "잘못된 파라미터 — 건너뜀"
+    severity: MEDIUM
+    suggested_fix: "주문 파라미터를 확인하세요"
+    retry_policy: none
+    action_code: SKIP_AND_ALERT
+    retry_after_sec: 0
+    max_retry: 0
+
+  borrow_amount_exceeded:
+    code: 170007
+    pattern: "borrow|borrowing|margin borrow"
+    category: BALANCE
+    korean_message: "차입 한도 초과 — 수량 축소 필요"
+    severity: HIGH
+    suggested_fix: "차입 가능 금액 내로 수량을 줄이세요"
+    retry_policy: reduce_qty
+    action_code: REDUCE_SIZE
+    retry_after_sec: 0
+    max_retry: 1

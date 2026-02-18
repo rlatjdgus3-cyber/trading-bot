@@ -14,7 +14,7 @@ sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[claude_gate]'
 
 # ── constants ────────────────────────────────────────────
-COOLDOWN_GENERAL_SEC = 1800       # 30 min
+COOLDOWN_GENERAL_SEC = 600        # 10 min
 COOLDOWN_EMERGENCY_SEC = 600      # 10 min
 COOLDOWN_ERROR_SEC = 3600         # 5xx → 1 hour block
 DAILY_CALL_LIMIT = 50
@@ -36,8 +36,19 @@ CALL_TYPE_EMERGENCY = CALL_TYPE_AUTO_EMERGENCY
 VALID_CALL_TYPES = {CALL_TYPE_NORMAL, CALL_TYPE_USER_MANUAL, CALL_TYPE_AUTO_EMERGENCY,
                     'AUTO', 'USER', 'EMERGENCY'}  # accept old names too
 EMERGENCY_SPAM_SEC = 60
-AUTO_EMERGENCY_DAILY_CAP = 30  # 폭주 방지 (AUTO_EMERGENCY)
+AUTO_EMERGENCY_DAILY_CAP = 100  # 폭주 방지 (AUTO_EMERGENCY)
 AUTO_EMERGENCY_DEDUP_SEC = 60  # 동일 이벤트 60초 dedup
+
+# ── 비용 기반 쓰로틀 ──
+DAILY_COST_WARN_USD = 3.0        # $3에서 경고
+DAILY_COST_THROTTLE_USD = 7.0    # $7에서 쿨다운 2배
+DAILY_COST_HARD_LIMIT_USD = 15.0 # $15에서 NORMAL 차단 (EMERGENCY/USER는 통과)
+# ── 시장 조건 기반 바이패스 임계값 ──
+MARKET_BYPASS_RET_5M_PCT = 1.0
+MARKET_BYPASS_RET_10M_PCT = 1.0
+MARKET_BYPASS_BAR_15M_CUMULATIVE = 1.5
+MARKET_BYPASS_LOSS_PCT = 2.0
+MARKET_BYPASS_LIQ_DIST_PCT = 3.0
 
 # Sonnet pricing (per token)
 INPUT_COST_PER_MTOK = 3.0         # $3 / 1M input tokens
@@ -59,9 +70,11 @@ GATE_COOLDOWNS = {
     'telegram': COOLDOWN_GENERAL_SEC,
     'openclaw': 120,                      # 2 min — control tower, permissive
     'event_trigger': 180,                 # 3 min — event cooldown (dedup is separate)
+    'chat_claude': 120,                   # 2 min — 사용자 대화 중 Claude 요청
+    'auto_apply': 300,                    # 5 min — 자동 매매 분석
 }
 
-EVENT_DEDUP_WINDOW_SEC = 300              # 5 min — event hash dedup
+EVENT_DEDUP_WINDOW_SEC = 60               # 1 min — event hash dedup
 
 
 def _normalize_call_type(call_type: str) -> str:
@@ -72,6 +85,54 @@ def _normalize_call_type(call_type: str) -> str:
         'EMERGENCY': CALL_TYPE_AUTO_EMERGENCY,
     }
     return mapping.get(call_type, call_type)
+
+
+def _check_market_conditions(context: dict) -> bool:
+    """시장 조건 기반 AUTO_EMERGENCY 자동 승격 체크.
+
+    조건 A: abs(ret_5m) >= 1.0% 또는 abs(ret_10m) >= 1.0%
+    조건 B: 15분봉 3연속 같은 방향 + 누적 >= 1.5%
+    조건 C: 포지션 손실 >= 2% 또는 청산거리 <= 3%
+    하나라도 충족 시 True → call_type을 AUTO_EMERGENCY로 승격.
+    """
+    if not context:
+        return False
+
+    returns = context.get('returns', {})
+
+    # 조건 A: 급격한 가격 변동
+    ret_5m = returns.get('ret_5m')
+    ret_10m = returns.get('ret_10m')
+    if ret_5m is not None and abs(ret_5m) >= MARKET_BYPASS_RET_5M_PCT:
+        _log(f'market_condition_A: ret_5m={ret_5m:.2f}% >= {MARKET_BYPASS_RET_5M_PCT}%')
+        return True
+    if ret_10m is not None and abs(ret_10m) >= MARKET_BYPASS_RET_10M_PCT:
+        _log(f'market_condition_A: ret_10m={ret_10m:.2f}% >= {MARKET_BYPASS_RET_10M_PCT}%')
+        return True
+
+    # 조건 B: 15분봉 3연속 방향성
+    bar_15m = context.get('bar_15m_returns', [])
+    if len(bar_15m) >= 3:
+        last3 = bar_15m[:3]
+        all_pos = all(b > 0 for b in last3)
+        all_neg = all(b < 0 for b in last3)
+        if all_pos or all_neg:
+            cumulative = abs(sum(last3))
+            if cumulative >= MARKET_BYPASS_BAR_15M_CUMULATIVE:
+                _log(f'market_condition_B: 3bar cumulative={cumulative:.2f}% >= {MARKET_BYPASS_BAR_15M_CUMULATIVE}%')
+                return True
+
+    # 조건 C: 포지션 위험
+    loss_pct = context.get('position_loss_pct')
+    if loss_pct is not None and abs(loss_pct) >= MARKET_BYPASS_LOSS_PCT:
+        _log(f'market_condition_C: loss={loss_pct:.2f}% >= {MARKET_BYPASS_LOSS_PCT}%')
+        return True
+    liq_dist = context.get('liq_dist_pct')
+    if liq_dist is not None and liq_dist <= MARKET_BYPASS_LIQ_DIST_PCT:
+        _log(f'market_condition_C: liq_dist={liq_dist:.2f}% <= {MARKET_BYPASS_LIQ_DIST_PCT}%')
+        return True
+
+    return False
 
 
 def _log(msg):
@@ -229,6 +290,12 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                 'gate': gate, 'budget_remaining': budget_remaining,
                 'call_type': call_type}
 
+    # Stage 3.5 pre-check: market condition auto-escalation
+    if call_type == CALL_TYPE_NORMAL and _check_market_conditions(context):
+        call_type = CALL_TYPE_AUTO_EMERGENCY
+        bypass = True
+        _log(f'MARKET CONDITION BYPASS: NORMAL -> AUTO_EMERGENCY')
+
     # Stage 3.5: Event hash dedup (NORMAL only; AUTO_EMERGENCY uses shorter dedup)
     if call_type == CALL_TYPE_NORMAL:
         event_hash = context.get('event_hash')
@@ -257,17 +324,7 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                         'gate': gate, 'budget_remaining': budget_remaining,
                         'call_type': call_type}
         elif call_type == CALL_TYPE_USER_MANUAL:
-            # USER_MANUAL: skip cooldown, 2min request cache dedup only
-            cooldowns = state.get('cooldowns', {})
-            dedup_key = f'user_dedup:{cooldown_key}'
-            last_call = cooldowns.get(dedup_key, 0)
-            if now - last_call < 120:  # 2min dedup
-                remaining = int(120 - (now - last_call))
-                _log(f'USER_MANUAL dedup: {dedup_key} ({remaining}s remaining)')
-                return {'allowed': False,
-                        'reason': f'USER_MANUAL dedup: {dedup_key} ({remaining}s remaining)',
-                        'gate': gate, 'budget_remaining': budget_remaining,
-                        'call_type': call_type}
+            # USER_MANUAL: 완전 무제한 (API 에러 블록만 유지)
             _log(f'cooldown SKIPPED (call_type=USER_MANUAL): {gate}:{cooldown_key}')
         elif call_type == CALL_TYPE_AUTO_EMERGENCY:
             # AUTO_EMERGENCY: 60-second spam guard only
@@ -297,13 +354,18 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
                     'reason': f'daily call limit ({daily_calls}/{DAILY_CALL_LIMIT})',
                     'gate': gate, 'budget_remaining': budget_remaining,
                     'call_type': call_type}
-        if daily_cost >= DAILY_COST_LIMIT:
-            _notify_budget_exceeded(state, f'daily cost limit (${daily_cost:.2f}/${DAILY_COST_LIMIT})')
+        # 3-tier cost throttle for NORMAL
+        if daily_cost >= DAILY_COST_HARD_LIMIT_USD:
+            _notify_budget_exceeded(state, f'daily cost hard limit (${daily_cost:.2f}/${DAILY_COST_HARD_LIMIT_USD})')
             _save_state(state)
             return {'allowed': False,
-                    'reason': f'daily cost limit (${daily_cost:.2f}/${DAILY_COST_LIMIT})',
+                    'reason': f'daily cost hard limit (${daily_cost:.2f}/${DAILY_COST_HARD_LIMIT_USD})',
                     'gate': gate, 'budget_remaining': budget_remaining,
                     'call_type': call_type}
+        if daily_cost >= DAILY_COST_THROTTLE_USD:
+            _log(f'COST THROTTLE: daily_cost=${daily_cost:.2f} >= ${DAILY_COST_THROTTLE_USD} — cooldowns doubled')
+        if daily_cost >= DAILY_COST_WARN_USD:
+            _log(f'COST WARNING: daily_cost=${daily_cost:.2f} >= ${DAILY_COST_WARN_USD}')
     elif call_type == CALL_TYPE_AUTO_EMERGENCY:
         # AUTO_EMERGENCY: bypass daily 50 cap, but has own 30/day cap
         emerg_daily = state.get('call_type_counts', {}).get(today, {}).get(CALL_TYPE_AUTO_EMERGENCY, 0)
