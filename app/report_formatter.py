@@ -193,6 +193,10 @@ def _debug_line(meta: dict = None) -> str:
         parts.append(f"latency={meta['latency']}ms")
     if meta.get('model'):
         parts.append(f"model={meta['model']}")
+    if meta.get('trace_id'):
+        parts.append(f"trace={meta['trace_id']}")
+    if meta.get('fallback_reason'):
+        parts.append(f"fallback={meta['fallback_reason']}")
     if not parts:
         return ''
     return '\n─\n' + ' | '.join(parts)
@@ -837,7 +841,7 @@ def format_news_analysis(macro_news, crypto_news, news_score,
 def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
                            scores, pos_state, details, news_items,
                            watch_kw, execute_status, ai_meta,
-                           claude_failed=False):
+                           claude_failed=False, exchange_block=None):
     """전략 보고 전체 포매팅."""
     parsed = parsed or {}
     scores = scores or {}
@@ -859,17 +863,35 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     lines = []
 
     # ── [📌 요약] ──
-    ps_side = (pos_state.get('side') or '').upper() if pos_state and pos_state.get('side') else 'NONE'
+    eb = exchange_block or {}
+    exch_pos = eb.get('exch_position', '')
+
+    if exch_pos and exch_pos not in ('UNKNOWN', ''):
+        ps_side = exch_pos
+    else:
+        ps_side = (pos_state.get('side') or '').upper() if pos_state and pos_state.get('side') else 'NONE'
 
     lines.append('[📌 요약]')
     lines.append(f'- 최종: {_kr_action_ctx(claude_action, ps_side)}')
 
-    if ps_side and ps_side != 'NONE':
-        qty = _safe_float(pos_state.get('total_qty'))
-        entry = _safe_float(pos_state.get('avg_entry_price'))
-        lines.append(f'- 포지션: {ps_side} {qty} BTC @ {_format_price(entry)}')
+    # Position: exchange-sourced (dual display)
+    if exch_pos and exch_pos not in ('UNKNOWN', ''):
+        if exch_pos == 'NONE':
+            lines.append('- 포지션(거래소): 없음')
+        else:
+            lines.append(f'- 포지션(거래소): {exch_pos} {eb.get("exch_qty", 0)} BTC')
+        strat_state = eb.get('strat_state', 'FLAT')
+        if strat_state not in ('FLAT', 'UNKNOWN'):
+            lines.append(f'- 전략의도(DB): {strat_state} {eb.get("strat_side", "")} qty={eb.get("strat_qty", 0)}')
     else:
-        lines.append('- 포지션: 없음')
+        # Fallback to DB position
+        db_side = (pos_state.get('side') or '').upper() if pos_state and pos_state.get('side') else 'NONE'
+        if db_side and db_side != 'NONE':
+            qty = _safe_float(pos_state.get('total_qty'))
+            entry = _safe_float(pos_state.get('avg_entry_price'))
+            lines.append(f'- 포지션(DB): {db_side} {qty} BTC @ {_format_price(entry)}')
+        else:
+            lines.append('- 포지션: 없음')
 
     # 참조신호: 디버그 모드에서만 표시
     if is_debug_on():
@@ -980,7 +1002,7 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
 # ── 전략 판단 알림 ───────────────────────────────────────
 
 def format_decision_alert(action, parsed, engine_action, scores, pos_state,
-                          claude_failed=False):
+                          claude_failed=False, exchange_block=None):
     """전략 판단 알림 포매팅."""
     parsed = parsed or {}
     scores = scores or {}
@@ -988,20 +1010,40 @@ def format_decision_alert(action, parsed, engine_action, scores, pos_state,
     action = action or 'HOLD'
 
     total = _safe_float(scores.get('total_score'))
-    side = (pos_state.get('side') or 'none').upper() if pos_state.get('side') else 'NONE'
-    qty = _safe_float(pos_state.get('total_qty'))
 
     lines = [
         f'[📋 전략 판단]',
-        f'- 최종: {_kr_action_ctx(action, side)}',
-        f'- 엔진: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}',
     ]
+
+    # Exchange-sourced position display
+    eb = exchange_block or {}
+    exch_pos = eb.get('exch_position', '')
+    if exch_pos:
+        if exch_pos == 'NONE':
+            lines.append(f'- 최종: {_kr_action_ctx(action, "NONE")}')
+        else:
+            lines.append(f'- 최종: {_kr_action_ctx(action, exch_pos)}')
+    else:
+        side = (pos_state.get('side') or 'none').upper() if pos_state.get('side') else 'NONE'
+        lines.append(f'- 최종: {_kr_action_ctx(action, side)}')
+
+    lines.append(f'- 엔진: {_kr_action(engine_action or "HOLD")} | 총점: {total:+.1f}')
     if claude_failed:
         lines.append('- Claude: SKIP(API fail)')
     else:
         lines.append(f'- 확신도: {parsed.get("confidence", "?")}')
         lines.append(f'- 근거: {_kr_reason_code(parsed.get("reason_code", "?"))}')
-    lines.append(f'- 포지션: {side} {qty} BTC')
+
+    # Position: exchange-sourced
+    if exch_pos and exch_pos != 'UNKNOWN':
+        if exch_pos == 'NONE':
+            lines.append('- 포지션(거래소): 없음')
+        else:
+            lines.append(f'- 포지션(거래소): {exch_pos} {eb.get("exch_qty", 0)} BTC')
+    else:
+        side = (pos_state.get('side') or 'none').upper() if pos_state.get('side') else 'NONE'
+        qty = _safe_float(pos_state.get('total_qty'))
+        lines.append(f'- 포지션(DB): {side} {qty} BTC')
     return '\n'.join(lines)
 
 
@@ -1416,6 +1458,49 @@ def _fill_reverse_open(direction='', avg_price=0, filled_qty=0,
     )
 
 
+# ── 포지션 블록 (거래소 기준 공통) ────────────────────────
+
+
+def format_report_position_block(exchange_block):
+    """Shared position block for all reports. Returns list of lines.
+
+    exchange_block: dict from exchange_reader.build_report_exchange_block()
+    """
+    if not exchange_block:
+        return ['현재포지션(거래소): 조회 실패']
+
+    eb = exchange_block
+    lines = []
+    exch_pos = eb.get('exch_position', 'UNKNOWN')
+    strat_state = eb.get('strat_state', 'FLAT')
+    strat_side = eb.get('strat_side', '')
+    recon = eb.get('reconcile', 'UNKNOWN')
+    entry_on = eb.get('entry_enabled')
+
+    # Trade switch OFF banner
+    if entry_on is False:
+        lines.append('⚠ 매매 중지 상태: trade_switch OFF → 신규 진입/추가매수 불가')
+        lines.append('')
+
+    # EXCHANGE position (the only "현재포지션")
+    if exch_pos == 'NONE':
+        lines.append('현재포지션(거래소): NONE')
+    elif exch_pos == 'UNKNOWN':
+        lines.append('현재포지션(거래소): 조회 실패')
+    else:
+        lines.append(f'현재포지션(거래소): {exch_pos} qty={eb.get("exch_qty", 0)}BTC')
+
+    # Strategy DB intent (clearly labeled)
+    if strat_state not in ('FLAT', 'UNKNOWN'):
+        lines.append(f'전략의도(DB): {strat_state} {strat_side} qty={eb.get("strat_qty", 0)} (체결 전/가상)')
+
+    # Reconcile
+    if recon == 'MISMATCH':
+        lines.append('⚠ RECONCILE: MISMATCH (거래소/DB 불일치)')
+
+    return lines
+
+
 # ── 뉴스→전략 통합 리포트 ────────────────────────────────
 
 def format_news_strategy_report(data, detail=False):
@@ -1514,22 +1599,60 @@ def format_news_strategy_report(data, detail=False):
                  f'레짐({regime:+.0f}×{regime_w}={regime_c:+.1f}) '
                  f'뉴스({news_s:+.0f}×{news_w_ax}={news_c:+.1f})')
 
-    # 엔진 권고 vs 현재 포지션
-    pos_side = pos.get('side', '')
-    pos_qty = pos.get('qty', pos.get('total_qty', 0))
-    rec_line = f'엔진권고: {side} stg{stage} (총점 {total:+.1f})'
-    if pos_side:
-        rec_line += f' | 현재포지션: {pos_side} {pos_qty}BTC'
-    else:
-        rec_line += ' | 현재포지션: 없음'
-    lines.append(rec_line)
+    # 엔진 권고 vs 현재 포지션 (거래소 기준)
+    eb = data.get('exchange_block', {})
+    exch_pos = eb.get('exch_position', 'UNKNOWN')
+    strat_state = eb.get('strat_state', 'FLAT')
+    strat_side = eb.get('strat_side', '')
+    recon = eb.get('reconcile', 'UNKNOWN')
+    entry_on = eb.get('entry_enabled')
 
-    # 게이트 정보: 권고와 포지션 불일치 시 사유 표시
+    # Trade switch OFF banner
+    if entry_on is False:
+        lines.append('⚠ 매매 중지 상태: trade_switch OFF → 신규 진입/추가매수 불가')
+        lines.append('')
+
+    # Engine recommendation
+    lines.append(f'엔진권고(분석): {side} stg{stage} (총점 {total:+.1f})')
+
+    # EXCHANGE position (the only "현재포지션")
+    if exch_pos == 'NONE':
+        lines.append('현재포지션(거래소): NONE')
+    elif exch_pos == 'UNKNOWN':
+        # Fallback to DB position if exchange unavailable
+        pos_side = pos.get('side', '')
+        pos_qty = pos.get('qty', pos.get('total_qty', 0))
+        if pos_side:
+            lines.append(f'현재포지션(거래소): 조회 실패 (DB참고: {pos_side} {pos_qty}BTC)')
+        else:
+            lines.append('현재포지션(거래소): 조회 실패')
+    else:
+        lines.append(f'현재포지션(거래소): {exch_pos} qty={eb.get("exch_qty", 0)}BTC')
+
+    # Strategy DB intent (clearly labeled)
+    if strat_state not in ('FLAT', 'UNKNOWN'):
+        lines.append(f'전략의도(DB): {strat_state} {strat_side} qty={eb.get("strat_qty", 0)} (체결 전/가상)')
+
+    # Reconcile
+    if recon == 'MISMATCH':
+        lines.append('⚠ RECONCILE: MISMATCH (거래소/DB 불일치)')
+
+    # Conditional recommendation text
     gate_info = scores.get('gate_info', '')
     if gate_info:
         lines.append(f'게이트: {gate_info}')
-    elif pos_side and pos_side != side:
-        lines.append(f'{side} 권고이나, 현재 {pos_side} 유지 중')
+    elif entry_on is False:
+        lines.append('  → 분석 결과만 표시 (매매 중지 중, 실행 안 됨)')
+    elif exch_pos not in ('NONE', 'UNKNOWN') and exch_pos.lower() != side.lower():
+        lines.append(f'엔진 권고: {side} | 실포지션(거래소): {exch_pos} — 방향 불일치')
+    elif exch_pos == 'NONE' and strat_state not in ('FLAT', 'UNKNOWN'):
+        lines.append(f'엔진 권고: {side} | 실포지션(거래소): NONE')
+        # Show wait reason if available
+        wait_reason = scores.get('wait_reason', eb.get('wait_reason', ''))
+        if wait_reason:
+            from response_envelope import WAIT_REASON_KR
+            wait_kr = WAIT_REASON_KR.get(wait_reason, wait_reason)
+            lines.append(f'  → {wait_kr}')
 
     # ── [📰 전략반영 거시 (Tier1-2)] ──
     lines.append('')
@@ -1768,3 +1891,80 @@ def _append_news_item(lines, idx, n):
                 label_str += f' (z={z:.1f})'
             parts.append(label_str)
         lines.append(f'   ▸ {" | ".join(parts)}')
+
+
+# ── ChatAgent / Auto-Apply 포매터 ──────────────────────────
+
+def format_auto_apply_result(decision):
+    """Claude 분석 → 매매 적용 결과 포맷."""
+    if not decision:
+        return ''
+    lines = ['─ Auto-Apply 결과 ─']
+    if decision.get('applied'):
+        eq_id = decision.get('execution_queue_id', '?')
+        lines.append(f'✅ 매매 적용됨 (eq_id={eq_id})')
+    else:
+        reason = decision.get('blocked_reason', '알 수 없음')
+        lines.append(f'⛔ 차단됨: {reason}')
+    return '\n'.join(lines)
+
+
+def format_arm_state(state):
+    """무장 상태 텔레그램 표시."""
+    if not state:
+        return '무장 상태: 조회 불가'
+    lines = ['─ 매매 무장 상태 ─']
+    armed = state.get('currently_armed', False)
+    lines.append(f'현재 상태: {"🟢 무장(ARMED)" if armed else "🔴 해제(DISARMED)"}')
+    current = state.get('current', {})
+    if armed and current:
+        lines.append(f'무장 시각: {current.get("armed_at", "?")}')
+        lines.append(f'만료 시각: {current.get("expires_at", "?")}')
+    recent = state.get('recent_entries', [])
+    if recent:
+        lines.append(f'최근 기록: {len(recent)}건')
+    return '\n'.join(lines)
+
+
+def format_claude_analysis(analysis):
+    """Claude 분석 결과 요약 + trade_action 표시."""
+    if not analysis:
+        return 'Claude 분석 결과 없음'
+    lines = ['─ Claude 분석 ─']
+
+    summary = analysis.get('summary', '')
+    if summary:
+        lines.append(f'📊 {summary}')
+
+    risk_notes = analysis.get('risk_notes', '')
+    if risk_notes:
+        lines.append(f'⚠️ 리스크: {risk_notes}')
+
+    ta = analysis.get('trade_action', {})
+    if ta and ta.get('should_trade'):
+        side = ta.get('side', '?')
+        qty = ta.get('qty_usd', 0)
+        lev = ta.get('leverage', 1)
+        sl = ta.get('stop_loss_pct', 0)
+        tp = ta.get('take_profit_pct', 0)
+        conf = ta.get('confidence', 0)
+        reason = ta.get('reason', '')
+        lines.append(f'💹 매매 제안: {side} ${qty} (x{lev})')
+        lines.append(f'   SL={sl}% | TP={tp}% | 확신={conf:.0%}')
+        if reason:
+            lines.append(f'   근거: {reason}')
+    else:
+        lines.append('💤 매매 제안: 없음 (관망)')
+
+    provider = analysis.get('provider', '')
+    model = analysis.get('model', '')
+    cost = analysis.get('estimated_cost_usd', 0)
+    if provider:
+        info_parts = [f'provider={provider}']
+        if model:
+            info_parts.append(f'model={model}')
+        if cost:
+            info_parts.append(f'cost=${cost:.4f}')
+        lines.append(f'({" | ".join(info_parts)})')
+
+    return '\n'.join(lines)

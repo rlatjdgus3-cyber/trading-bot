@@ -48,7 +48,7 @@ def _load_safety_limits(cur):
             'capital_limit_usdt': 900,
             'max_daily_trades': 20,
             'max_hourly_trades': 15,
-            'daily_loss_limit_usdt': -150,
+            'daily_loss_limit_usdt': -45,
             'max_pyramid_stages': 7,
             'add_score_threshold': 65,
             'trade_budget_pct': 70,
@@ -62,7 +62,7 @@ def _load_safety_limits(cur):
         'capital_limit_usdt': float(row[0]) if row[0] is not None else 900,
         'max_daily_trades': int(row[1]) if row[1] is not None else 20,
         'max_hourly_trades': int(row[2]) if row[2] is not None else 15,
-        'daily_loss_limit_usdt': float(row[3]) if row[3] is not None else -150,
+        'daily_loss_limit_usdt': float(row[3]) if row[3] is not None else -45,
         'max_pyramid_stages': int(row[4]) if row[4] is not None else 7,
         'add_size_min_pct': float(row[5]) if row[5] is not None else 5,
         'add_size_max_pct': float(row[6]) if row[6] is not None else 10,
@@ -78,17 +78,19 @@ def _load_safety_limits(cur):
 
 def check_service_health():
     '''Check service health state. Returns (can_open, reason).
-    DOWN 서비스 > 0 또는 UNKNOWN 필수 서비스 >= 2 → 신규 포지션 차단.
+    DOWN >= 1 → 차단. UNKNOWN → WARN 로그만 (차단 안 함).
+    Uses dual-source (systemctl --all + heartbeat DB) via get_service_health_snapshot().
     '''
     try:
-        from local_query_executor import get_service_health_summary
-        health = get_service_health_summary()
+        from local_query_executor import get_service_health_snapshot
+        health = get_service_health_snapshot()
         req_down = health.get('required_down', [])
         req_unknown = health.get('required_unknown', [])
         if req_down:
             return (False, f'필수 서비스 중지: {", ".join(req_down)}')
-        if len(req_unknown) >= 2:
-            return (False, f'필수 서비스 미확인 {len(req_unknown)}개: {", ".join(req_unknown)}')
+        if req_unknown:
+            _log(f'WARN: 필수 서비스 미확인 {len(req_unknown)}개: {", ".join(req_unknown)} (차단 안 함)')
+            return (True, f'WARN: 필수 서비스 미확인 {len(req_unknown)}개: {", ".join(req_unknown)}')
         return (True, 'ok')
     except Exception as e:
         _log(f'check_service_health error: {e}')
@@ -99,6 +101,10 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
     '''Run all safety checks. Returns (ok, reason).
     When emergency=True or manual_override=True, daily/hourly trade limits are BYPASSED.
     Circuit breaker, daily loss limit, and 70% exposure cap remain active.
+
+    INVARIANT: 뉴스는 절대 gate를 차단하지 않음.
+    뉴스 점수(news_event_w=0.05)는 스코어 가중치에 보조 역할만 하며,
+    이 함수에서 news 테이블을 참조하거나 뉴스를 이유로 차단하는 로직은 없음.
     '''
     if limits is None:
         limits = _load_safety_limits(cur)
@@ -154,7 +160,56 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
     if daily_pnl <= limits['daily_loss_limit_usdt']:
         return (False, f"daily loss limit ({daily_pnl:.1f} <= {limits['daily_loss_limit_usdt']})")
 
+    # Consecutive stop-loss auto-halt (always active)
+    cur.execute("""
+        SELECT close_reason FROM execution_log
+        WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'
+          AND close_reason IS NOT NULL
+        ORDER BY ts DESC LIMIT 3;
+    """)
+    recent_reasons = [r[0] for r in cur.fetchall()]
+    consec_stops = 0
+    for r in recent_reasons:
+        if 'stop' in r.lower():
+            consec_stops += 1
+        else:
+            break
+    if consec_stops >= 3:
+        try:
+            cur.execute("""UPDATE trade_switch SET enabled = false
+                           WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);""")
+        except Exception as e:
+            _log(f'CONSECUTIVE STOPS: trade_switch UPDATE failed: {e}')
+        _log(f'CONSECUTIVE STOPS AUTO-HALT: {consec_stops} stops today → trade_switch OFF')
+        return (False, f"consecutive stop-loss auto-halt ({consec_stops} stops)")
+
     return (True, 'all checks passed')
+
+
+def get_block_reason_code(cur, limits=None):
+    """Map run_all_checks() result to a structured BLOCK_REASON_CODE.
+    Returns (code, korean_description) tuple.
+    Does NOT change run_all_checks() signature.
+    """
+    ok, reason = run_all_checks(cur, limits=limits)
+    if ok:
+        return ('NONE', '차단 없음 — 정상')
+    r = reason.lower()
+    if '서비스' in r or 'service' in r:
+        return ('SERVICE_STALE', '필수 서비스 이상 — 주문 발행 금지')
+    if 'daily_loss' in r or '손실' in r or 'daily loss' in r:
+        return ('DAILY_LOSS_LIMIT', '일일 손실 한도 도달 — 매매 자동 중지')
+    if 'circuit' in r:
+        return ('CIRCUIT_BREAKER', '서킷 브레이커 발동 — 주문 과다')
+    if 'daily trade' in r:
+        return ('RISK_LIMIT', '일일 거래 횟수 초과 — 주문 발행 금지')
+    if 'hourly trade' in r:
+        return ('RISK_LIMIT', '시간당 거래 횟수 초과 — 주문 발행 금지')
+    if 'consecutive' in r or 'stop' in r:
+        return ('DAILY_LOSS_LIMIT', '연속 손절 자동 중지')
+    if 'budget' in r or 'exposure' in r or 'cap' in r:
+        return ('CAP_LIMIT', '자본 노출 한도 초과 — 추가 진입 불가')
+    return ('UNKNOWN', f'차단 사유: {reason}')
 
 
 def check_total_exposure(cur, add_usdt, limits=None):

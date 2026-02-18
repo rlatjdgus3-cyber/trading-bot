@@ -227,7 +227,7 @@ def ensure_safety_limits(cur):
             capital_limit_usdt    NUMERIC NOT NULL DEFAULT 900,
             max_daily_trades      INTEGER NOT NULL DEFAULT 20,
             max_hourly_trades     INTEGER NOT NULL DEFAULT 8,
-            daily_loss_limit_usdt NUMERIC NOT NULL DEFAULT -150,
+            daily_loss_limit_usdt NUMERIC NOT NULL DEFAULT -45,
             max_pyramid_stages    INTEGER NOT NULL DEFAULT 3,
             add_size_min_pct      NUMERIC NOT NULL DEFAULT 5,
             add_size_max_pct      NUMERIC NOT NULL DEFAULT 10,
@@ -1058,29 +1058,38 @@ def cleanup_old_data(cur):
     '''Retention policy: prune old data from large tables.
 
     - pm_decision_log: keep 90 days
-    - market_ohlcv: keep 60 days
     - score_history: keep 60 days
     - event_trigger_log: keep 30 days
     - claude_call_log: keep 60 days
 
+    NOTE: market_ohlcv and candles are EXCLUDED from cleanup.
+    Historical price data is a core asset for backtest/indicators.
     Safe to call repeatedly. Uses DELETE with LIMIT to avoid long locks.
     '''
     policies = [
         ('pm_decision_log', 'ts', 90),
-        ('market_ohlcv', 'ts', 60),
+        # market_ohlcv removed — historical price data preserved for backtest
         ('score_history', 'ts', 60),
         ('event_trigger_log', 'ts', 30),
         ('claude_call_log', 'ts', 60),
     ]
     for table, ts_col, days in policies:
         try:
-            cur.execute(f"""
-                DELETE FROM {table}
-                WHERE {ts_col} < now() - interval '{days} days';
-            """)
-            deleted = cur.rowcount
-            if deleted > 0:
-                _log(f'cleanup {table}: deleted {deleted} rows (>{days}d)')
+            total_deleted = 0
+            while True:
+                cur.execute(f"""
+                    DELETE FROM {table} WHERE ctid IN (
+                        SELECT ctid FROM {table}
+                        WHERE {ts_col} < now() - interval '{days} days'
+                        LIMIT 5000
+                    );
+                """)
+                batch_del = cur.rowcount
+                total_deleted += batch_del
+                if batch_del < 5000:
+                    break
+            if total_deleted > 0:
+                _log(f'cleanup {table}: deleted {total_deleted} rows (>{days}d)')
         except Exception as e:
             _log(f'cleanup {table} skip: {e}')
 
@@ -1225,6 +1234,259 @@ def ensure_macro_trace_qqq_columns(cur):
     _log('ensure_macro_trace_qqq_columns done')
 
 
+def ensure_backfill_job_runs(cur):
+    """backfill_job_runs 테이블 — 백필 작업 이력 추적."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.backfill_job_runs (
+            id           BIGSERIAL PRIMARY KEY,
+            job_name     TEXT NOT NULL,
+            started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            finished_at  TIMESTAMPTZ,
+            status       TEXT NOT NULL DEFAULT 'RUNNING',
+            inserted     INTEGER NOT NULL DEFAULT 0,
+            updated      INTEGER NOT NULL DEFAULT 0,
+            failed       INTEGER NOT NULL DEFAULT 0,
+            last_cursor  TEXT,
+            error        TEXT,
+            metadata     JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_bjr_job ON backfill_job_runs(job_name, started_at DESC);')
+    _log('ensure_backfill_job_runs done')
+
+
+def ensure_backfill_job_ack_columns(cur):
+    """backfill_job_runs에 ack 컬럼 추가 — FAILED job acknowledge 지원."""
+    cur.execute("ALTER TABLE backfill_job_runs ADD COLUMN IF NOT EXISTS acked_at TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE backfill_job_runs ADD COLUMN IF NOT EXISTS acked_by TEXT;")
+    _log('ensure_backfill_job_ack_columns done')
+
+
+def ensure_once_lock_ttl(cur):
+    """once_lock에 expires_at 컬럼 추가 — TTL 기반 자동 만료."""
+    cur.execute("ALTER TABLE live_order_once_lock ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;")
+    _log('ensure_once_lock_ttl done')
+
+
+def ensure_price_events(cur):
+    """price_events 테이블 — 가격 이벤트 감지 결과."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.price_events (
+            id               BIGSERIAL PRIMARY KEY,
+            event_id         TEXT NOT NULL UNIQUE,
+            symbol           TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            start_ts         TIMESTAMPTZ NOT NULL,
+            end_ts           TIMESTAMPTZ,
+            direction        SMALLINT NOT NULL,
+            move_pct         NUMERIC NOT NULL,
+            trigger_type     TEXT NOT NULL,
+            max_runup        NUMERIC,
+            max_drawdown     NUMERIC,
+            vol_spike_z      NUMERIC,
+            atr_z            NUMERIC,
+            regime_context   TEXT,
+            btc_price_at     NUMERIC,
+            ret_1h           NUMERIC,
+            ret_4h           NUMERIC,
+            ret_24h          NUMERIC,
+            metadata         JSONB DEFAULT '{}'::jsonb,
+            created_at       TIMESTAMPTZ DEFAULT now()
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_pe_start_ts ON price_events(start_ts DESC);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_pe_trigger ON price_events(trigger_type);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_pe_direction ON price_events(direction);')
+    _log('ensure_price_events done')
+
+
+def ensure_event_news_link(cur):
+    """event_news_link 테이블 — price_events↔news 연결."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.event_news_link (
+            id               BIGSERIAL PRIMARY KEY,
+            event_id         TEXT NOT NULL,
+            news_id          BIGINT NOT NULL,
+            time_lag_minutes NUMERIC NOT NULL,
+            match_score      NUMERIC DEFAULT 0,
+            reason           TEXT,
+            UNIQUE(event_id, news_id)
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_enl_event ON event_news_link(event_id);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_enl_news ON event_news_link(news_id);')
+    _log('ensure_event_news_link done')
+
+
+def ensure_alert_dedup_state(cur):
+    '''DB-based cross-process alert dedup state.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.alert_dedup_state (
+            key              TEXT PRIMARY KEY,
+            first_seen_ts    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_seen_ts     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_sent_ts     TIMESTAMPTZ,
+            suppressed_count INTEGER NOT NULL DEFAULT 0,
+            last_payload_hash TEXT,
+            prev_state       TEXT
+        );
+    """)
+    _log('ensure_alert_dedup_state done')
+
+
+def ensure_candles_retention_policy(cur):
+    """Index for efficient 1m candle pruning."""
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_candles_tf_ts
+        ON candles(tf, ts);
+    """)
+    _log('ensure_candles_retention_policy done')
+
+
+def ensure_news_reaction_direction_columns(cur):
+    """Add price_source_tf, dir_30m, dir_24h columns to news_market_reaction."""
+    for col, dtype in (
+        ('price_source_tf', 'TEXT'),
+        ('dir_30m', 'TEXT'),
+        ('dir_24h', 'TEXT'),
+    ):
+        cur.execute(f"""
+            ALTER TABLE news_market_reaction
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_news_reaction_direction_columns done')
+
+
+def ensure_news_price_path(cur):
+    """news_price_path 테이블 — 뉴스 후 24h 가격 경로 분석."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.news_price_path (
+            id               BIGSERIAL PRIMARY KEY,
+            news_id          BIGINT NOT NULL,
+            ts_news          TIMESTAMPTZ NOT NULL,
+            btc_price_at     NUMERIC,
+            price_source_tf  TEXT,
+            max_drawdown_24h NUMERIC,
+            max_runup_24h    NUMERIC,
+            drawdown_ts      TIMESTAMPTZ,
+            runup_ts         TIMESTAMPTZ,
+            recovery_minutes INTEGER,
+            end_price_24h    NUMERIC,
+            end_ret_24h      NUMERIC,
+            end_state_24h    TEXT,
+            path_shape       TEXT,
+            computed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(news_id)
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_npp_ts ON news_price_path(ts_news DESC);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_npp_end_state ON news_price_path(end_state_24h);')
+    _log('ensure_news_price_path done')
+
+
+def ensure_news_price_path_v2(cur):
+    """news_price_path v2 — 7분류 path_class + 방향 컬럼 추가."""
+    cur.execute("ALTER TABLE news_price_path ADD COLUMN IF NOT EXISTS path_class TEXT;")
+    cur.execute("ALTER TABLE news_price_path ADD COLUMN IF NOT EXISTS initial_move_dir TEXT;")
+    cur.execute("ALTER TABLE news_price_path ADD COLUMN IF NOT EXISTS follow_through_dir TEXT;")
+    cur.execute("ALTER TABLE news_price_path ADD COLUMN IF NOT EXISTS recovered_flag BOOLEAN;")
+    cur.execute("ALTER TABLE news_price_path ADD COLUMN IF NOT EXISTS further_drop_flag BOOLEAN;")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_npp_path_class ON news_price_path(path_class);")
+    _log('ensure_news_price_path_v2 done')
+
+
+def ensure_chat_memory(cur):
+    """대화 기록 테이블 — GPT ChatAgent 대화 히스토리."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.chat_memory (
+            id        BIGSERIAL PRIMARY KEY,
+            chat_id   BIGINT NOT NULL,
+            role      TEXT NOT NULL,
+            content   TEXT NOT NULL,
+            tool_name TEXT,
+            metadata  JSONB DEFAULT '{}',
+            ts        TIMESTAMPTZ DEFAULT now()
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_chatmem_chat_ts ON chat_memory(chat_id, ts DESC);')
+    _log('ensure_chat_memory done')
+
+
+def ensure_trade_arm_state(cur):
+    """무장 상태 테이블 — 매매 활성화 전 확인."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.trade_arm_state (
+            id          BIGSERIAL PRIMARY KEY,
+            chat_id     BIGINT NOT NULL,
+            armed       BOOLEAN NOT NULL DEFAULT false,
+            armed_at    TIMESTAMPTZ,
+            expires_at  TIMESTAMPTZ,
+            disarmed_at TIMESTAMPTZ
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_arm_chat ON trade_arm_state(chat_id);')
+    _log('ensure_trade_arm_state done')
+
+
+def ensure_auto_apply_config(cur):
+    """AUTO APPLY 설정 + 리스크 정책."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.auto_apply_config (
+            id                       BIGSERIAL PRIMARY KEY,
+            auto_apply_on_claude     BOOLEAN DEFAULT false,
+            auto_apply_on_emergency  BOOLEAN DEFAULT false,
+            max_notional_usdt        NUMERIC DEFAULT 500,
+            max_leverage             INTEGER DEFAULT 5,
+            sl_min_pct               NUMERIC DEFAULT 1.0,
+            sl_max_pct               NUMERIC DEFAULT 4.0,
+            cooldown_sec             INTEGER DEFAULT 300,
+            updated_at               TIMESTAMPTZ DEFAULT now()
+        );
+    """)
+    cur.execute('SELECT count(*) FROM public.auto_apply_config;')
+    cnt = cur.fetchone()[0]
+    if cnt == 0:
+        cur.execute('INSERT INTO public.auto_apply_config DEFAULT VALUES;')
+    _log('ensure_auto_apply_config done')
+
+
+def ensure_claude_trade_decision_log(cur):
+    """Claude 매매 결정 감사 로그."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.claude_trade_decision_log (
+            id                  BIGSERIAL PRIMARY KEY,
+            ts                  TIMESTAMPTZ DEFAULT now(),
+            trace_id            TEXT,
+            provider            TEXT NOT NULL,
+            model               TEXT,
+            trade_action        JSONB DEFAULT '{}',
+            applied             BOOLEAN DEFAULT false,
+            blocked_reason      TEXT,
+            execution_queue_id  BIGINT,
+            arm_state           JSONB,
+            risk_check_result   JSONB
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_ctdl_ts ON claude_trade_decision_log(ts DESC);')
+    _log('ensure_claude_trade_decision_log done')
+
+
+def ensure_news_market_reaction_extended(cur):
+    """news_market_reaction 확장 컬럼 추가 — ret_30m, ret_2h, vol 등."""
+    for col, dtype in (('ret_30m', 'NUMERIC'),
+                       ('ret_2h', 'NUMERIC'),
+                       ('vol_30m', 'NUMERIC'),
+                       ('vol_2h', 'NUMERIC'),
+                       ('vol_24h', 'NUMERIC'),
+                       ('direction_2h', 'TEXT'),
+                       ('abs_move_2h', 'NUMERIC'),
+                       ('status', "TEXT DEFAULT 'computed'")):
+        cur.execute(f"""
+            ALTER TABLE news_market_reaction
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_news_market_reaction_extended done')
+
+
 def ensure_news_impact_stats_extended(cur):
     """news_impact_stats 확장 컬럼 추가."""
     cur.execute("""
@@ -1333,6 +1595,37 @@ def run_all():
             ensure_macro_trace_qqq_columns(cur)
             # Phase 5: News impact stats extended columns
             ensure_news_impact_stats_extended(cur)
+            # Phase 6: Backfill infrastructure tables
+            ensure_backfill_job_runs(cur)
+            ensure_backfill_job_ack_columns(cur)
+            ensure_price_events(cur)
+            ensure_event_news_link(cur)
+            ensure_news_market_reaction_extended(cur)
+            # Alert dedup state (cross-process)
+            ensure_alert_dedup_state(cur)
+            # Hybrid data retention + news path analysis
+            ensure_candles_retention_policy(cur)
+            ensure_news_reaction_direction_columns(cur)
+            ensure_news_price_path(cur)
+            ensure_news_price_path_v2(cur)
+            # ChatAgent + Auto-Apply tables
+            ensure_chat_memory(cur)
+            ensure_trade_arm_state(cur)
+            ensure_auto_apply_config(cur)
+            ensure_claude_trade_decision_log(cur)
+            ensure_candles_data_source(cur)
+            # Data integrity audit table (gap detection)
+            ensure_data_integrity_audit(cur)
+            # News v2 filter: allow_storage + allow_trading columns
+            ensure_news_allow_columns(cur)
+            # Once lock TTL column
+            ensure_once_lock_ttl(cur)
+            # Daily loss limit -150 → -45 (900 USDT * 5%)
+            ensure_safety_limits_daily_loss_45(cur)
+            # Position state v2: order_state + planned/filled tracking
+            ensure_position_state_v2_columns(cur)
+            # News trading_impact_weight column
+            ensure_news_trading_impact_weight(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -1344,6 +1637,74 @@ def run_all():
                 conn.close()
             except Exception:
                 pass
+
+
+def ensure_position_state_v2_columns(cur):
+    """Add order_state + planned/filled tracking columns to position_state."""
+    for col, dtype in (
+        ('order_state', "TEXT DEFAULT 'NONE'"),
+        ('planned_qty', 'NUMERIC DEFAULT 0'),
+        ('filled_qty', 'NUMERIC DEFAULT 0'),
+        ('planned_usdt', 'NUMERIC DEFAULT 0'),
+        ('sent_usdt', 'NUMERIC DEFAULT 0'),
+        ('filled_usdt', 'NUMERIC DEFAULT 0'),
+        ('last_order_id', 'TEXT'),
+        ('last_order_ts', 'TIMESTAMPTZ'),
+        ('state_changed_at', 'TIMESTAMPTZ DEFAULT now()'),
+    ):
+        cur.execute(f"""
+            ALTER TABLE position_state
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_position_state_v2_columns done')
+
+
+def ensure_news_trading_impact_weight(cur):
+    """Add trading_impact_weight column to news table."""
+    cur.execute("""
+        ALTER TABLE news ADD COLUMN IF NOT EXISTS trading_impact_weight NUMERIC DEFAULT 0;
+    """)
+    _log('ensure_news_trading_impact_weight done')
+
+
+def ensure_candles_data_source(cur):
+    """Add data_source column to candles + market_ohlcv for multi-source tracking."""
+    cur.execute("ALTER TABLE candles ADD COLUMN IF NOT EXISTS data_source TEXT DEFAULT 'bybit';")
+    cur.execute("ALTER TABLE market_ohlcv ADD COLUMN IF NOT EXISTS data_source TEXT DEFAULT 'bybit';")
+    _log('ensure_candles_data_source done')
+
+
+def ensure_news_allow_columns(cur):
+    """Add allow_storage, allow_trading boolean columns to news table (v2 filter)."""
+    cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS allow_storage BOOLEAN;")
+    cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS allow_trading BOOLEAN;")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_news_allow_trading ON news(allow_trading) WHERE allow_trading = true;")
+    _log('ensure_news_allow_columns done')
+
+
+def ensure_safety_limits_daily_loss_45(cur):
+    """Update daily_loss_limit_usdt from -150 to -45 (900 USDT * 5%)."""
+    cur.execute("""
+        UPDATE safety_limits SET daily_loss_limit_usdt = -45
+        WHERE daily_loss_limit_usdt = -150;
+    """)
+    _log('ensure_safety_limits_daily_loss_45 done')
+
+
+def ensure_data_integrity_audit(cur):
+    """data_integrity_audit table — monthly data coverage tracking + gap detection."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.data_integrity_audit (
+            id          BIGSERIAL PRIMARY KEY,
+            table_name  TEXT NOT NULL,
+            month       TEXT NOT NULL,
+            row_count   BIGINT NOT NULL DEFAULT 0,
+            gap_flag    BOOLEAN NOT NULL DEFAULT false,
+            checked_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (table_name, month)
+        );
+    """)
+    _log('ensure_data_integrity_audit done')
 
 
 if __name__ == '__main__':

@@ -120,16 +120,51 @@ HELP_TEXT = (
     "🔧 슬래시 명령\n"
     "  /help — 도움말 표시\n"
     "  /status — 전체 시스템 현황\n"
-    "  /health — 서비스 상태 점검\n"
+    "  /health — 서비스 상태 (OK/DOWN/UNKNOWN)\n"
     "  /score — 스코어 엔진 현황\n"
     "  /db_health — DB 연결 상태 확인\n"
-    "  /test_report — 종합 테스트 리포트\n"
+    "  /test_report — 종합 테스트 보고(적용 금지)\n"
     "  /audit — 감사 리포트\n"
     "  /close_all — 전포지션 수동 청산\n"
     "  /claude_audit — Claude 사용량·비용 조회\n"
     "  /force — 즉시 전략 분석 실행\n"
     "  /detail — 상세 뉴스→전략 리포트\n"
-    "  /debug — 디버그 모드 토글\n"
+    "  /trade on|off — 매매 스위치 ON/OFF\n"
+    "  /trade flatten — 포지션 청산 + 스위치 OFF\n"
+    "  /trade status — 매매 종합 상태\n"
+    "  /position — 거래소 실시간 포지션 (Bybit)\n"
+    "  /account — 거래소 잔고 (Bybit)\n"
+    "  /orders — 미체결 주문 (Bybit)\n"
+    "  /position_strat — 전략 DB 포지션\n"
+    "  /risk_config — 안전장치 설정 조회\n"
+    "  /snapshot — 종합 현황 카드\n"
+    "  /fact — 4섹션 팩트 요약 (거래소+주문+전략+실행상태)\n"
+    "  /debug — 디버그 서브커맨드 메뉴\n"
+    "    /debug version — 빌드/버전/환경\n"
+    "    /debug router — 라우팅 디버그\n"
+    "    /debug health — 서비스 상태 (상세)\n"
+    "    /debug db_coverage — DB 월별 커버리지\n"
+    "    /debug news_sample — 뉴스 샘플\n"
+    "    /debug news_reaction_sample — 뉴스 반응\n"
+    "    /debug news_filter_stats — 뉴스 필터 통계\n"
+    "    /debug backfill_status — 백필 현황\n"
+    "    /debug backfill_dryrun — 백필 잔여량\n"
+    "    /debug backfill_enable — 백필 허용/차단\n"
+    "    /debug backfill_start — 백필 시작\n"
+    "    /debug backfill_pause — 백필 일시정지\n"
+    "    /debug backfill_resume — 백필 재개\n"
+    "    /debug backfill_stop — 백필 종료\n"
+    "    /debug news_gap_diagnosis — 뉴스 갭 진단\n"
+    "    /debug storage — DB 스토리지/테이블 크기\n"
+    "    /debug system_stability — 시스템 안정성 점수\n"
+    "    /debug state — 시스템 상태 변수\n\n"
+    "📋 자연어 데이터 조회\n"
+    "  \"서비스 상태 점검\" — OK/DOWN/UNKNOWN 분리\n"
+    "  \"전략 반영 뉴스 TOP5\" — tier/점수/반응\n"
+    "  \"무시된 뉴스 10개\" — 무시 사유 포함\n"
+    "  \"DB 커버리지\" — 월별 건수 + UNKNOWN 비율\n"
+    "  \"보조지표 근거\" — price_events/유사이벤트\n"
+    "  \"테스트 종합 보고\" — 이벤트/체결/오판 분석\n"
 )
 
 # ── news importance check & AI news advisory ─────────────
@@ -1490,14 +1525,24 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                 # final_action 실행을 위해 parsed에 action 덮어쓰기
                 exec_parsed = dict(parsed)
                 exec_parsed['action'] = final_action
-                (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
-                if not auto_ok:
-                    execute_status = f'BLOCKED ({auto_reason})'
+                # EXIT actions bypass trade_switch check
+                EXIT_ACTIONS = {'CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE'}
+                if final_action not in EXIT_ACTIONS:
+                    (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
+                    if not auto_ok:
+                        execute_status = f'BLOCKED ({auto_reason})'
+                    else:
+                        eq_id = _enqueue_claude_action(cur, exec_parsed, pos_state, scores, snapshot)
+                        if eq_id:
+                            execute_status = f'YES (eq_id={eq_id})'
+                            _send_enqueue_alert(eq_id, final_action, exec_parsed, pos_state)
+                        else:
+                            execute_status = f'BLOCKED (safety)'
                 else:
+                    # EXIT actions bypass trade_switch
                     eq_id = _enqueue_claude_action(cur, exec_parsed, pos_state, scores, snapshot)
                     if eq_id:
                         execute_status = f'YES (eq_id={eq_id})'
-                        # [ENQUEUE] Telegram alert
                         _send_enqueue_alert(eq_id, final_action, exec_parsed, pos_state)
                     else:
                         execute_status = f'BLOCKED (safety)'
@@ -1657,6 +1702,7 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
         if no_fallback:
             reason = result.get('gate_reason', 'unknown')
             _log(f"Claude gate denied ({reason}) — call_type={call_type}, no fallback")
+            _last_debug_state['last_llm_error'] = f'claude_denied: {reason}'
             return (f'⚠️ Claude 게이트 거부 (GPT fallback 차단): {reason}', {
                 'model': 'claude(denied)',
                 'model_provider': 'anthropic(denied)',
@@ -1669,6 +1715,7 @@ def _call_claude_advisory(prompt: str, gate: str = 'telegram',
         if gate in ('pre_action', 'event_trigger', 'emergency'):
             reason = result.get('gate_reason', 'unknown')
             _log(f"CLAUDE UNAVAILABLE – STRATEGY ABORTED ({reason})")
+            _last_debug_state['last_llm_error'] = f'claude_strategy_abort: {reason}'
             return ('⚠️ Claude 미응답 — 전략 중단', {
                 'model': 'claude(denied)',
                 'model_provider': 'anthropic(denied)',
@@ -1826,14 +1873,409 @@ def _handle_directive_intent(intent, text):
             pass
 
 
-# ── REPORT_ONLY keyword pre-routing ────────────────────────
-# P0-1: "보고해/리포트/정리/종합" → 반드시 REPORT 경로.
-# GPT가 COMMAND/run_audit 로 오분류하는 치명적 버그 방지.
+# ── Deterministic command routing (runs BEFORE GPT) ──────────
+# Priority keyword patterns for specific handlers. Each entry:
+#   (handler_name, [keyword_patterns], description)
+# First match wins. Checked before REPORT_ONLY and GPT router.
+import hashlib as _hashlib
+
+DETERMINISTIC_ROUTES = [
+    # HEALTH: service status — only explicit Korean phrases
+    ('HEALTH', [
+        '서비스 상태', '헬스체크', '서비스 점검', '서비스점검',
+    ]),
+    # TEST_REPORT: test summary — only explicit report requests
+    ('TEST_REPORT', [
+        '테스트 종합 보고', '테스트 보고', '테스트 종합',
+    ]),
+    # NEWS_APPLIED: applied news top N — only explicit Korean phrases
+    ('NEWS_APPLIED', [
+        '전략 반영 뉴스', '전략반영 뉴스', '반영된 뉴스',
+        '채택된 뉴스', '적용된 뉴스',
+    ]),
+    # NEWS_IGNORED: ignored news
+    ('NEWS_IGNORED', [
+        '무시된 뉴스', '제외된 뉴스', '무시 사유', '무시사유',
+        '걸러진 뉴스', '제외 뉴스', '안 쓴 뉴스',
+    ]),
+    # DB_COVERAGE: monthly data counts — only explicit Korean/compound phrases
+    ('DB_COVERAGE', [
+        'db 커버리지', 'db커버리지',
+    ]),
+    # EVIDENCE: auxiliary indicators evidence — only explicit Korean phrases
+    ('EVIDENCE', [
+        '보조지표 근거', '보조지표', '근거 섹션',
+    ]),
+]
+
+# Handler dispatch map for deterministic routes
+DETERMINISTIC_HANDLERS = {
+    'HEALTH': lambda text: local_query_executor.execute('health_check', original_text=text),
+    'TEST_REPORT': lambda text: local_query_executor.execute('test_report_full', original_text=text),
+    'NEWS_APPLIED': lambda text: local_query_executor.execute('news_applied', original_text=text),
+    'NEWS_IGNORED': lambda text: local_query_executor.execute('news_ignored', original_text=text),
+    'DB_COVERAGE': lambda text: local_query_executor.execute('db_coverage', original_text=text),
+    'EVIDENCE': lambda text: local_query_executor.execute('evidence', original_text=text),
+}
+
+
+def _normalize_for_matching(text: str) -> str:
+    """Normalize text for keyword matching: lower, strip, collapse punct/emoji."""
+    import unicodedata
+    t = (text or '').strip().lower()
+    # Remove emoji and special chars (keep letters, digits, spaces, basic punct)
+    t = ''.join(c for c in t if unicodedata.category(c)[0] in ('L', 'N', 'Z', 'P'))
+    # Collapse multiple spaces
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def _deterministic_route(text: str) -> str:
+    """Check deterministic keyword routes. Returns handler name or ''."""
+    t = _normalize_for_matching(text)
+    if not t:
+        return ''
+    for handler_name, patterns in DETERMINISTIC_ROUTES:
+        for pattern in patterns:
+            if pattern in t:
+                return handler_name
+    return ''
+
+
+# ── Loop detection ────────────────────────────────────────
+_response_history = []  # list of (text_hash, handler_name, timestamp)
+MAX_HISTORY = 10
+LOOP_THRESHOLD = 2  # same hash N times with different user intent → loop
+
+
+def _check_response_loop(response_text: str, handler_name: str) -> bool:
+    """Check if we're in a response loop. Returns True if loop detected."""
+    h = _hashlib.md5((response_text or '')[:500].encode()).hexdigest()[:12]
+    now = time.time()
+    # Clean old entries (> 30 min)
+    while _response_history and now - _response_history[0][2] > 1800:
+        _response_history.pop(0)
+    # Count same hash with different handler
+    same_hash = [e for e in _response_history if e[0] == h and e[1] != handler_name]
+    _response_history.append((h, handler_name, now))
+    if len(_response_history) > MAX_HISTORY:
+        _response_history.pop(0)
+    return len(same_hash) >= LOOP_THRESHOLD
+
+
+def _loop_debug_info(text: str, handler: str) -> str:
+    """Generate debug info when loop is detected."""
+    return (
+        '\n⚠️ 반복 응답 감지 — 라우팅 디버그:\n'
+        f'  입력: {text[:50]}\n'
+        f'  선택된 핸들러: {handler}\n'
+        f'  최근 응답 이력: {len(_response_history)}건\n'
+        '  💡 /debug 명령으로 상세 상태를 확인하세요.'
+    )
+
+
+# ── /debug cache (file-based, survives oneshot restarts) ──
+_DEBUG_CACHE_FILE = '/tmp/tg_debug_cache.json'
+_DEBUG_CACHE_TTL = 5  # seconds (short — oneshot process, data changes matter)
+
+
+def _debug_cache_get(key: str, text: str):
+    """Returns (hit: bool, response: str|None, nonce: str).
+    Bypass cache if nonce=xxx or force_refresh=true in text."""
+    nonce = ''
+    m = re.search(r'nonce=(\S+)', text or '')
+    if m:
+        nonce = m.group(1)
+    force = 'force_refresh=true' in (text or '').lower()
+    if nonce or force:
+        return (False, None, nonce)
+    try:
+        with open(_DEBUG_CACHE_FILE, 'r') as f:
+            cache = json.load(f)
+        entry = cache.get(key)
+        if entry and (time.time() - entry.get('ts', 0)) < _DEBUG_CACHE_TTL:
+            return (True, entry['response'], entry.get('nonce', ''))
+    except Exception:
+        pass
+    return (False, None, nonce)
+
+
+def _debug_cache_set(key: str, response: str, nonce: str = ''):
+    """Write response to cache file."""
+    try:
+        try:
+            with open(_DEBUG_CACHE_FILE, 'r') as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+        cache[key] = {'response': response, 'ts': time.time(), 'nonce': nonce}
+        tmp = _DEBUG_CACHE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, _DEBUG_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _debug_meta_footer(cache_hit: bool, nonce: str = '',
+                       data_fingerprint: str = '') -> str:
+    """Append metadata line to debug response with UTC+KST, fingerprint, trace_id."""
+    import uuid
+    from datetime import datetime, timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    kst = timezone(timedelta(hours=9))
+    now_kst = now_utc.astimezone(kst)
+    ts_str = f'{now_utc.strftime("%H:%M:%S")}UTC/{now_kst.strftime("%H:%M:%S")}KST'
+    trace_id = uuid.uuid4().hex[:8]
+    parts = [
+        f'query_ts={now_utc.strftime("%Y-%m-%d")} {ts_str}',
+        f'cache_hit={cache_hit}',
+        f'trace_id={trace_id}',
+    ]
+    if data_fingerprint:
+        parts.append(f'fingerprint={data_fingerprint}')
+    if nonce:
+        parts.append(f'nonce={nonce}')
+    return '\n---\n' + ' | '.join(parts)
+
+
+# ── /debug state ─────────────────────────────────────────
+_ROUTER_STATE_FILE = '/tmp/tg_router_state.json'
+
+
+def _load_router_state():
+    try:
+        with open(_ROUTER_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {
+            'detected_intent': '',
+            'selected_handler': '',
+            'model_used': 'none',
+            'last_llm_error': '',
+            'state_mode': 'chat',
+            'last_response_hash': '',
+            'decision_ts': '',
+        }
+
+
+def _save_router_state(state):
+    tmp = _ROUTER_STATE_FILE + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, _ROUTER_STATE_FILE)
+    except Exception:
+        pass
+
+
+_last_debug_state = _load_router_state()
+
+
+# ── /debug subcommand dispatcher ─────────────────────────
+
+# ── Levenshtein fuzzy match for unknown commands ──────────
+_KNOWN_SLASH_COMMANDS = [
+    '/help', '/debug', '/db_health', '/db_monthly_stats', '/claude_audit',
+    '/health', '/status', '/score', '/test_report', '/test', '/audit',
+    '/position', '/position_exch', '/orders', '/orders_exch',
+    '/account', '/account_exch', '/position_strat', '/risk_config',
+    '/snapshot', '/snap', '/fact', '/now', '/close_all', '/force',
+    '/detail', '/trade', '/reconcile',
+    # Korean aliases
+    '/포지션', '/주문', '/잔고', '/자산', '/전략포지션', '/리스크', '/risk',
+    '/스냅샷', '/팩트', '/전청산', '/서비스', '/상태', '/스코어', '/테스트', '/감사',
+]
+
+
+def _levenshtein(s1, s2):
+    """Compute Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return _levenshtein(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            cost = 0 if c1 == c2 else 1
+            curr_row.append(min(
+                curr_row[j] + 1,       # insert
+                prev_row[j + 1] + 1,   # delete
+                prev_row[j] + cost,     # replace
+            ))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def _fuzzy_match_command(unknown_cmd, candidates, max_dist=3):
+    """Find the closest matching command within max_dist Levenshtein distance.
+    Returns (best_match, distance) or (None, -1) if no match found.
+    """
+    best, best_dist = None, max_dist + 1
+    unknown_lower = unknown_cmd.lower()
+    for cmd in candidates:
+        d = _levenshtein(unknown_lower, cmd.lower())
+        if d < best_dist:
+            best, best_dist = cmd, d
+    if best_dist <= max_dist:
+        return (best, best_dist)
+    return (None, -1)
+
+
+_DEBUG_SUBCMDS = {
+    'version': 'debug_version',
+    'router': 'debug_router',
+    'health': 'debug_health',
+    'db_coverage': 'debug_db_coverage',
+    'news_sample': 'debug_news_sample',
+    'news_reaction_sample': 'debug_news_reaction_sample',
+    'news_reaction_coverage': 'debug_news_reaction_sample',
+    'news_filter_stats': 'debug_news_filter_stats',
+    'backfill_status': 'debug_backfill_status',
+    'backfill_dryrun': 'debug_backfill_dryrun',
+    'backfill_enable': 'debug_backfill_enable',
+    'backfill_start': 'debug_backfill_start',
+    'backfill_pause': 'debug_backfill_pause',
+    'backfill_resume': 'debug_backfill_resume',
+    'backfill_stop': 'debug_backfill_stop',
+    'backfill_log': 'debug_backfill_log',
+    'news_gap_diagnosis': 'debug_news_gap_diagnosis',
+    'state': 'debug_state',
+    # short aliases
+    'reaction': 'debug_news_reaction_sample',
+    'coverage': 'debug_db_coverage',
+    'backfill': 'debug_backfill_status',
+    'dryrun': 'debug_backfill_dryrun',
+    'bf_enable': 'debug_backfill_enable',
+    'bf_start': 'debug_backfill_start',
+    'bf_pause': 'debug_backfill_pause',
+    'bf_resume': 'debug_backfill_resume',
+    'bf_stop': 'debug_backfill_stop',
+    'bf_log': 'debug_backfill_log',
+    'news_gap': 'debug_news_gap_diagnosis',
+    'storage': 'debug_storage',
+    'db_size': 'debug_storage',
+    'news_path_sample': 'debug_news_path_sample',
+    'path_sample': 'debug_news_path_sample',
+    'news_path_stats': 'debug_news_path_stats',
+    'path_stats': 'debug_news_path_stats',
+    'system_stability': 'debug_system_stability',
+    'stability': 'debug_system_stability',
+    'once_lock_status': 'debug_once_lock_status',
+    'once_lock_clear': 'debug_once_lock_clear',
+    'once_lock': 'debug_once_lock_status',
+    'backfill_ack': 'debug_backfill_ack',
+    'bf_ack': 'debug_backfill_ack',
+    'gate_details': 'debug_gate_details',
+    'gate': 'debug_gate_details',
+}
+
+_DEBUG_HELP = (
+    '🔍 /debug 서브커맨드\n'
+    '━━━━━━━━━━━━━━━━━━\n'
+    '  /debug version — 빌드/버전/환경 정보\n'
+    '  /debug router [nonce=xxx] — 라우팅 디버그\n'
+    '  /debug health — 서비스 상태 (상세)\n'
+    '  /debug db_coverage [--from=YYYY-MM] — DB 월별 커버리지\n'
+    '  /debug news_sample [--n=20] — 최신 뉴스 샘플\n'
+    '  /debug news_reaction_sample — 뉴스 반응 샘플\n'
+    '  /debug news_filter_stats — 뉴스 필터 통계 (24h)\n'
+    '  /debug backfill_status — 백필 작업 현황\n'
+    '  /debug backfill_dryrun — 백필 잔여량 추정\n'
+    '  /debug backfill_enable on|off — 백필 실행 허용/차단\n'
+    '  /debug backfill_start job=<name> [from=X] [to=X] [write=true] — 백필 시작\n'
+    '  /debug backfill_pause — 실행 중인 백필 일시정지\n'
+    '  /debug backfill_resume — 일시정지된 백필 재개\n'
+    '  /debug backfill_stop — 백필 안전 종료 (현재 배치 커밋 후)\n'
+    '  /debug backfill_log [job=X] [lines=30] — 백필 실행 로그 조회\n'
+    '  /debug news_gap_diagnosis — 뉴스 월별 갭 진단\n'
+    '  /debug news_path_sample [--n=10] — 뉴스 경로 분석 샘플\n'
+    '  /debug news_path_stats — 뉴스 경로 7분류 통계\n'
+    '  /debug storage — DB 스토리지/테이블 크기\n'
+    '  /debug system_stability — 시스템 안정성 점수 + 게이트 PASS/FAIL\n'
+    '  /debug state — 시스템 상태 변수\n'
+    '  /debug gate_details — 서비스별 gate 상세 (dual-source)\n'
+    '  /debug on|off — 디버그 모드 토글\n'
+    '\n'
+    '  aliases: reaction, coverage, backfill, dryrun, gate,\n'
+    '           bf_enable, bf_start, bf_pause, bf_resume, bf_stop, bf_log,\n'
+    '           news_gap, path_sample, path_stats\n'
+)
+
+
+def _dispatch_debug(text: str) -> str:
+    """Dispatch /debug subcommands with cache + self-routing tracking."""
+    import hashlib
+    t = text.strip()
+
+    # Legacy: /debug on|off
+    if t == '/debug on':
+        return report_formatter.set_debug_mode(True)
+    if t == '/debug off':
+        return report_formatter.set_debug_mode(False)
+
+    # Parse subcommand
+    parts = t.split(None, 2)  # ['/debug', 'subcmd', 'rest...']
+    if len(parts) < 2 or parts[0] not in ('/debug', '디버그'):
+        # bare /debug → show menu
+        _last_debug_state['detected_intent'] = 'debug_menu'
+        _last_debug_state['selected_handler'] = '_dispatch_debug(menu)'
+        _last_debug_state['model_used'] = 'none'
+        return _DEBUG_HELP + _footer('debug_menu', 'local', 'local')
+
+    subcmd = parts[1].lower()
+    handler_key = _DEBUG_SUBCMDS.get(subcmd)
+    if not handler_key:
+        # Fuzzy match against debug subcommand names
+        suggestion, dist = _fuzzy_match_command(
+            subcmd, list(_DEBUG_SUBCMDS.keys()), max_dist=3)
+        hint = ''
+        if suggestion:
+            hint = f'\n혹시 이 서브커맨드를 찾으시나요? → /debug {suggestion}\n'
+        _last_debug_state['detected_intent'] = f'debug_unknown({subcmd})'
+        _last_debug_state['selected_handler'] = '_dispatch_debug(menu)'
+        _last_debug_state['model_used'] = 'none'
+        return (f'⚠ unknown_subcommand={subcmd}{hint}\n' +
+                _DEBUG_HELP + _footer('debug_menu', 'local', 'local'))
+
+    # Record self-routing in debug state (Item 1: always populated)
+    _last_debug_state['detected_intent'] = handler_key
+    _last_debug_state['selected_handler'] = f'_dispatch_debug({subcmd})'
+    _last_debug_state['model_used'] = 'none'
+    _last_debug_state['decision_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    # Cache check
+    cache_hit, cached_resp, nonce = _debug_cache_get(handler_key, t)
+    if cache_hit and cached_resp:
+        fp = hashlib.md5(cached_resp.encode()).hexdigest()[:12]
+        _save_router_state(_last_debug_state)
+        return cached_resp + _debug_meta_footer(True, nonce, fp) + \
+            _footer(handler_key, 'local', 'local')
+
+    # Execute handler
+    try:
+        resp = local_query_executor.execute(handler_key, original_text=t)
+    except Exception as e:
+        resp = f'⚠ {handler_key} 실행 실패: {e}'
+
+    # Compute data fingerprint
+    fp = hashlib.md5(resp.encode()).hexdigest()[:12]
+
+    # Cache set
+    _debug_cache_set(handler_key, resp, nonce)
+
+    _save_router_state(_last_debug_state)
+    return resp + _debug_meta_footer(False, nonce, fp) + \
+        _footer(handler_key, 'local', 'local')
+
+
+# ── REPORT_ONLY keyword pre-routing (NARROWED) ────────────
+# Only match explicit report/brief requests, NOT generic queries.
 REPORT_ONLY_KEYWORDS = frozenset({
-    '보고', '리포트', '정리해', '종합', '요약해', '브리핑',
-    '현황', '총정리', '분석해줘', '보여줘', '알려줘',
-    '분석', '왜 그래', '무슨 일', '설명', '점검',
-    '진행상황', '감사', 'audit',
+    '리포트 보여', '리포트 줘', '전체 리포트', '종합 리포트',
+    '전략 리포트', '뉴스 리포트', '브리핑 해줘', '총정리 해줘',
+    '일간 리포트', '일일 리포트',
 })
 # 이 키워드가 있으면 REPORT가 아니라 DIRECTIVE로 취급해야 하는 예외
 DIRECTIVE_OVERRIDE_KEYWORDS = frozenset({
@@ -1890,6 +2332,11 @@ NL_LOCAL_MAP = {
     'claude_audit': 'claude_audit',
     'macro_summary': 'macro_summary',
     'db_monthly_stats': 'db_monthly_stats',
+    'news_applied': 'news_applied',
+    'news_ignored': 'news_ignored',
+    'db_coverage': 'db_coverage',
+    'evidence': 'evidence',
+    'test_report': 'test_report_full',
 }
 
 
@@ -1918,17 +2365,19 @@ def _execute_trade_command(parsed, text):
         result, provider = _ai_strategy_advisory(text, call_type='USER_MANUAL')
         return result + _footer('strategy', 'claude', provider, call_type='USER_MANUAL')
 
-    # 2. Safety check: auto-trading active?
+    # 2. Safety check: auto-trading active? (EXIT actions bypass trade_switch)
+    EXIT_NL_INTENTS = {'close_position', 'reduce_position'}
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
-            if not auto_ok and not test_mode:
-                return (
-                    f"⚠️ 자동매매 비활성: {auto_reason}\n"
-                    f"💡 테스트 모드로 실행하려면: \"{text} 테스트\"\n"
-                    f"💡 또는: /force {text}"
-                ) + _footer(intent, 'blocked', 'local')
+            if intent not in EXIT_NL_INTENTS:
+                (auto_ok, auto_reason) = _check_auto_trading_active(cur=cur)
+                if not auto_ok and not test_mode:
+                    return (
+                        f"⚠️ 자동매매 비활성: {auto_reason}\n"
+                        f"💡 테스트 모드로 실행하려면: \"{text} 테스트\"\n"
+                        f"💡 또는: /force {text}"
+                    ) + _footer(intent, 'blocked', 'local')
 
             # 3. Position + scores
             pos = _fetch_position_state(cur)
@@ -2098,22 +2547,312 @@ def _handle_nl_question(parsed, text):
         return local_query_executor.execute(qtype, original_text=text) + \
             _footer(intent, 'local', 'local')
 
-    # 5. General → GPT-mini
-    result = _ai_general_advisory(text)
-    return result + _footer('general', 'gpt', 'gpt-4o-mini')
+    # 5. General → GPT-mini (with LLM failure transparency)
+    try:
+        result = _ai_general_advisory(text)
+        if result and not result.startswith('⚠'):
+            return result + _footer('general', 'gpt', 'gpt-4o-mini')
+    except Exception as e:
+        _last_debug_state['last_llm_error'] = str(e)[:100]
+        return (
+            f'⚠️ LLM 호출 실패: {e}\n'
+            '데이터 응답 불가합니다. 아래 명령을 사용해 주세요:\n'
+            '/health — 서비스 상태\n/status — 시스템 현황\n/debug — 디버그 상태'
+        ) + _footer('general', 'error', 'none')
+
+    # 6. Fallback: help menu (NOT strategy report)
+    return (
+        '요청을 처리할 수 없었습니다. 가능한 명령:\n\n'
+        '/health — 서비스 상태 (OK/DOWN/UNKNOWN)\n'
+        '/status — 시스템 현황\n'
+        '/score — 스코어 엔진\n'
+        '/test_report — 종합 테스트 보고\n'
+        '/detail — 뉴스 상세 리포트\n'
+        '/debug — 디버그 상태\n\n'
+        '또는 자연어로: "무시된 뉴스 10개", "DB 커버리지", '
+        '"전략 반영 뉴스 TOP5", "보조지표 근거"'
+    ) + _footer('fallback_help', 'local', 'none')
+
+
+# ── trade arm/disarm/auto_apply handler ───────────────────
+
+def _trade_switch_set(enable: bool) -> str:
+    """Set trade_switch ON/OFF. Returns status message.
+    ON 요청 시 safety_manager 검사를 먼저 실행, 차단이면 변경 거부.
+    """
+    conn = _get_db_conn()
+    try:
+        # ON 요청 시 안전장치 게이트 검사
+        if enable:
+            try:
+                import safety_manager
+                with conn.cursor() as cur:
+                    ok, reason = safety_manager.run_all_checks(cur)
+                if not ok:
+                    return (
+                        f'⛔ entry_enabled=ON 차단\n'
+                        f'  사유: {reason}\n'
+                        f'  안전장치 통과 후 다시 시도하세요.'
+                    ) + _footer('trade_switch', 'blocked', 'local')
+                svc_ok, svc_reason = safety_manager.check_service_health()
+                if not svc_ok:
+                    return (
+                        f'⛔ entry_enabled=ON 차단\n'
+                        f'  사유: {svc_reason}\n'
+                        f'  서비스 복구 후 다시 시도하세요.'
+                    ) + _footer('trade_switch', 'blocked', 'local')
+            except Exception as e:
+                _log(f'trade_switch gate check error: {e}')
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trade_switch SET enabled = %s "
+                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
+                (enable,))
+            if cur.rowcount == 0:
+                return '⚠️ trade_switch 레코드가 없습니다.' + \
+                    _footer('trade_switch', 'error', 'local')
+            cur.execute("SELECT enabled, updated_at FROM trade_switch ORDER BY id DESC LIMIT 1;")
+            row = cur.fetchone()
+        state_str = 'ON' if enable else 'OFF'
+        updated = str(row[1])[:19] if row else '?'
+        return (
+            f'✅ entry_enabled={state_str}\n'
+            f'  exit_enabled=항상ON (CLOSE/손절 허용)\n'
+            f'  updated_at={updated}'
+        ) + _footer('trade_switch', 'local', 'local')
+    finally:
+        conn.close()
+
+
+def _trade_flatten() -> str:
+    """Flatten all positions + set entry_enabled=false."""
+    conn = _get_db_conn()
+    try:
+        # 1. Disable entry
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trade_switch SET enabled = false "
+                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);")
+
+        # 2. Close position
+        try:
+            ex = _get_exchange()
+            from live_order_executor import get_position, place_close_order, SYMBOL as _SYM
+            side, qty, upnl, pct = get_position(ex)
+            if side and qty > 0:
+                order = place_close_order(ex, side, qty)
+                return (
+                    f'✅ Flatten 실행 완료\n'
+                    f'  청산: {side} qty={qty}\n'
+                    f'  order_id={order.get("id", "?")}\n'
+                    f'  entry_enabled=OFF (자동 설정)'
+                ) + _footer('trade_flatten', 'local', 'local')
+            else:
+                return (
+                    f'ℹ️ 포지션 없음 — 청산 불필요\n'
+                    f'  entry_enabled=OFF (설정 완료)'
+                ) + _footer('trade_flatten', 'local', 'local')
+        except Exception as e:
+            return (
+                f'⚠️ Flatten 실패: {e}\n'
+                f'  entry_enabled=OFF (설정은 완료)\n'
+                f'  수동 청산: /close_all'
+            ) + _footer('trade_flatten', 'error', 'local')
+    finally:
+        conn.close()
+
+
+def _trade_full_status(chat_id: int) -> str:
+    """Comprehensive trade status: switch, env, position, schedule, recent logs."""
+    lines = ['📊 Trade 종합 상태', '━━━━━━━━━━━━━━━━━━']
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # 1. trade_switch (entry_enabled / exit_enabled)
+            cur.execute("SELECT enabled, updated_at FROM trade_switch ORDER BY id DESC LIMIT 1;")
+            sw = cur.fetchone()
+            if sw:
+                entry_str = 'ON' if sw[0] else 'OFF'
+                lines.append(f'entry_enabled: {entry_str} (updated: {str(sw[1])[:19]})')
+            else:
+                lines.append('entry_enabled: ⚠ 레코드 없음')
+            lines.append('exit_enabled: 항상ON')
+
+            # 2. Env
+            live_env = os.getenv('LIVE_TRADING', '')
+            lines.append(f'LIVE_TRADING: {"YES" if live_env == "YES_I_UNDERSTAND" else "NO"}')
+
+            # 3. test_mode
+            import test_utils
+            test = test_utils.load_test_mode()
+            active = test_utils.is_test_active(test)
+            lines.append(f'test_mode: {"활성" if active else "비활성"}')
+            end_utc = test.get('end_utc', '')
+            if end_utc:
+                lines.append(f'  end_utc: {end_utc}')
+
+            # 4. Capital
+            from live_order_executor import USDT_CAP, CAPITAL_CAP_USDT, ALLOWED_SYMBOLS
+            lines.append(f'cap: per_order={USDT_CAP} total={CAPITAL_CAP_USDT}')
+            lines.append(f'allowed_symbols: {", ".join(ALLOWED_SYMBOLS)}')
+
+            # 5. Live position
+            try:
+                ex = _get_exchange()
+                from live_order_executor import get_position
+                side, qty, upnl, pct = get_position(ex)
+                if side and qty > 0:
+                    lines.append(f'\n📈 포지션: {side} qty={qty:.6f} uPnL={upnl:.4f} ({pct:+.2f}%)')
+                else:
+                    lines.append('\n📈 포지션: 없음')
+            except Exception as e:
+                lines.append(f'\n📈 포지션 조회 실패: {e}')
+
+            # 6. Recent execution_log (5건)
+            try:
+                cur.execute("""
+                    SELECT id, order_type, direction, status, requested_qty,
+                           to_char(created_at, 'MM-DD HH24:MI') as ts
+                    FROM execution_log
+                    ORDER BY id DESC LIMIT 5;
+                """)
+                elogs = cur.fetchall()
+                if elogs:
+                    lines.append('\n📋 최근 실행 로그 (5건)')
+                    for el in elogs:
+                        lines.append(f'  #{el[0]} {el[1]} {el[2]} {el[3]} qty={el[4]} {el[5]}')
+            except Exception:
+                pass
+
+            # 7. WAIT_REASON
+            try:
+                import exchange_reader
+                wr = exchange_reader.compute_wait_reason(cur)
+                wr_str = wr[0] if isinstance(wr, tuple) else wr
+                lines.append(f'\nWAIT_REASON: {wr_str}')
+            except Exception:
+                lines.append('\nWAIT_REASON: N/A')
+
+        return '\n'.join(lines) + _footer('trade_status', 'local', 'local')
+    finally:
+        conn.close()
+
+
+def _handle_trade_arm_command(text: str, chat_id: int) -> str:
+    """Handle /trade on|off|flatten|status|arm|disarm|auto_apply commands."""
+    import trade_arm_manager
+    parts = text.strip().split()
+    sub = parts[1].lower() if len(parts) > 1 else 'status'
+
+    # --- New: explicit trade_switch commands ---
+    if sub == 'on':
+        return _trade_switch_set(True)
+    elif sub == 'off':
+        return _trade_switch_set(False)
+    elif sub == 'flatten':
+        return _trade_flatten()
+    elif sub in ('status', 'state'):
+        return _trade_full_status(chat_id)
+
+    if sub == 'arm':
+        confirm = parts[2] if len(parts) > 2 else ''
+        if confirm != 'YES_I_UNDERSTAND':
+            return (
+                '⚠️ 매매 무장을 활성화하려면:\n'
+                '/trade arm YES_I_UNDERSTAND\n\n'
+                '무장 상태에서 Claude 분석 → 자동 매매가 실행될 수 있습니다.\n'
+                '기본 TTL: 12시간 (만료 후 자동 해제)'
+            ) + _footer('trade_arm', 'local', 'local')
+        result = trade_arm_manager.arm(chat_id, ttl_hours=12)
+        if result.get('armed'):
+            return (
+                f'🟢 매매 무장 완료\n'
+                f'만료: {result.get("expires_at", "?")}\n'
+                f'해제: /trade disarm'
+            ) + _footer('trade_arm', 'local', 'local')
+        return f'⚠️ 무장 실패: {result.get("error", "?")}' + \
+            _footer('trade_arm', 'local', 'local')
+
+    elif sub == 'disarm':
+        result = trade_arm_manager.disarm(chat_id)
+        return (
+            f'🔴 매매 무장 해제됨\n'
+            f'해제 건수: {result.get("disarmed_count", 0)}'
+        ) + _footer('trade_disarm', 'local', 'local')
+
+    elif sub == 'auto_apply':
+        mode = parts[2].lower() if len(parts) > 2 else ''
+        if mode not in ('on', 'off'):
+            return (
+                '사용법: /trade auto_apply on|off\n'
+                'Claude 분석 → 자동 매매 적용 여부 설정'
+            ) + _footer('trade_auto_apply', 'local', 'local')
+        enabled = (mode == 'on')
+        try:
+            from db_config import get_conn
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE auto_apply_config
+                    SET auto_apply_on_claude = %s, updated_at = now()
+                    WHERE id = (SELECT MIN(id) FROM auto_apply_config);
+                """, (enabled,))
+            conn.commit()
+            conn.close()
+            state_str = '활성' if enabled else '비활성'
+            return f'✅ Claude Auto-Apply: {state_str}' + \
+                _footer('trade_auto_apply', 'local', 'local')
+        except Exception as e:
+            return f'⚠️ 설정 실패: {e}' + \
+                _footer('trade_auto_apply', 'local', 'local')
+
+    else:  # unknown sub → show arm status
+        status = trade_arm_manager.get_status(chat_id)
+        import report_formatter as _rf
+        arm_text = _rf.format_arm_state(status)
+        # Also show auto_apply config
+        try:
+            from db_config import get_conn
+            conn = get_conn(autocommit=True)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT auto_apply_on_claude, auto_apply_on_emergency,
+                           max_notional_usdt, max_leverage
+                    FROM auto_apply_config
+                    ORDER BY id DESC LIMIT 1;
+                """)
+                row = cur.fetchone()
+            conn.close()
+            if row:
+                arm_text += (
+                    f'\n\n─ Auto-Apply 설정 ─\n'
+                    f'Claude 자동 적용: {"✅" if row[0] else "❌"}\n'
+                    f'긴급 자동 적용: {"✅" if row[1] else "❌"}\n'
+                    f'최대 금액: ${row[2]} | 최대 레버리지: x{row[3]}'
+                )
+        except Exception:
+            pass
+        return arm_text + _footer('trade_status', 'local', 'local')
 
 
 # ── main command handler ─────────────────────────────────
 
 def _footer(intent_name: str, route: str, provider: str,
-            call_type: str = '', bypass: bool = False, cost: float = 0.0) -> str:
-    return report_formatter._debug_line({
+            call_type: str = '', bypass: bool = False, cost: float = 0.0,
+            trace_id: str = '', fallback_reason: str = '') -> str:
+    meta = {
         'intent_name': intent_name,
         'route': route,
         'provider': provider,
         'call_type': call_type,
         'cost': cost,
-    })
+    }
+    if trace_id:
+        meta['trace_id'] = trace_id
+    if fallback_reason:
+        meta['fallback_reason'] = fallback_reason
+    return report_formatter._debug_line(meta)
 
 def _comprehensive_report(text: str) -> str:
     """종합 리포트: 뉴스+전략+스코어+포지션+시스템 전체 현황.
@@ -2148,21 +2887,16 @@ def _comprehensive_report(text: str) -> str:
                                        'local+claude')
 
 
-def handle_command(text: str) -> str:
+def handle_command(text: str, chat_id: int = 0) -> str:
     t = (text or "").strip()
 
     # Phase 0: Minimal direct commands (no GPT cost)
     if t in ("/help", "help"):
         return HELP_TEXT + _footer("help", "direct", "local")
 
-    # /debug — toggle debug mode (no GPT cost)
-    if t.startswith('/debug'):
-        if t == '/debug on':
-            return report_formatter.set_debug_mode(True)
-        if t == '/debug off':
-            return report_formatter.set_debug_mode(False)
-        state = 'ON' if report_formatter.is_debug_on() else 'OFF'
-        return f'디버그 모드: {state}\n사용법: /debug on 또는 /debug off'
+    # /debug — diagnostic subcommand dispatcher (no GPT cost)
+    if t.startswith('/debug') or t == '디버그':
+        return _dispatch_debug(t)
 
     # /db_health — direct DB health check (no GPT cost)
     if t in ('/db_health', '/dbhealth', 'db_health'):
@@ -2175,9 +2909,28 @@ def handle_command(text: str) -> str:
             _footer('db_monthly_stats', 'local', 'local')
 
     # /claude_audit — Claude API usage audit (no GPT cost)
-    if t in ('/claude_audit', '/claude', '/ai_cost', 'claude_audit'):
+    if t in ('/claude_audit', '/ai_cost', 'claude_audit'):
         return local_query_executor.execute('claude_audit') + \
             _footer('claude_audit', 'local', 'local')
+
+    # /claude [질문] — Claude 분석 파이프라인 직접 호출
+    if t == '/claude' or t.startswith('/claude '):
+        claude_text = t[len('/claude'):].strip() or '현재 시장 분석해줘'
+        _log(f'/claude command: text={claude_text[:50]}')
+        try:
+            import chat_agent
+            response, meta = chat_agent.process_message(
+                chat_id, f'클로드 {claude_text}')
+            return response + _footer(
+                meta.get('intent', 'claude_analysis'),
+                meta.get('route', 'claude_analysis'),
+                meta.get('provider', 'claude'),
+                call_type='USER_MANUAL',
+                trace_id=meta.get('trace_id', ''),
+            )
+        except Exception as e:
+            _log(f'/claude error: {e}')
+            return f'⚠ Claude 분석 실패: {e}' + _footer('claude', 'error', 'local')
 
     # /health — 서비스 상태 점검
     if t in ('/health', '/서비스', 'health'):
@@ -2194,13 +2947,55 @@ def handle_command(text: str) -> str:
         return local_query_executor.execute('score_summary') + \
             _footer('score_summary', 'local', 'local')
 
-    # /test_report — 종합 테스트 리포트
+    # /test_report — 종합 테스트 리포트 (new: deterministic handler)
     if t in ('/test_report', '/test', '/테스트'):
-        return _comprehensive_report(t)
+        return local_query_executor.execute('test_report_full') + \
+            _footer('test_report', 'local', 'local')
 
     # /audit — 감사 리포트
     if t in ('/audit', '/감사'):
-        return _comprehensive_report(t)
+        return local_query_executor.execute('audit_report') + \
+            _footer('audit', 'local', 'local')
+
+    # /position, /position_exch — 거래소 실시간 포지션
+    if t in ('/position', '/position_exch', '/포지션'):
+        return local_query_executor.execute('position_exch') + \
+            _footer('position_exch', 'local', 'local')
+
+    # /orders, /orders_exch — 미체결 주문
+    if t in ('/orders', '/orders_exch', '/주문'):
+        return local_query_executor.execute('orders_exch') + \
+            _footer('orders_exch', 'local', 'local')
+
+    # /account, /account_exch — 거래소 잔고
+    if t in ('/account', '/account_exch', '/잔고', '/자산'):
+        return local_query_executor.execute('account_exch') + \
+            _footer('account_exch', 'local', 'local')
+
+    # /position_strat — 전략 DB 포지션
+    if t in ('/position_strat', '/전략포지션'):
+        return local_query_executor.execute('position_strat') + \
+            _footer('position_strat', 'local', 'local')
+
+    # /risk_config — 안전장치 설정
+    if t in ('/risk_config', '/리스크', '/risk'):
+        return local_query_executor.execute('risk_config') + \
+            _footer('risk_config', 'local', 'local')
+
+    # /snapshot — 종합 현황 카드
+    if t in ('/snapshot', '/스냅샷', '/snap'):
+        return local_query_executor.execute('snapshot') + \
+            _footer('snapshot', 'local', 'local')
+
+    # /fact, /now — 4섹션 팩트 요약 (자연어 응답과 동일)
+    if t in ('/fact', '/now', '/팩트'):
+        return local_query_executor.execute('fact_snapshot') + \
+            _footer('fact_snapshot', 'local', 'local')
+
+    # /reconcile — 거래소 vs 전략DB 비교
+    if t in ('/reconcile', '/대조'):
+        return local_query_executor.execute('reconcile') + \
+            _footer('reconcile', 'local', 'local')
 
     # /close_all — 전포지션 수동 청산
     if t in ('/close_all', '/전청산'):
@@ -2231,40 +3026,104 @@ def handle_command(text: str) -> str:
             detail_text, call_type='AUTO', detail=True)
         return detail_result + _footer('detail', 'claude', detail_provider)
 
-    # P0-1: REPORT_ONLY 키워드 사전 라우팅 (GPT 분류 전)
-    # "보고해/리포트/종합 정리" 등이 COMMAND/directive로 오분류되는 버그 방지
+    # ── Phase 0.5: Deterministic keyword routing (BEFORE GPT) ──
+    # Matches specific user requests to code handlers directly.
+    # This prevents the GPT router or REPORT_ONLY from hijacking queries.
+    det_handler = _deterministic_route(t)
+    if det_handler:
+        _log(f'DETERMINISTIC route: handler={det_handler} text={t[:50]}')
+        handler_fn = DETERMINISTIC_HANDLERS.get(det_handler)
+        if handler_fn:
+            _last_debug_state['detected_intent'] = det_handler
+            _last_debug_state['selected_handler'] = det_handler
+            _last_debug_state['model_used'] = 'none(deterministic)'
+            _last_debug_state['decision_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            result = handler_fn(t)
+            result += _footer(det_handler, 'deterministic', 'local')
+            # Loop detection
+            if _check_response_loop(result, det_handler):
+                result += _loop_debug_info(t, det_handler)
+            _last_debug_state['last_response_hash'] = \
+                _hashlib.md5(result[:500].encode()).hexdigest()[:12]
+            _save_router_state(_last_debug_state)
+            return result
+
+    # P0-1: REPORT_ONLY 키워드 사전 라우팅 (narrowed — only explicit report requests)
     report_mode = _detect_report_only(t)
     if report_mode:
         _log(f'REPORT_ONLY pre-route: mode={report_mode} text={t[:50]}')
+        _last_debug_state['detected_intent'] = f'report:{report_mode}'
+        _last_debug_state['selected_handler'] = report_mode
+        _last_debug_state['decision_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
         if report_mode == 'comprehensive_report':
+            _save_router_state(_last_debug_state)
             return _comprehensive_report(t)
         elif report_mode == 'strategy_report':
             result, provider = _ai_strategy_advisory(t, call_type='AUTO')
+            _save_router_state(_last_debug_state)
             return result + _footer('strategy_report', 'claude', provider)
         else:  # news_report
             result, provider = _ai_news_claude_advisory(
                 t, call_type='AUTO', detail=True)
+            _save_router_state(_last_debug_state)
             return result + _footer('news_report', 'claude', provider)
 
-    # Phase 1: NL parser (always runs)
+    # ── Phase 0.7: /trade arm|disarm|auto_apply commands ──
+    if t.startswith('/trade ') or t == '/trade':
+        return _handle_trade_arm_command(t, chat_id)
+
+    # INVARIANT: "/" 로 시작하는 미인식 명령은 chat_agent로 보내지 않음
+    if t.startswith('/'):
+        cmd_part = t.split()[0] if t.split() else t
+        suggestion, dist = _fuzzy_match_command(cmd_part, _KNOWN_SLASH_COMMANDS)
+        if suggestion:
+            return (
+                f'알 수 없는 명령: {t}\n'
+                f'혹시 이 명령을 찾으시나요? → {suggestion}'
+            ) + _footer('unknown_command', 'local', 'local')
+        return (
+            f'알 수 없는 명령: {t}\n'
+            '/help 으로 사용 가능한 명령을 확인하세요.'
+        ) + _footer('unknown_command', 'local', 'local')
+
+    # ── Phase 1: ChatAgent (GPT 대화형) ──
+    import chat_agent
     try:
-        parsed = gpt_router.classify_intent(t)
-    except Exception:
-        parsed = gpt_router._keyword_fallback(t)
+        response, meta = chat_agent.process_message(chat_id, t)
+        # 메타데이터 푸터 추가
+        footer = _footer(
+            meta.get('intent', 'chat'),
+            meta.get('route', 'chat_agent'),
+            meta.get('provider', 'gpt-4o-mini'),
+            call_type=meta.get('call_type', ''),
+            trace_id=meta.get('trace_id', ''),
+            fallback_reason=meta.get('fallback_reason', ''),
+        )
+        result = response + footer
+    except Exception as e:
+        _log(f'ChatAgent error: {e}')
+        # Fallback: 기존 gpt_router 경로
+        try:
+            parsed = gpt_router.classify_intent(t)
+        except Exception:
+            parsed = gpt_router._keyword_fallback(t)
+        msg_type = parsed.get("type", "QUESTION")
+        if msg_type == "COMMAND":
+            result = _handle_nl_command(parsed, t)
+        else:
+            result = _handle_nl_question(parsed, t)
 
-    msg_type = parsed.get("type", "QUESTION")
-    intent = parsed.get("intent", "general")
-    _log(f"type={msg_type} intent={intent} "
-         f"confidence={parsed.get('confidence', '?')} "
-         f"fallback={parsed.get('_fallback', False)} "
-         f"budget_exceeded={parsed.get('_budget_exceeded', False)}")
-
-    # Phase 2: COMMAND → execution flow
-    if msg_type == "COMMAND":
-        return _handle_nl_command(parsed, t)
-
-    # Phase 3: QUESTION → information/analysis flow
-    return _handle_nl_question(parsed, t)
+    # Loop detection
+    _last_debug_state['detected_intent'] = 'chat_agent'
+    _last_debug_state['selected_handler'] = 'chat_agent'
+    _last_debug_state['model_used'] = 'gpt-4o-mini'
+    _last_debug_state['decision_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    if _check_response_loop(result, 'chat_agent'):
+        result += _loop_debug_info(t, 'chat_agent')
+    _last_debug_state['last_response_hash'] = \
+        _hashlib.md5(result[:500].encode()).hexdigest()[:12]
+    _save_router_state(_last_debug_state)
+    return result
 
 # ── main loop (unchanged) ────────────────────────────────
 
@@ -2308,7 +3167,7 @@ def main():
             continue
 
         try:
-            reply = handle_command(text)
+            reply = handle_command(text, chat_id=chat_id)
         except Exception as e:
             _log(f"handle_command error: {e}")
             _log_err(f"handle_command error: {e}")

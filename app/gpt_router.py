@@ -42,7 +42,12 @@ QUESTION_INTENTS = (
     "status", "price", "indicators", "news_analysis", "strategy",
     "emergency", "score", "report", "health", "errors",
     "volatility", "db_health", "claude_audit", "general",
-    "macro_summary", "db_monthly_stats")
+    "macro_summary", "db_monthly_stats",
+    "news_applied", "news_ignored", "db_coverage", "evidence",
+    "test_report",
+    "position_exch", "orders_exch", "account_exch",
+    "position_strat", "risk_config",
+    "snapshot", "fact_snapshot")
 
 # Legacy mapping: new QUESTION intent → (route, local_query_type)
 QUESTION_ROUTE_MAP = {
@@ -61,7 +66,19 @@ QUESTION_ROUTE_MAP = {
     'claude_audit': ('local', 'claude_audit'),
     'macro_summary': ('local', 'macro_summary'),
     'db_monthly_stats': ('local', 'db_monthly_stats'),
+    'news_applied': ('local', 'news_applied'),
+    'news_ignored': ('local', 'news_ignored'),
+    'db_coverage': ('local', 'db_coverage'),
+    'evidence': ('local', 'evidence'),
+    'test_report': ('local', 'test_report_full'),
     'general': ('none', ''),
+    'position_exch': ('local', 'position_exch'),
+    'orders_exch': ('local', 'orders_exch'),
+    'account_exch': ('local', 'account_exch'),
+    'position_strat': ('local', 'position_strat'),
+    'risk_config': ('local', 'risk_config'),
+    'snapshot': ('local', 'snapshot'),
+    'fact_snapshot': ('local', 'fact_snapshot'),
 }
 
 SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/English message into structured JSON.
@@ -99,6 +116,11 @@ SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/Engl
 - claude_audit: Claude API 사용량/비용 감사
 - macro_summary: 매크로/거시경제 지표 요약 (나스닥, DXY, VIX 등)
 - db_monthly_stats: DB 월별 데이터량/통계
+- news_applied: 전략 반영/채택된 뉴스 (TOP5, tier, 반응)
+- news_ignored: 무시/제외된 뉴스 + 무시 사유
+- db_coverage: DB 커버리지 (월별 candles/events/news 건수)
+- evidence: 보조지표 근거 (price_events, 유사 이벤트, 과거 반응)
+- test_report: 테스트 종합 보고 (적용 금지, 이벤트/체결/오판)
 - general: 기타 질문
 
 ## Output JSON (ONLY valid JSON, no text)
@@ -430,9 +452,15 @@ def _keyword_fallback(text: str) -> dict:
         return _add_legacy_fields({"type": "QUESTION", "intent": "news_analysis",
                 "confidence": 0.8, "_fallback": True})
 
+    if any(x in t for x in ["스냅샷", "snapshot", "현재 상태", "종합 현황", "팩트",
+                             "포지션어때", "포지션 어때", "들어갔어", "주문나갔어",
+                             "주문 나갔어", "왜 안사", "왜 안팔아"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "fact_snapshot",
+                "confidence": 0.85, "_fallback": True})
+
     if any(x in t for x in ["포지션", "position", "포지"]):
-        return _add_legacy_fields({"type": "QUESTION", "intent": "status",
-                "confidence": 0.7, "_fallback": True})
+        return _add_legacy_fields({"type": "QUESTION", "intent": "position_exch",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["에러", "error", "오류", "장애"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "errors",
@@ -447,8 +475,8 @@ def _keyword_fallback(text: str) -> dict:
                 "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["equity", "자본", "잔고"]):
-        return _add_legacy_fields({"type": "QUESTION", "intent": "report",
-                "confidence": 0.7, "_fallback": True})
+        return _add_legacy_fields({"type": "QUESTION", "intent": "account_exch",
+                "confidence": 0.8, "_fallback": True})
 
     if any(x in t for x in ["매매"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "strategy",
@@ -469,6 +497,29 @@ def _keyword_fallback(text: str) -> dict:
                              "자세히 분석"]):
         return _add_legacy_fields({"type": "QUESTION", "intent": "strategy",
                 "use_claude": True, "confidence": 0.8, "_fallback": True})
+
+    # ── New deterministic intents (fallback) ──
+    if any(x in t for x in ["전략 반영 뉴스", "반영된 뉴스", "적용된 뉴스", "top5",
+                             "채택된 뉴스", "topic_class", "relevance_score"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "news_applied",
+                "confidence": 0.9, "_fallback": True})
+
+    if any(x in t for x in ["무시된 뉴스", "제외된 뉴스", "무시 사유", "걸러진 뉴스"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "news_ignored",
+                "confidence": 0.9, "_fallback": True})
+
+    if any(x in t for x in ["db 커버리지", "coverage", "월별 건수", "2023-11"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "db_coverage",
+                "confidence": 0.9, "_fallback": True})
+
+    if any(x in t for x in ["보조지표 근거", "유사 이벤트", "과거 평균 반응",
+                             "price_events", "근거 섹션"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "evidence",
+                "confidence": 0.9, "_fallback": True})
+
+    if any(x in t for x in ["테스트 종합 보고", "테스트 보고", "적용 금지", "오판"]):
+        return _add_legacy_fields({"type": "QUESTION", "intent": "test_report",
+                "confidence": 0.9, "_fallback": True})
 
     return _add_legacy_fields({"type": "QUESTION", "intent": "general",
             "confidence": 0.3, "_fallback": True})

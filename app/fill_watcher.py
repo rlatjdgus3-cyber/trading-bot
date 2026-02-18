@@ -220,7 +220,7 @@ def _process_order(ex, cur, row):
         if order_type in ('ENTRY', 'OPEN'):
             _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
                                  filled_qty, avg_price, fee_cost, fee_currency)
-        elif order_type in ('EXIT', 'CLOSE', 'EMERGENCY_CLOSE', 'STOP_LOSS'):
+        elif order_type in ('EXIT', 'CLOSE', 'EMERGENCY_CLOSE', 'STOP_LOSS', 'SCHEDULED_CLOSE'):
             _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
                                 signal_id, decision_id, close_reason,
                                 filled_qty, avg_price, fee_cost, fee_currency)
@@ -254,6 +254,23 @@ def _process_order(ex, cur, row):
         _handle_timeout(cur, eid, order_id, order_type, direction, signal_id)
         if execution_queue_id:
             _update_eq_status(cur, execution_queue_id, 'TIMEOUT')
+
+
+def _update_position_order_state(cur, order_state, filled_qty=None, filled_usdt=None):
+    """Update position_state.order_state + filled tracking columns."""
+    try:
+        sets = ['order_state = %s', 'state_changed_at = now()']
+        vals = [order_state]
+        if filled_qty is not None:
+            sets.append('filled_qty = %s')
+            vals.append(filled_qty)
+        if filled_usdt is not None:
+            sets.append('filled_usdt = %s')
+            vals.append(filled_usdt)
+        vals.append(SYMBOL)
+        cur.execute(f"UPDATE position_state SET {', '.join(sets)} WHERE symbol = %s;", vals)
+    except Exception as e:
+        log(f'_update_position_order_state error: {e}')
 
 
 def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
@@ -311,9 +328,16 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
                   'stage': start_stage,
                   'price': avg_price,
                   'qty': filled_qty,
-                  'pct': entry_pct}]),
+                  'pct': entry_pct,
+                  'planned_usdt': capital_used,
+                  'filled_usdt': capital_used,
+                  'planned_qty': filled_qty,
+                  'filled_qty': filled_qty}]),
               abs(fee_cost)))
     _update_trade_process_log(cur, signal_id, trade_budget_used_after=entry_pct)
+    _update_position_order_state(cur, 'FILLED',
+                                  filled_qty=filled_qty,
+                                  filled_usdt=avg_price * filled_qty)
 
     msg = report_formatter.format_fill_notify('entry',
         direction=direction, avg_price=avg_price, filled_qty=filled_qty,
@@ -371,6 +395,7 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
 
     if position_verified:
         _sync_position_state(cur, None, 0)
+        _update_position_order_state(cur, 'NONE')
 
     # Backfill pnl_after_trade in trade_process_log for the originating signal
     if realized_pnl is not None and signal_id:
@@ -392,6 +417,7 @@ def _handle_timeout(cur, eid, order_id, order_type, direction, signal_id):
         WHERE id = %s;
     """, (eid,))
     _update_stage(cur, signal_id, 'ORDER_TIMEOUT')
+    _update_position_order_state(cur, 'TIMEOUT')
     msg = report_formatter.format_fill_notify('timeout',
         order_type=order_type, direction=direction, order_id=order_id,
         timeout_sec=ORDER_TIMEOUT_SEC)
@@ -406,6 +432,7 @@ def _handle_canceled(cur, eid, order_id, order_type, direction, signal_id):
         WHERE id = %s;
     """, (eid,))
     _update_stage(cur, signal_id, 'ORDER_CANCELED')
+    _update_position_order_state(cur, 'CANCELED')
     msg = report_formatter.format_fill_notify('canceled',
         order_type=order_type, direction=direction, order_id=order_id)
     _send_telegram(msg)

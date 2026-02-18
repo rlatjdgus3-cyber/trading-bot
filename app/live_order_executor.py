@@ -30,7 +30,9 @@ import exchange_compliance as ecl
 # Constants
 # ============================================================
 SYMBOL = "BTC/USDT:USDT"
+ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
 USDT_CAP = 300                     # hard cap per order
+CAPITAL_CAP_USDT = 900             # total exposure hard cap
 POLL_SEC = 3                       # main loop interval
 MIN_ORDER_INTERVAL_SEC = 60        # rate-limit between orders
 EMERGENCY_LOSS_PCT = -2.0          # unrealised PnL threshold for auto-close
@@ -108,6 +110,55 @@ def exchange():
 
 
 # ============================================================
+# Symbol whitelist + Exposure cap
+# ============================================================
+def _check_symbol_allowed(symbol):
+    """Hard block: only symbols in ALLOWED_SYMBOLS may trade."""
+    if symbol not in ALLOWED_SYMBOLS:
+        raise ValueError(f"SYMBOL_NOT_ALLOWED: {symbol}")
+
+
+def get_btc_exposure_usdt(ex):
+    """Current BTC position notional (USDT) from Bybit live."""
+    side, qty, upnl, pct = get_position(ex)
+    if not side or qty <= 0:
+        return 0.0
+    ticker = ex.fetch_ticker(SYMBOL)
+    return qty * float(ticker["last"])
+
+
+def enforce_exposure_cap(ex, requested_usdt, cur=None):
+    """Check exposure cap. Returns (allowed_usdt, reason_or_None).
+    Shrinks requested_usdt if cap would be exceeded.
+    Blocks (returns 0) if remaining < minNotional (~5 USDT).
+    """
+    exposure = get_btc_exposure_usdt(ex)
+    remaining = max(0, CAPITAL_CAP_USDT - exposure)
+    if requested_usdt <= remaining:
+        return requested_usdt, None
+    if remaining < 5:  # below minNotional
+        reason = f"CAP_EXCEEDED: exp={exposure:.0f} cap={CAPITAL_CAP_USDT}"
+        log(f"EXPOSURE CAP BLOCK: {reason}")
+        if cur:
+            audit(cur, "CAP_BLOCKED", SYMBOL, {
+                "exposure": round(exposure, 2),
+                "cap": CAPITAL_CAP_USDT,
+                "requested": round(requested_usdt, 2),
+            })
+        return 0, reason
+    reason = f"CAP_SHRINK: {requested_usdt:.0f}->{remaining:.0f}"
+    log(f"EXPOSURE CAP SHRINK: {reason}")
+    if cur:
+        audit(cur, "CAP_SHRINK", SYMBOL, {
+            "exposure": round(exposure, 2),
+            "cap": CAPITAL_CAP_USDT,
+            "requested": round(requested_usdt, 2),
+            "allowed": round(remaining, 2),
+        })
+    return remaining, reason
+
+
+# ============================================================
 # DB utilities
 # ============================================================
 def ensure_log_table(cur):
@@ -135,13 +186,26 @@ def trade_switch_on(cur) -> bool:
     return bool(row and row[0])
 
 
+ONCE_LOCK_TTL_MIN = 1440  # 24h
+
+
 def has_once_lock(cur, symbol: str) -> bool:
-    cur.execute("SELECT 1 FROM live_order_once_lock WHERE symbol=%s LIMIT 1;", (symbol,))
+    cur.execute("""
+        SELECT 1 FROM live_order_once_lock
+        WHERE symbol=%s AND (expires_at IS NULL OR expires_at > now())
+        LIMIT 1;
+    """, (symbol,))
     return cur.fetchone() is not None
 
 
 def set_once_lock(cur, symbol: str):
-    cur.execute("INSERT INTO live_order_once_lock(symbol) VALUES (%s);", (symbol,))
+    from datetime import timedelta
+    ttl = timedelta(minutes=ONCE_LOCK_TTL_MIN)
+    cur.execute("""
+        INSERT INTO live_order_once_lock(symbol, opened_at, expires_at)
+        VALUES (%s, now(), now() + %s)
+        ON CONFLICT (symbol) DO UPDATE SET opened_at = now(), expires_at = now() + %s;
+    """, (symbol, ttl, ttl))
 
 
 def clear_once_lock(cur, symbol: str):
@@ -290,7 +354,7 @@ def _insert_exec_log(cur, order, order_type, direction, qty, reason,
     return row[0] if row else None
 
 
-def _process_execution_queue(ex, cur, pos_side, pos_qty):
+def _process_execution_queue(ex, cur, pos_side, pos_qty, entry_enabled=True):
     """Main EQ consumer: expire stale, then process pending items."""
     _expire_stale_eq_items(cur)
     items = _fetch_pending_eq_items(cur)
@@ -298,15 +362,45 @@ def _process_execution_queue(ex, cur, pos_side, pos_qty):
         return
     for item in items:
         try:
-            _process_eq_item(ex, cur, item, pos_side, pos_qty)
+            _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=entry_enabled)
         except Exception as e:
             eq_id = item[0]
             log(f"EQ item id={eq_id} processing error: {type(e).__name__}: {e}")
             audit(cur, "EQ_ITEM_ERROR", SYMBOL, {"eq_id": eq_id, "error": str(e)})
 
 
-def _process_eq_item(ex, cur, item, pos_side, pos_qty):
-    """Dispatch a single EQ item by action_type."""
+def _update_position_order_state(cur, eq_id, action_type, direction, target_usdt):
+    """Update position_state.order_state to SENT when EQ item is picked.
+    Records planned_qty/planned_usdt for entry actions."""
+    try:
+        if action_type in ('ADD', 'REVERSE_OPEN'):
+            usdt = float(target_usdt or 0)
+            cur.execute("""
+                UPDATE position_state SET
+                    order_state = 'SENT',
+                    planned_usdt = %s,
+                    sent_usdt = %s,
+                    last_order_ts = now(),
+                    state_changed_at = now()
+                WHERE symbol = %s;
+            """, (usdt, usdt, SYMBOL))
+        elif action_type in ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE'):
+            cur.execute("""
+                UPDATE position_state SET
+                    order_state = 'SENT',
+                    last_order_ts = now(),
+                    state_changed_at = now()
+                WHERE symbol = %s;
+            """, (SYMBOL,))
+    except Exception as e:
+        log(f"_update_position_order_state error (eq_id={eq_id}): {e}")
+
+
+def _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=True):
+    """Dispatch a single EQ item by action_type.
+    EXIT actions (CLOSE/FULL_CLOSE/REDUCE/REVERSE_CLOSE) always allowed.
+    ENTRY actions (ADD/REVERSE_OPEN) require entry_enabled=True.
+    """
     eq_id, action_type, direction, target_qty, target_usdt, \
         reduce_pct, reason, meta_raw, expire_at, depends_on_col = item
 
@@ -332,8 +426,18 @@ def _process_eq_item(ex, cur, item, pos_side, pos_qty):
             log(f"EQ id={eq_id} waiting on depends_on={dep_id} (status={dep_row[0]})")
             return  # stay PENDING, retry next cycle
 
-    # Mark PICKED
+    # ENTRY gate: ADD/REVERSE_OPEN require entry_enabled
+    if action_type in ("ADD", "REVERSE_OPEN") and not entry_enabled:
+        log(f"EQ id={eq_id} {action_type} REJECTED — trade_switch OFF (entry disabled)")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "action_type": action_type,
+            "reason": "trade_switch_off_entry_disabled"})
+        return
+
+    # Mark PICKED + update order_state to SENT
     _update_eq_status(cur, eq_id, "PICKED")
+    _update_position_order_state(cur, eq_id, action_type, direction, target_usdt)
 
     if action_type in ("CLOSE", "FULL_CLOSE"):
         _eq_handle_close(ex, cur, eq_id, direction, pos_side, pos_qty, reason)
@@ -453,6 +557,15 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
         usdt = USDT_CAP
     dir_upper = (direction or "LONG").upper()
 
+    # Exposure cap enforcement
+    usdt, cap_reason = enforce_exposure_cap(ex, usdt, cur=cur)
+    if usdt <= 0:
+        log(f"EQ id={eq_id} ADD blocked by exposure cap: {cap_reason}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"exposure_cap: {cap_reason}"})
+        return
+
     if EQ_DRY_RUN:
         log(f"[EQ_DRY_RUN] ADD {dir_upper} usdt={usdt} reason={reason}"
             f" — WOULD CALL place_open_order()")
@@ -474,6 +587,12 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "ADD", dir_upper, amount, reason,
                      eq_id, usdt=usdt, price=exec_price)
+    # Record last_order_id in position_state
+    try:
+        cur.execute("UPDATE position_state SET last_order_id = %s WHERE symbol = %s;",
+                    (order.get("id", ""), SYMBOL))
+    except Exception:
+        pass
     audit(cur, "EQ_ADD_SENT", SYMBOL, {
         "eq_id": eq_id, "direction": dir_upper, "usdt": usdt,
         "price": exec_price, "amount": amount,
@@ -539,6 +658,15 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
         usdt = USDT_CAP
     dir_upper = (direction or "LONG").upper()
 
+    # Exposure cap enforcement
+    usdt, cap_reason = enforce_exposure_cap(ex, usdt, cur=cur)
+    if usdt <= 0:
+        log(f"EQ id={eq_id} REVERSE_OPEN blocked by exposure cap: {cap_reason}")
+        _update_eq_status(cur, eq_id, "REJECTED")
+        audit(cur, "EQ_REJECTED", SYMBOL, {
+            "eq_id": eq_id, "reason": f"exposure_cap: {cap_reason}"})
+        return
+
     if EQ_DRY_RUN:
         log(f"[EQ_DRY_RUN] REVERSE_OPEN {dir_upper} usdt={usdt} reason={reason}"
             f" — WOULD CALL place_open_order()")
@@ -560,6 +688,12 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REVERSE_OPEN", dir_upper, amount, reason,
                      eq_id, usdt=usdt, price=exec_price)
+    # Record last_order_id in position_state
+    try:
+        cur.execute("UPDATE position_state SET last_order_id = %s WHERE symbol = %s;",
+                    (order.get("id", ""), SYMBOL))
+    except Exception:
+        pass
     set_once_lock(cur, SYMBOL)
     audit(cur, "EQ_REVERSE_OPEN_SENT", SYMBOL, {
         "eq_id": eq_id, "direction": dir_upper, "usdt": usdt,
@@ -599,6 +733,7 @@ def get_position(ex):
 
 def place_close_order(ex, side: str, qty: float, cur=None):
     """reduceOnly market close with ECL compliance."""
+    _check_symbol_allowed(SYMBOL)
     # Compliance validation
     order_params = {
         'action': 'SELL' if side == 'long' else 'BUY',
@@ -660,6 +795,7 @@ def place_close_order(ex, side: str, qty: float, cur=None):
 
 def place_open_order(ex, direction: str, usdt_size: float, cur=None):
     """Market open order with ECL compliance.  direction = 'LONG' or 'SHORT'."""
+    _check_symbol_allowed(SYMBOL)
     ticker = ex.fetch_ticker(SYMBOL)
     price = float(ticker["last"])
     amount = usdt_size / price
@@ -815,9 +951,25 @@ def _cycle(ex, _last_order_ts_unused):
     conn = db_conn()
     try:
         with conn.cursor() as cur:
-            # --- Guard: trade_switch ---
-            if not trade_switch_on(cur):
-                return
+            # --- Guard: trade_switch (ENTRY only) ---
+            # EXIT actions (CLOSE, stoploss, REDUCE) always run regardless of switch.
+            entry_enabled = trade_switch_on(cur)
+
+            # --- Cleanup expired once_locks ---
+            if entry_enabled:
+                cur.execute("DELETE FROM live_order_once_lock WHERE expires_at IS NOT NULL AND expires_at <= now();")
+
+            # --- Guard: schedule expiry (auto entry block) ---
+            try:
+                import test_utils
+                from datetime import datetime, timezone
+                _test_mode = test_utils.load_test_mode()
+                if _test_mode.get('enabled') and _test_mode.get('end_utc'):
+                    _end_dt = datetime.fromisoformat(_test_mode['end_utc'])
+                    if datetime.now(timezone.utc) >= _end_dt:
+                        entry_enabled = False
+            except Exception:
+                pass
 
             # --- Bybit position check + emergency stoploss ---
             side, qty, upnl, pct = get_position(ex)
@@ -882,12 +1034,14 @@ def _cycle(ex, _last_order_ts_unused):
 
             # --- Execution Queue (from position_manager / strategy) ---
             try:
-                _process_execution_queue(ex, cur, side, qty)
+                _process_execution_queue(ex, cur, side, qty, entry_enabled=entry_enabled)
             except Exception as eq_err:
                 log(f"EQ ERROR: {type(eq_err).__name__}: {eq_err}")
                 audit(cur, "EQ_ERROR", SYMBOL, {"error": str(eq_err)})
 
-            # --- OPEN signal ---
+            # --- OPEN signal (entry_enabled gate) ---
+            if not entry_enabled:
+                return
             row = fetch_unprocessed_open_signal(cur)
             if not row:
                 return
@@ -963,6 +1117,17 @@ def _cycle(ex, _last_order_ts_unused):
             usdt_size = min(float(meta.get("qty", USDT_CAP)), USDT_CAP)
             if usdt_size <= 0:
                 usdt_size = USDT_CAP
+
+            # Exposure cap enforcement
+            usdt_size, cap_reason = enforce_exposure_cap(ex, usdt_size, cur=cur)
+            if usdt_size <= 0:
+                log(f"OPEN blocked by exposure cap: {cap_reason}")
+                audit(cur, "GUARD_BLOCK", SYMBOL, {
+                    "signal_id": sig_id, "guard": "exposure_cap",
+                    "reason": cap_reason,
+                })
+                mark_processed(cur, sig_id)
+                return
 
             log(f"OPEN {direction} signal_id={sig_id} usdt={usdt_size}")
             try:

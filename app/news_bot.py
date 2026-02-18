@@ -55,11 +55,12 @@ GOSSIP_BLOCKLIST = {
 
 LOW_VALUE_SOURCES = {'yahoo_finance'}  # insert에 impact_score >= 6 조건 적용
 
-# ── 소스 티어 분류 ──
+# ── 소스 티어 분류 (v2: bbc/investing → TIER2로 승격) ──
 SOURCE_TIERS = {
     'TIER1_SOURCE': {'reuters', 'bloomberg', 'wsj', 'ft', 'ap'},
-    'TIER2_SOURCE': {'cnbc', 'coindesk', 'marketwatch', 'cointelegraph'},
-    'REFERENCE_ONLY': {'yahoo_finance', 'investing', 'bbc_business', 'bbc_world'},
+    'TIER2_SOURCE': {'cnbc', 'coindesk', 'marketwatch', 'cointelegraph',
+                     'bbc_business', 'bbc_world', 'investing'},
+    'REFERENCE_ONLY': {'yahoo_finance'},
 }
 
 CRYPTO_FEEDS = {'coindesk', 'cointelegraph'}
@@ -102,14 +103,31 @@ CRYPTO_CORE_KEYWORDS = {
 IMPACT_KEYWORDS = {
     'fed', 'fomc', 'cpi', 'inflation', 'rate', 'powell', 'nfp', 'pce',
     'treasury', 'bond', 'yields', 'dxy',
-    'nasdaq', 'qqq', 'sp500', 'risk-off',
+    'nasdaq', 'qqq', 'sp500', 'risk-off', 'risk off', 'risk-on', 'risk on',
     'war', 'missile', 'sanction', 'tariff',
     'sec', 'etf', 'regulation', 'ban',
     'liquidation', 'hack', 'exploit',
+    # macro indicators
+    'pmi', 'ism', 'gdp', 'retail sales', 'jobless',
+    'credit spread', 'yield curve', 'us10y', 'earnings',
+    # central banks
+    'boj', 'ecb', 'rate decision', 'rate cut', 'rate hike',
 }
 MACRO_STANDALONE_KEYWORDS = {
+    # existing
     'fed', 'fomc', 'cpi', 'nfp', 'ppi', 'pce', 'powell',
     'war', 'missile', 'tariff', 'sanction',
+    # macro indicators
+    'dxy', 'pmi', 'ism', 'gdp', 'retail sales', 'jobless claims',
+    'consumer confidence', 'consumer sentiment',
+    # treasury/credit
+    'treasury yields', 'yield curve', 'credit spread', 'us10y',
+    # central banks
+    'boj', 'ecb', 'rate decision', 'rate cut', 'rate hike',
+    # geopolitical
+    'nato', 'invasion', 'embargo',
+    # mega-cap earnings (high BTC correlation)
+    'earnings',
 }
 
 
@@ -205,12 +223,12 @@ def worth_llm(title: str, active_keywords=None, source: str = '') -> bool:
     if has_crypto and has_impact:
         return True
     # 기존 KEYWORDS fallback (하위호환)
-    kw_list = active_keywords if active_keywords else KEYWORDS
+    kw_list = active_keywords if active_keywords is not None else KEYWORDS
     return any(k in t for k in kw_list)
 
 def extract_keywords(title: str, active_keywords=None):
     t = (title or "").lower()
-    kw_list = active_keywords if active_keywords else KEYWORDS
+    kw_list = active_keywords if active_keywords is not None else KEYWORDS
     hits = [k for k in kw_list if k in t]
     return hits
 
@@ -445,8 +463,13 @@ def main():
                         except Exception as llm_err:
                             log(f"[news_bot] LLM error: {llm_err}")
 
-                    # 7) 소스 티어 캡: REFERENCE_ONLY → 최대 TIER3
-                    if source_tier == 'REFERENCE_ONLY' and tier in ('TIER1', 'TIER2'):
+                    # 7) 소스 가중치 기반 티어 캡 (weight < 0.6 → TIER3)
+                    try:
+                        from news_classifier_config import get_source_weight, DENY_SOURCE_WEIGHT_THRESHOLD
+                        _sw = get_source_weight(source)
+                    except Exception:
+                        _sw = 0.55 if source_tier == 'REFERENCE_ONLY' else 0.70
+                    if _sw < DENY_SOURCE_WEIGHT_THRESHOLD and tier in ('TIER1', 'TIER2'):
                         tier = 'TIER3'
 
                     # 8) 유효 티어 가드
@@ -454,31 +477,74 @@ def main():
                     if tier not in valid_tiers:
                         tier = 'UNKNOWN'
 
-                    # 9) exclusion_reason 결정
+                    # 9) exclusion_reason — v2 three-condition deny
                     exclusion_reason = None
+                    _low_tier = tier in ('TIER3', 'TIERX')
+                    _low_rel = (rel_score > 0 and rel_score < 0.55) or relevance in ('GOSSIP', 'LOW')
+                    _low_src = _sw < DENY_SOURCE_WEIGHT_THRESHOLD  # from step 7
+
                     if tier == 'TIERX':
                         exclusion_reason = 'TIERX: noise/column/stock_pick'
-                    elif rel_score > 0 and rel_score < 0.6:
-                        exclusion_reason = f'low_relevance: {rel_score}'
-                    elif source_tier == 'REFERENCE_ONLY' and impact < 6:
-                        exclusion_reason = 'reference_source_low_impact'
-                    elif relevance in ('GOSSIP', 'LOW'):
-                        exclusion_reason = 'llm_low_relevance'
+                    elif _low_tier and _low_rel and _low_src:
+                        exclusion_reason = f'triple_low: tier={tier} rel={rel_score:.2f} w={_sw:.2f}'
 
-                    # 제외된 뉴스도 DB에 저장 (추적용), 단 GOSSIP/LOW는 기존 호환성 위해 스킵 카운터 증가
-                    if relevance in ('GOSSIP', 'LOW') and exclusion_reason:
+                    # 제외된 뉴스도 DB에 저장 (추적용), 카운터 증가
+                    if exclusion_reason:
                         skipped_low_relevance += 1
 
                     kw = extract_keywords(title, active_keywords)
 
-                    # 10) DB INSERT (tier, relevance_score, source_tier, exclusion_reason, topic_class, asset_relevance 포함)
+                    # 9.5) Shadow classifier — preview_classify (two-tier allow)
+                    allow_storage = False
+                    allow_trading = False
+                    try:
+                        import news_classifier_config as _ncc
+                        _shadow = _ncc.preview_classify(
+                            title, source, impact,
+                            summary=summary or '', title_ko=title_ko or '')
+                        # If GPT returned noise/empty topic, use shadow
+                        if topic_class in ('noise', '', None) and _shadow.get('topic_class_preview', 'unclassified') != 'unclassified':
+                            topic_class = _shadow['topic_class_preview']
+                        # If GPT didn't assign tier, use shadow
+                        if tier in ('UNKNOWN', None) and _shadow.get('tier_preview'):
+                            tier = _shadow['tier_preview']
+                        # If relevance_score is missing, use shadow
+                        if (not rel_score or rel_score <= 0) and _shadow.get('relevance_score_preview'):
+                            rel_score = _shadow['relevance_score_preview']
+                        # Two-tier allow decisions
+                        allow_storage = _shadow.get('allow_for_storage', False)
+                        allow_trading = _shadow.get('allow_for_trading', False)
+                    except Exception:
+                        pass  # shadow classifier failure should never block insertion
+
+                    # 9.7) BTC keyword fallback for still-unclassified items
+                    if topic_class in ('unclassified', 'noise', '', None):
+                        _btc_kws = {'bitcoin', 'btc', 'crypto', 'cryptocurrency',
+                                    'blockchain', 'halving', 'mining', 'defi', 'exchange'}
+                        title_lower = (title or '').lower()
+                        if any(kw in title_lower for kw in _btc_kws):
+                            topic_class = 'CRYPTO_GENERAL'
+                            if not allow_storage:
+                                allow_storage = True
+
+                    # 10) Compute trading_impact_weight = source_weight * relevance_score
+                    try:
+                        from news_classifier_config import get_source_weight
+                        _src_w = get_source_weight(source)
+                        _trading_impact_weight = round(_src_w * (rel_score or 0), 4)
+                    except Exception:
+                        _trading_impact_weight = 0
+
+                    # 11) DB INSERT (tier, relevance_score, source_tier, exclusion_reason, topic_class, asset_relevance, allow_storage, allow_trading, trading_impact_weight)
                     with db.cursor() as cur:
                         cur.execute("""
                             INSERT INTO public.news(source, title, url, summary, impact_score,
                                                     keywords, title_ko, tier, relevance_score,
                                                     source_tier, exclusion_reason,
-                                                    topic_class, asset_relevance)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                                    topic_class, asset_relevance,
+                                                    allow_storage, allow_trading,
+                                                    trading_impact_weight)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                             ON CONFLICT (url) DO UPDATE SET
                                 summary = EXCLUDED.summary,
                                 impact_score = EXCLUDED.impact_score,
@@ -489,7 +555,10 @@ def main():
                                 source_tier = EXCLUDED.source_tier,
                                 exclusion_reason = EXCLUDED.exclusion_reason,
                                 topic_class = EXCLUDED.topic_class,
-                                asset_relevance = EXCLUDED.asset_relevance
+                                asset_relevance = EXCLUDED.asset_relevance,
+                                allow_storage = EXCLUDED.allow_storage,
+                                allow_trading = EXCLUDED.allow_trading,
+                                trading_impact_weight = EXCLUDED.trading_impact_weight
                             WHERE EXCLUDED.impact_score > COALESCE(news.impact_score, 0)
                                OR news.tier IS NULL
                         """, (
@@ -506,6 +575,9 @@ def main():
                             exclusion_reason,
                             topic_class,
                             asset_relevance,
+                            allow_storage,
+                            allow_trading,
+                            _trading_impact_weight,
                         ))
                     inserted += 1
 
