@@ -512,9 +512,19 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
     once_lock_ttl = exec_ctx.get('once_lock_ttl')
     test_mode = exec_ctx.get('test_mode', False)
     test_mode_end = exec_ctx.get('test_mode_end', '')
-    cap_limit = exec_ctx.get('capital_limit', 900)
-    budget_pct = exec_ctx.get('trade_budget_pct', 70)
-    max_stages = exec_ctx.get('max_stages', 7)
+    eq_limits = exec_ctx.get('equity_limits')
+    if eq_limits:
+        cap_limit = eq_limits.get('operating_cap', 900)
+        equity_val = eq_limits.get('equity', 0)
+        budget_pct = eq_limits.get('operating_ratio', 0.70) * 100
+        max_stages = eq_limits.get('max_stages', 7)
+        cap_source = eq_limits.get('source', 'exchange').upper()
+    else:
+        cap_limit = exec_ctx.get('capital_limit', 900)
+        equity_val = 0
+        budget_pct = exec_ctx.get('trade_budget_pct', 70)
+        max_stages = exec_ctx.get('max_stages', 7)
+        cap_source = 'FALLBACK'
     live_trading = exec_ctx.get('live_trading', False)
 
     if gate_ok is True:
@@ -545,7 +555,10 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
         sections.append('   - test_mode: OFF')
 
     sections.append(f'   - LIVE_TRADING: {"YES" if live_trading else "NO"}')
-    sections.append(f'   - 자본한도: {cap_limit:,.0f} USDT / {budget_pct:.0f}% / {max_stages}단계')
+    if eq_limits and equity_val > 0:
+        sections.append(f'   - 자본한도: {cap_limit:,.0f} USDT (= equity {equity_val:,.0f} x {budget_pct:.0f}%) / {max_stages}단계 [{cap_source}]')
+    else:
+        sections.append(f'   - 자본한도: {cap_limit:,.0f} USDT / {budget_pct:.0f}% / {max_stages}단계 [{cap_source}]')
 
     # Last fill info
     last_fill = exec_ctx.get('last_fill')
@@ -674,12 +687,22 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         eq = capital_info.get('equity', 0)
         op = capital_info.get('operating_cap', 0)
         res = capital_info.get('reserve', 0)
+        ratio = capital_info.get('operating_ratio', 0.70)
+        max_stg = capital_info.get('max_stages', 7)
+        slc = capital_info.get('slice_usdt', 0)
         used = capital_info.get('used_usdt', 0)
         remaining = capital_info.get('remaining_usdt', 0)
-        source = capital_info.get('source', '?')
+        source = capital_info.get('source', '?').upper()
         sections.append(
-            f'[CAPITAL] equity=${eq:,.0f} | 운용=${op:,.0f} 예비=${res:,.0f} ({source})\n'
-            f'  사용={used:,.0f} 잔여={remaining:,.0f} USDT'
+            f'[CAPITAL]\n'
+            f'  - equity_total: {eq:,.2f} USDT ({source})\n'
+            f'  - operating_ratio: {ratio:.2f}\n'
+            f'  - operating_cap: {op:,.2f} USDT (= {eq:,.2f} x {ratio:.2f})\n'
+            f'  - reserve_cap: {res:,.2f} USDT (= {eq:,.2f} - {op:,.2f})\n'
+            f'  - stage_plan: {max_stg} steps\n'
+            f'  - slice_per_step: {slc:,.2f} USDT (= {op:,.2f} / {max_stg})\n'
+            f'  - used_cap: {used:,.2f} USDT\n'
+            f'  - remaining_cap: {remaining:,.2f} USDT'
         )
         # Leverage
         lev = capital_info.get('leverage_current', 0)
@@ -687,8 +710,7 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         sections.append(f'[LEVERAGE] current={lev}x | rule={lev_rule}')
         # Stage
         stage = capital_info.get('stage', 0)
-        max_stage = capital_info.get('max_stages', 7)
-        sections.append(f'[STAGE] {stage}/{max_stage}')
+        sections.append(f'[STAGE] {stage}/{max_stg}')
     else:
         sections.append(f'[RISK] (use /risk_config for details)')
 

@@ -394,10 +394,18 @@ def _gather_live_test_2_data():
         'end': END_UTC,
         'mode': 'REAL',
         'symbol': 'BTC ONLY',
-        'cap': 900,
+        'cap': None,  # filled dynamically below
     }
     try:
         with conn.cursor() as cur:
+            # Dynamic cap from equity limits
+            try:
+                import safety_manager
+                _eq = safety_manager.get_equity_limits(cur)
+                data['cap'] = round(_eq.get('operating_cap', 900), 0)
+            except Exception:
+                data['cap'] = 900
+
             # Total trades, wins, losses, PnL
             cur.execute("""
                 SELECT COUNT(*),
@@ -527,7 +535,7 @@ def _format_live_test_2_report(data):
         f"  최대 DD: {data.get('max_drawdown', 0)} USDT",
         f"",
         f"[캡 준수]",
-        f"  900 USDT 캡 차단: {data.get('cap_blocked', 0)}건",
+        f"  {data.get('cap', '?')} USDT 캡 차단: {data.get('cap_blocked', 0)}건",
         f"  캡 축소: {data.get('cap_shrink', 0)}건",
         f"",
         f"[17:30 청산]",

@@ -116,9 +116,11 @@ def get_equity_limits(cur=None):
         equity = limits.get('capital_limit_usdt', 900)
         source = 'db_fallback'
 
-    operating_cap = equity * 0.70   # operating funds
-    reserve = equity * 0.30         # reserve funds
-    slice_usdt = operating_cap / 7  # per-stage slice (= equity * 10%)
+    operating_ratio = limits.get('trade_budget_pct', 70) / 100.0
+    max_stages = limits.get('max_stages', 7)
+    operating_cap = equity * operating_ratio
+    reserve = equity * (1 - operating_ratio)
+    slice_usdt = operating_cap / max_stages if max_stages > 0 else operating_cap
 
     return {
         'equity': round(equity, 2),
@@ -127,6 +129,8 @@ def get_equity_limits(cur=None):
         'slice_usdt': round(slice_usdt, 2),
         'max_entry_usdt': round(operating_cap, 2),
         'source': source,
+        'operating_ratio': operating_ratio,
+        'max_stages': max_stages,
         'leverage_min': limits.get('leverage_min', 3),
         'leverage_max': limits.get('leverage_max', 8),
         'leverage_high_stage_max': limits.get('leverage_high_stage_max', 5),

@@ -490,14 +490,16 @@ def fetch_execution_context(cur=None):
         except Exception:
             ctx['last_fill'] = None
 
-        # 8. capital limits
+        # 8. capital limits (dynamic equity-based)
         try:
             import safety_manager
-            limits = safety_manager._load_safety_limits(cur)
-            ctx['capital_limit'] = limits.get('capital_limit_usdt', 900)
-            ctx['trade_budget_pct'] = limits.get('trade_budget_pct', 70)
-            ctx['max_stages'] = limits.get('max_stages', 7)
+            eq = safety_manager.get_equity_limits(cur)
+            ctx['equity_limits'] = eq
+            ctx['capital_limit'] = eq.get('operating_cap', 900)
+            ctx['trade_budget_pct'] = eq.get('operating_ratio', 0.70) * 100
+            ctx['max_stages'] = eq.get('max_stages', 7)
         except Exception:
+            ctx['equity_limits'] = None
             ctx['capital_limit'] = 900
             ctx['trade_budget_pct'] = 70
             ctx['max_stages'] = 7
@@ -513,6 +515,7 @@ def fetch_execution_context(cur=None):
                 'once_lock': False, 'test_mode': False, 'gate_ok': None,
                 'gate_reason': 'context fetch failed', 'wait_reason': 'UNKNOWN',
                 'wait_detail': '', 'recent_exec_queue': [], 'last_fill': None,
+                'equity_limits': None,
                 'capital_limit': 900, 'trade_budget_pct': 70, 'max_stages': 7,
                 'live_trading': False}
     finally:

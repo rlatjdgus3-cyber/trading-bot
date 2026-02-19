@@ -3166,12 +3166,14 @@ def _debug_state(_text=None):
     except Exception:
         lines.append('  (equity_limits 조회 실패)')
     conn2 = None
+    _cap_source = 'dynamic'
     try:
         import safety_manager as _sm
         _eq = _sm.get_equity_limits()
         _cap = _eq['operating_cap']
     except Exception:
         _cap = 900  # fallback
+        _cap_source = 'FALLBACK'
     try:
         conn2 = _db()
         with conn2.cursor() as cur2:
@@ -3186,10 +3188,10 @@ def _debug_state(_text=None):
                 cap_used = float(ps[2] or 0)
                 remaining = max(0, _cap - cap_used)
                 lines.append(f'  position: {side_str} qty={qty_val} capital_used={cap_used:.1f}')
-                lines.append(f'  remaining_cap: {remaining:.1f} USDT')
+                lines.append(f'  remaining_cap: {remaining:.1f} USDT [{_cap_source}]')
             else:
                 lines.append('  position: FLAT')
-                lines.append(f'  remaining_cap: {_cap} USDT')
+                lines.append(f'  remaining_cap: {_cap} USDT [{_cap_source}]')
             # Cap block/shrink counts
             cur2.execute("""
                 SELECT event, count(*)

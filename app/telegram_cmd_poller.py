@@ -2720,7 +2720,9 @@ def _trade_full_status(chat_id: int) -> str:
                 import safety_manager
                 from trading_config import ALLOWED_SYMBOLS
                 eq = safety_manager.get_equity_limits(cur)
-                lines.append(f'cap: slice={eq["slice_usdt"]:.0f} total={eq["operating_cap"]:.0f} (equity={eq["equity"]:.0f}, src={eq["source"]})')
+                _ratio_pct = eq.get('operating_ratio', 0.70) * 100
+                _max_stg = eq.get('max_stages', 7)
+                lines.append(f'cap: total={eq["operating_cap"]:.0f} (= {eq["equity"]:.0f} x {_ratio_pct:.0f}%) slice={eq["slice_usdt"]:.0f} (= {eq["operating_cap"]:.0f}/{_max_stg}) src={eq["source"]}')
                 lines.append(f'allowed_symbols: {", ".join(ALLOWED_SYMBOLS)}')
             except Exception as e:
                 lines.append(f'cap: (조회 오류: {e})')
