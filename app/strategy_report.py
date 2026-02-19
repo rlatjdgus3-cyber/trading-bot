@@ -506,7 +506,8 @@ def _gather_live_test_2_data():
     except Exception as e:
         data['error'] = str(e)
     finally:
-        conn.close()
+        if conn:
+            conn.close()
     return data
 
 

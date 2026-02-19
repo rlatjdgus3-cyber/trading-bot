@@ -702,7 +702,6 @@ def _snapshot(_text=None):
                     'used_usdt': used,
                     'remaining_usdt': round(max(0, eq['operating_cap'] - used), 2),
                     'stage': stage,
-                    'max_stages': 7,
                     'leverage_current': lev,
                     'leverage_rule': f'{lev_min}-{lev_max}x',
                 }
@@ -3157,23 +3156,19 @@ def _debug_state(_text=None):
     # ── Exposure cap / symbol whitelist ──
     lines.append('')
     lines.append('[exposure_cap]')
+    _cap_source = 'dynamic'
+    _cap = 900
     try:
         from trading_config import ALLOWED_SYMBOLS
         import safety_manager
         eq = safety_manager.get_equity_limits()
+        _cap = eq['operating_cap']
         lines.append(f'  ALLOWED_SYMBOLS: {", ".join(sorted(ALLOWED_SYMBOLS))}')
         lines.append(f'  operating_cap: {eq["operating_cap"]} (equity={eq["equity"]}, src={eq["source"]})')
     except Exception:
+        _cap_source = 'FALLBACK'
         lines.append('  (equity_limits 조회 실패)')
     conn2 = None
-    _cap_source = 'dynamic'
-    try:
-        import safety_manager as _sm
-        _eq = _sm.get_equity_limits()
-        _cap = _eq['operating_cap']
-    except Exception:
-        _cap = 900  # fallback
-        _cap_source = 'FALLBACK'
     try:
         conn2 = _db()
         with conn2.cursor() as cur2:

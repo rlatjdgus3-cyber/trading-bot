@@ -501,7 +501,7 @@ def fetch_execution_context(cur=None):
         except Exception:
             ctx['equity_limits'] = None
             ctx['capital_limit'] = 900
-            ctx['trade_budget_pct'] = 70
+            ctx['trade_budget_pct'] = 70.0
             ctx['max_stages'] = 7
 
         # 9. LIVE_TRADING env
@@ -516,7 +516,7 @@ def fetch_execution_context(cur=None):
                 'gate_reason': 'context fetch failed', 'wait_reason': 'UNKNOWN',
                 'wait_detail': '', 'recent_exec_queue': [], 'last_fill': None,
                 'equity_limits': None,
-                'capital_limit': 900, 'trade_budget_pct': 70, 'max_stages': 7,
+                'capital_limit': 900, 'trade_budget_pct': 70.0, 'max_stages': 7,
                 'live_trading': False}
     finally:
         if close_conn and conn:

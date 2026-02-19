@@ -88,7 +88,10 @@ def get_equity_limits(cur=None):
     Falls back to DB capital_limit_usdt if exchange unavailable.
     """
     import exchange_reader
-    bal = exchange_reader.fetch_balance()
+    try:
+        bal = exchange_reader.fetch_balance()
+    except Exception:
+        bal = {'data_status': 'ERROR', 'total': 0}
 
     conn = None
     close_conn = False
