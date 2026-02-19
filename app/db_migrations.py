@@ -1646,6 +1646,8 @@ def run_all():
             ensure_market_context_table(cur)
             # MCTX Phase 2: peak_upnl_pct for trailing TP
             ensure_peak_upnl_column(cur)
+            # Daily trade limit 20→60
+            update_daily_trade_limit(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -1909,6 +1911,16 @@ def ensure_peak_upnl_column(cur):
             ADD COLUMN IF NOT EXISTS peak_upnl_pct NUMERIC DEFAULT 0;
     """)
     _log('ensure_peak_upnl_column done')
+
+
+def update_daily_trade_limit(cur):
+    """Update max_daily_trades from 20 to 60."""
+    cur.execute("""
+        UPDATE safety_limits
+        SET max_daily_trades = 60
+        WHERE max_daily_trades = 20;
+    """)
+    _log('update_daily_trade_limit done')
 
 
 def ensure_market_context_table(cur):

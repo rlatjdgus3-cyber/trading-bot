@@ -28,6 +28,8 @@ DB_ERROR_MAX_CONSECUTIVE = 3        # 3 consecutive -> trade OFF
 NETWORK_BACKOFF_BASE = 5            # 5->10->20->40->300 max
 NETWORK_BACKOFF_MAX = 300
 ENTERING_TTL_SEC = 180
+SIGNAL_DEDUP_SEC = 60              # same direction+action_type blocked for 60s
+REJECTION_COOLDOWN_SEC = 180       # 3min cooldown after rejection
 
 EXIT_ACTIONS = frozenset({'CLOSE', 'REDUCE', 'REVERSE_CLOSE', 'FULL_CLOSE'})
 
@@ -52,6 +54,8 @@ _state = {
     'last_reject_reason': '',
     'last_reject_ts': 0.0,
     'recent_attempts': [],          # list of float timestamps (sliding 1hr, ENTRY only)
+    'last_signal_key': '',          # 'LONG:OPEN' format
+    'last_signal_ts': 0.0,
 }
 _loaded = False
 _lock = threading.Lock()
@@ -153,7 +157,28 @@ def record_attempt(cur, action_type, direction, outcome,
         _state['last_action_ts'][action_type] = now
         if action_type not in EXIT_ACTIONS:
             _state['recent_attempts'].append(now)
+        _state['last_signal_key'] = f'{direction}:{action_type}'
+        _state['last_signal_ts'] = now
         _prune_old_attempts(now)
+
+
+def check_signal_dedup(action_type, direction):
+    """Block identical signal within SIGNAL_DEDUP_SEC.
+    Also block any entry for REJECTION_COOLDOWN_SEC after last rejection."""
+    with _lock:
+        now = time.time()
+        # 1) Rejection cooldown
+        if _state['last_reject_ts'] > 0:
+            elapsed = now - _state['last_reject_ts']
+            if elapsed < REJECTION_COOLDOWN_SEC:
+                return (False, f'rejection_cooldown ({REJECTION_COOLDOWN_SEC - elapsed:.0f}s remaining)')
+        # 2) Same signal dedup
+        key = f'{direction}:{action_type}'
+        if key == _state['last_signal_key']:
+            elapsed = now - _state['last_signal_ts']
+            if elapsed < SIGNAL_DEDUP_SEC:
+                return (False, f'signal_dedup ({key}, {SIGNAL_DEDUP_SEC - elapsed:.0f}s remaining)')
+    return (True, '')
 
 
 def check_rate_limit(cur=None, symbol='BTC/USDT:USDT'):
@@ -241,8 +266,8 @@ def check_entry_lock():
     return (True, '', 0)
 
 
-def check_all(cur, action_type, symbol='BTC/USDT:USDT'):
-    """Unified throttle check. Combines entry_lock + rate_limit + cooldown.
+def check_all(cur, action_type, symbol='BTC/USDT:USDT', direction=None):
+    """Unified throttle check. Combines entry_lock + signal_dedup + rate_limit + cooldown.
     EXIT actions (CLOSE, REDUCE, REVERSE_CLOSE, FULL_CLOSE) always bypass.
     Returns (ok, reason, meta_dict).
     """
@@ -253,6 +278,12 @@ def check_all(cur, action_type, symbol='BTC/USDT:USDT'):
     ok, reason, ts = check_entry_lock()
     if not ok:
         return (False, reason, {'next_allowed_ts': ts, 'lock_type': 'entry_lock'})
+
+    # 1.5 Signal dedup (same direction+action within 60s, rejection cooldown 180s)
+    if direction:
+        ok, reason = check_signal_dedup(action_type, direction)
+        if not ok:
+            return (False, reason, {'lock_type': 'signal_dedup'})
 
     # 2. Rate limit (12/hr, 4/10min)
     ok, reason, ts = check_rate_limit(cur, symbol)

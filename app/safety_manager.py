@@ -46,7 +46,7 @@ def _load_safety_limits(cur):
     if not row:
         return {
             'capital_limit_usdt': 900,
-            'max_daily_trades': 20,
+            'max_daily_trades': 60,
             'max_hourly_trades': 15,
             'daily_loss_limit_usdt': -45,
             'max_pyramid_stages': 7,

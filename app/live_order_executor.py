@@ -1221,7 +1221,7 @@ def _cycle(ex, _last_order_ts_unused):
                 return
 
             # Guard: order throttle (replaces simple rate limit)
-            throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, 'OPEN')
+            throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, 'OPEN', direction=direction)
             if not throttle_ok:
                 log(f"GUARD: throttle — {throttle_reason}")
                 audit(cur, "GUARD_BLOCK", SYMBOL, {

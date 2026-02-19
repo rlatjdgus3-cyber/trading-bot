@@ -84,11 +84,15 @@ ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD = 40  # 조건C: |news_event_score| >= 40
 # ── Telegram throttle ────────────────────────────────────
 TELEGRAM_EVENT_THROTTLE_SEC = 600  # same event type: max once per 10 min
 
+# ── Whipsaw guard (vol_spike + level_break) ──────────────
+WHIPSAW_GUARD_SEC = 120            # 120s wait when vol_spike + level_break coincide
+
 # ── Event bundling (30s window) ──────────────────────────
 BUNDLE_WINDOW_SEC = 30
 _event_bundle = {
     'triggers': [],
     'first_ts': 0,
+    'whipsaw_first_ts': 0,
 }
 
 # ── emergency lock state ──────────────────────────────────
@@ -621,6 +625,22 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
         _log(f'triggers buffered for bundling: {[t["type"] for t in surviving]}')
         return EventResult()  # still accumulating, return DEFAULT
 
+    # Whipsaw guard: vol_spike + level_break coincide → 120s wait
+    has_vol_spike = any(t.get('type') == 'volume_spike' or t.get('vol_spike') for t in bundled)
+    has_level_break = any(t.get('type') in ('vah_break', 'val_break') for t in bundled)
+    if has_vol_spike and has_level_break:
+        ws_first = _event_bundle.get('whipsaw_first_ts', 0)
+        if ws_first == 0:
+            _event_bundle['whipsaw_first_ts'] = time.time()
+            _log('WHIPSAW_GUARD: vol_spike+level_break detected, starting 120s wait')
+            return EventResult()
+        elapsed_ws = time.time() - ws_first
+        if elapsed_ws < WHIPSAW_GUARD_SEC:
+            _log(f'WHIPSAW_GUARD: vol_spike+level_break, {WHIPSAW_GUARD_SEC - elapsed_ws:.0f}s remaining')
+            return EventResult()
+        # 120s elapsed → pass through, reset timer
+        _event_bundle['whipsaw_first_ts'] = 0
+
     eh = compute_event_hash(bundled, symbol=symbol, price=price)
     _log(f'EVENT: triggers={[t["type"] for t in bundled]} hash={eh[:12]}')
     return EventResult(
@@ -730,6 +750,7 @@ def _check_level_breaks(snapshot, cur=None) -> list:
                 'value': price,
                 'vah': vah,
                 'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
+                'vol_spike': snapshot.get('vol_ratio', 0) >= VOL_SPIKE_RATIO,
             })
         _prev_level_state['above_vah'] = now_above_vah
 
@@ -744,6 +765,7 @@ def _check_level_breaks(snapshot, cur=None) -> list:
                 'value': price,
                 'val': val,
                 'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
+                'vol_spike': snapshot.get('vol_ratio', 0) >= VOL_SPIKE_RATIO,
             })
         _prev_level_state['below_val'] = now_below_val
 

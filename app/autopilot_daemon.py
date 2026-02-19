@@ -22,7 +22,7 @@ SYMBOL = 'BTC/USDT:USDT'
 ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
 POLL_SEC = 20
 COOLDOWN_SEC = 30  # v2.1 중간 공격형
-MAX_DAILY_TRADES = 10
+MAX_DAILY_TRADES = 60
 MIN_CONFIDENCE = 10  # abs(total_score) >= 10 for entry
 DEFAULT_SIZE_PCT = 10
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
@@ -30,6 +30,10 @@ TRADE_SWITCH_DEDUP_KEY = 'autopilot:risk_check:trade_switch_off'
 LOG_COOLDOWN_SEC = 1800  # 30min log dedup (non-trade_switch reasons)
 _migrations_done = False
 _exchange = None
+_last_add_price = 0.0           # last ADD attempt price
+_last_add_ts = 0.0
+ADD_PRICE_DEDUP_PCT = 0.1       # ±0.1% range
+ADD_PRICE_DEDUP_SEC = 600       # 10min window
 
 
 def _db_check_trade_switch_transition(cur):
@@ -452,6 +456,16 @@ def _cycle():
             # Risk checks passed → trade_switch is ON: reset transition state
             _db_reset_trade_switch(cur)
 
+            # WAIT_ORDER_FILL: block signal creation while pending orders exist
+            try:
+                import exchange_reader
+                wr, wd = exchange_reader.compute_wait_reason(cur=cur)
+                if wr == 'WAIT_ORDER_FILL':
+                    _log(f'WAIT_ORDER_FILL: signal creation blocked ({wd})')
+                    return
+            except Exception:
+                pass  # FAIL-OPEN
+
             import direction_scorer
             scores = direction_scorer.compute_scores()
             confidence = scores.get('confidence', 0)
@@ -510,6 +524,21 @@ def _cycle():
                     if cur.fetchone():
                         _log('ADD blocked: duplicate pending in queue')
                     else:
+                        # ADD price dedup: block ±0.1% same price within 10min
+                        global _last_add_price, _last_add_ts
+                        try:
+                            cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
+                            price_row = cur.fetchone()
+                            current_price = float(price_row[0]) if price_row else 0
+                        except Exception:
+                            current_price = 0
+                        if current_price > 0 and _last_add_price > 0:
+                            diff_pct = abs(current_price - _last_add_price) / _last_add_price * 100
+                            elapsed = time.time() - _last_add_ts
+                            if diff_pct <= ADD_PRICE_DEDUP_PCT and elapsed < ADD_PRICE_DEDUP_SEC:
+                                _log(f'ADD_PRICE_DEDUP: blocked — price={current_price} vs last={_last_add_price} diff={diff_pct:.3f}%')
+                                return
+
                         (ok, reason) = safety_manager.run_all_checks(cur, add_usdt)
                         if not ok:
                             _log(f'ADD safety block: {reason}')
@@ -524,6 +553,9 @@ def _cycle():
                             """, (SYMBOL, direction, add_usdt, add_reason))
                             eq_row = cur.fetchone()
                             _log(f'ADD enqueued: eq_id={eq_row[0] if eq_row else None}')
+                            if current_price > 0:
+                                _last_add_price = current_price
+                                _last_add_ts = time.time()
                 else:
                     _log(f'position exists, {decision}: {add_reason}')
                 return
