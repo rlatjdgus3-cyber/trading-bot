@@ -109,9 +109,12 @@ def compute_dynamic_stop_loss(regime_score=None, macro_score=None, base=None):
 
     Returns: float between 1.2% and 3.0%
     '''
-    risk_input = regime_score * 0.6 + macro_score * 0.4
+    r = regime_score if regime_score is not None else 0
+    m = macro_score if macro_score is not None else 0
+    b = base if base is not None else 2.0
+    risk_input = r * 0.6 + m * 0.4
     adjustment = (-risk_input / 100) * 1
-    dynamic_sl = base + adjustment
+    dynamic_sl = b + adjustment
     return max(1.2, min(3, round(dynamic_sl, 2)))
 
 

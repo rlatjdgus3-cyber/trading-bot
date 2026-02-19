@@ -2,9 +2,11 @@ import os
 import time
 import traceback
 import ccxt
+from dotenv import load_dotenv
+load_dotenv('/root/trading-bot/app/.env')
 
 # =========================
-# 🔑 BYBIT API KEY 설정 (.env에서 로드)
+# BYBIT API KEY (.env에서 로드)
 # =========================
 BYBIT_API_KEY = os.getenv('BYBIT_API_KEY', '')
 BYBIT_API_SECRET = os.getenv('BYBIT_SECRET', '')

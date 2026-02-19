@@ -10,7 +10,11 @@ import json
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.environ['DATABASE_URL']
+try:
+    from db_config import SQLALCHEMY_URL
+    DATABASE_URL = SQLALCHEMY_URL
+except Exception:
+    DATABASE_URL = os.environ.get('DATABASE_URL', '')
 SYMBOL = os.environ.get('SYMBOL', 'BTC/USDT:USDT')
 TF = os.environ.get('TF', '1m')
 DRY_RUN = os.environ.get('DRY_RUN', '1') == '1'

@@ -23,11 +23,11 @@ LOG_PREFIX = '[trade_bridge]'
 ACTION_TBL = 'signals_action_v3'
 
 
-def _get_usdt_cap():
+def _get_usdt_cap(cur=None):
     """Dynamic per-order USDT cap from safety_manager. Fallback 300."""
     try:
         import safety_manager
-        eq = safety_manager.get_equity_limits()
+        eq = safety_manager.get_equity_limits(cur)
         return eq['slice_usdt']
     except Exception:
         return 300
@@ -158,7 +158,7 @@ def _insert_signal(cur, direction, usdt_amount=None, raw_text=None, source='tele
     now_unix = int(time.time())
     meta = {
         'direction': direction,
-        'qty': min(usdt_amount, _get_usdt_cap()) if usdt_amount else 0,
+        'qty': min(usdt_amount, _get_usdt_cap(cur)) if usdt_amount else 0,
         'dry_run': False,
         'source': source,
         'reason': 'manual_trade_command' if source == 'telegram_manual' else source}
@@ -274,7 +274,7 @@ def execute_trade_command(parsed = None):
         usdt_amount = balance * (size_pct / 100.0)
         if capital_limit and usdt_amount > capital_limit:
             usdt_amount = capital_limit
-        usdt_amount = min(usdt_amount, _get_usdt_cap())
+        usdt_amount = min(usdt_amount, _get_usdt_cap(cur))
         if usdt_amount < 1:
             return "주문 가능 금액이 부족합니다."
         # Insert signal

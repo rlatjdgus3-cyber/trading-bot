@@ -225,8 +225,9 @@ def _risk_checks(cur=None):
     row = cur.fetchone()
     if row and row[0]:
         import datetime
-        elapsed = (datetime.datetime.now(datetime.timezone.utc) - row[0].replace(
-            tzinfo=datetime.timezone.utc)).total_seconds()
+        ts = row[0] if row[0].tzinfo is not None else row[0].replace(
+            tzinfo=datetime.timezone.utc)
+        elapsed = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
         if elapsed < COOLDOWN_SEC:
             return (False, f'cooldown ({int(elapsed)}/{COOLDOWN_SEC}s)')
 
@@ -399,7 +400,33 @@ def _cycle():
                 (decision, add_reason) = _check_position_for_add(cur, pos_side, pos_qty, scores)
                 if decision == 'ADD':
                     _log(f'ADD decision: {add_reason}')
-                    # Handle ADD via position_manager
+                    import safety_manager
+                    direction = 'LONG' if pos_side == 'long' else 'SHORT'
+                    add_usdt = safety_manager.get_add_slice_usdt(cur)
+                    # Duplicate check
+                    cur.execute("""
+                        SELECT id FROM execution_queue
+                        WHERE symbol = %s AND action_type = 'ADD' AND direction = %s
+                          AND status IN ('PENDING', 'PICKED')
+                          AND ts >= now() - interval '5 minutes';
+                    """, (SYMBOL, direction))
+                    if cur.fetchone():
+                        _log('ADD blocked: duplicate pending in queue')
+                    else:
+                        (ok, reason) = safety_manager.run_all_checks(cur, add_usdt)
+                        if not ok:
+                            _log(f'ADD safety block: {reason}')
+                        else:
+                            cur.execute("""
+                                INSERT INTO execution_queue
+                                    (symbol, action_type, direction, target_usdt,
+                                     source, reason, priority, expire_at)
+                                VALUES (%s, 'ADD', %s, %s,
+                                        'autopilot', %s, 4, now() + interval '5 minutes')
+                                RETURNING id;
+                            """, (SYMBOL, direction, add_usdt, add_reason))
+                            eq_row = cur.fetchone()
+                            _log(f'ADD enqueued: eq_id={eq_row[0] if eq_row else None}')
                 else:
                     _log(f'position exists, {decision}: {add_reason}')
                 return

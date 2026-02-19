@@ -647,8 +647,8 @@ def compute(cur):
         dyn_crypto_w = CRYPTO_WEIGHT
         btc_qqq_corr = None
         try:
-            from score_engine import regime_correlation
-            corr_data = regime_correlation.get_current_regime()
+            import regime_correlation
+            corr_data = regime_correlation.get_correlation_info(cur)
             btc_qqq_corr = corr_data.get('correlation') if corr_data else None
             if btc_qqq_corr is not None:
                 if btc_qqq_corr > 0.5:
