@@ -1,6 +1,6 @@
 """
 indicators.py — Technical indicator calculator daemon.
-Runs every ~60s: fetches latest 300 1m candles, calculates indicators, upserts to DB.
+Runs every ~15s: fetches latest 300 1m candles, calculates indicators, upserts to DB.
 """
 import os
 import time
@@ -22,9 +22,20 @@ def hh(xs):
 def ll(xs):
     return min(xs)
 
+def ema(xs, period):
+    if len(xs) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema_val = sma(xs[:period])
+    for price in xs[period:]:
+        ema_val = (price - ema_val) * multiplier + ema_val
+    return ema_val
+
 print("=== INDICATOR ENGINE STARTED ===", flush=True)
 
-last_ts = None
+from watchdog_helper import init_watchdog
+init_watchdog(interval_sec=10)
+
 db = get_conn(autocommit=True)
 
 while True:
@@ -52,12 +63,6 @@ while True:
         rows = list(reversed(rows))
 
         ts, o, h, l, c, v = rows[-1]
-
-        # 같은 ts 반복 방지
-        if last_ts is not None and ts == last_ts:
-            time.sleep(5)
-            continue
-        last_ts = ts
 
         closes = [float(r[4]) for r in rows]
         highs  = [float(r[2]) for r in rows]
@@ -115,6 +120,34 @@ while True:
         ma_50 = sma(closes[-50:]) if len(closes) >= 50 else None
         ma_200 = sma(closes[-200:]) if len(closes) >= 200 else None
 
+        # EMA (9/21/50)
+        ema_9 = ema(closes, 9)
+        ema_21 = ema(closes, 21)
+        ema_50 = ema(closes, 50) if len(closes) >= 50 else None
+
+        # VWAP (UTC 00:00 intraday reset)
+        vwap_val = None
+        try:
+            from datetime import datetime, timezone
+            utc_today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            cum_vp = 0.0
+            cum_vol = 0.0
+            for r in rows:
+                row_ts = r[0]
+                if hasattr(row_ts, 'astimezone'):
+                    row_ts_utc = row_ts.astimezone(timezone.utc)
+                else:
+                    row_ts_utc = row_ts.replace(tzinfo=timezone.utc)
+                if row_ts_utc >= utc_today:
+                    typical = (float(r[2]) + float(r[3]) + float(r[4])) / 3
+                    vol_r = float(r[5])
+                    cum_vp += typical * vol_r
+                    cum_vol += vol_r
+            if cum_vol > 0:
+                vwap_val = cum_vp / cum_vol
+        except Exception:
+            pass
+
         # =========================
         # indicators 저장
         # =========================
@@ -127,16 +160,19 @@ while True:
                     ich_tenkan, ich_kijun,
                     ich_span_a, ich_span_b,
                     vol, vol_ma20, vol_spike,
-                    rsi_14, atr_14, ma_50, ma_200
+                    rsi_14, atr_14, ma_50, ma_200,
+                    ema_9, ema_21, ema_50, vwap
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (symbol, tf, ts) DO UPDATE SET
                     bb_mid=EXCLUDED.bb_mid, bb_up=EXCLUDED.bb_up, bb_dn=EXCLUDED.bb_dn,
                     ich_tenkan=EXCLUDED.ich_tenkan, ich_kijun=EXCLUDED.ich_kijun,
                     ich_span_a=EXCLUDED.ich_span_a, ich_span_b=EXCLUDED.ich_span_b,
                     vol=EXCLUDED.vol, vol_ma20=EXCLUDED.vol_ma20, vol_spike=EXCLUDED.vol_spike,
                     rsi_14=EXCLUDED.rsi_14, atr_14=EXCLUDED.atr_14,
-                    ma_50=EXCLUDED.ma_50, ma_200=EXCLUDED.ma_200
+                    ma_50=EXCLUDED.ma_50, ma_200=EXCLUDED.ma_200,
+                    ema_9=EXCLUDED.ema_9, ema_21=EXCLUDED.ema_21,
+                    ema_50=EXCLUDED.ema_50, vwap=EXCLUDED.vwap
                 """,
                 (
                     symbol, tf, ts,
@@ -144,7 +180,8 @@ while True:
                     tenkan, kijun,
                     span_a, span_b,
                     vol, vol_ma20, vol_spike,
-                    rsi_14, atr_14, ma_50, ma_200
+                    rsi_14, atr_14, ma_50, ma_200,
+                    ema_9, ema_21, ema_50, vwap_val
                 ),
             )
 
@@ -153,7 +190,7 @@ while True:
             flush=True
         )
 
-        time.sleep(60)
+        time.sleep(15)
 
     except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
         print(f"DB connection lost: {e}", flush=True)

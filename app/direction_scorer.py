@@ -215,16 +215,14 @@ def _compute_scores_legacy():
 
             price = _fetch_latest_price(cur)
             closes = _fetch_recent_closes(cur, 5)
-            sentiment = _fetch_news_sentiment(cur)
 
             (ich_l, ich_s) = _score_ichimoku(ind)
             (bb_l, bb_s) = _score_bollinger(ind, price)
             (vol_l, vol_s) = _score_volume(ind)
-            (news_l, news_s) = _score_news(sentiment)
             (mom_l, mom_s) = _score_momentum(closes)
 
-            long_score = ich_l + bb_l + vol_l + news_l + mom_l
-            short_score = ich_s + bb_s + vol_s + news_s + mom_s
+            long_score = ich_l + bb_l + vol_l + mom_l
+            short_score = ich_s + bb_s + vol_s + mom_s
 
             long_score = max(0, min(100, long_score))
             short_score = max(0, min(100, short_score))
@@ -241,7 +239,6 @@ def _compute_scores_legacy():
                     'ichimoku': (ich_l, ich_s),
                     'bollinger': (bb_l, bb_s),
                     'volume': (vol_l, vol_s),
-                    'news': (news_l, news_s),
                     'momentum': (mom_l, mom_s),
                 }}
 

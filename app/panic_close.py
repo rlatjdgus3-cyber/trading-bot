@@ -27,9 +27,20 @@ def db_conn():
     return get_conn(autocommit=True)
 
 def set_trade_switch(enabled: bool):
-    with db_conn() as db:
+    db = db_conn()
+    try:
         with db.cursor() as cur:
-            cur.execute("UPDATE trade_switch SET enabled=%s, updated_at=NOW() WHERE id=1;", (enabled,))
+            import trade_switch_recovery
+            trade_switch_recovery._ensure_columns(cur)
+            if not enabled:
+                trade_switch_recovery.set_off_with_reason(cur, 'panic_close')
+            else:
+                cur.execute("UPDATE trade_switch SET enabled=%s, off_reason=NULL, "
+                            "manual_off_until=NULL, updated_at=NOW() "
+                            "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
+                            (enabled,))
+    finally:
+        db.close()
 
 def exchange():
     return ccxt.bybit({

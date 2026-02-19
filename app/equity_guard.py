@@ -38,8 +38,12 @@ def get_trade_switch(cur) -> bool:
     row = q1(cur, "SELECT enabled FROM public.trade_switch ORDER BY id DESC LIMIT 1;")
     return bool(row[0]) if row else False
 
-def set_trade_switch(cur, enabled: bool):
-    cur.execute("INSERT INTO public.trade_switch(enabled) VALUES (%s);", (enabled,))
+def set_trade_switch(cur, enabled: bool, off_reason=None):
+    if not enabled and off_reason:
+        import trade_switch_recovery
+        trade_switch_recovery.set_off_with_reason(cur, off_reason)
+    else:
+        cur.execute("INSERT INTO public.trade_switch(enabled) VALUES (%s);", (enabled,))
 
 def get_cash(cur) -> Decimal:
     row = q1(cur, "SELECT capital_usdt FROM public.virtual_capital ORDER BY id DESC LIMIT 1;")
@@ -106,10 +110,10 @@ def main():
         ts = get_trade_switch(cur)
 
         if ts and equity <= total_floor:
-            set_trade_switch(cur, False)
+            set_trade_switch(cur, False, off_reason='equity_drawdown')
             print('[equity_guard] SWITCH OFF TOTAL_DD', 'equity=', equity, 'floor=', total_floor, flush=True)
         elif ts and equity <= day_floor:
-            set_trade_switch(cur, False)
+            set_trade_switch(cur, False, off_reason='equity_drawdown')
             print('[equity_guard] SWITCH OFF DAY_DD', 'equity=', equity, 'floor=', day_floor, flush=True)
         else:
             print('[equity_guard] OK', 'equity=', equity, 'start=', start_eq, 'day_floor=', day_floor, 'total_floor=', total_floor, 'trade_switch=', ts, flush=True)

@@ -43,6 +43,9 @@ def log(msg):
     print(msg, flush=True)
 
 def main():
+    from watchdog_helper import init_watchdog
+    init_watchdog(interval_sec=10)
+
     exchange = make_exchange()
     backoff = 5
     last_saved_ms = None
@@ -65,8 +68,9 @@ def main():
 
             last_ms = ohlcv[-1][0]
             if last_saved_ms is not None and last_ms == last_saved_ms:
-                log(f"[candles] no new candle (last_ms={last_ms}), sleep 10s")
-                time.sleep(10)
+                # Intra-bar: update current candle only
+                upsert_ohlcv(db, ohlcv[-1:])
+                time.sleep(15)
                 continue
 
             upsert_ohlcv(db, ohlcv)
@@ -74,7 +78,7 @@ def main():
 
             log(f"[candles] Saved {TF} last_ts_ms={last_ms}")
             backoff = 5
-            time.sleep(60)
+            time.sleep(15)
 
         except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
             log(f"[candles] network error: {repr(e)} | retry in {backoff}s")

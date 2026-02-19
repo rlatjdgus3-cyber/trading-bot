@@ -39,7 +39,7 @@ def _load_safety_limits(cur):
                daily_loss_limit_usdt, max_pyramid_stages, add_size_min_pct,
                add_size_max_pct, circuit_breaker_window_sec, circuit_breaker_max_orders,
                add_score_threshold, trade_budget_pct, stage_slice_pct, max_stages,
-               stop_loss_pct
+               stop_loss_pct, leverage_min, leverage_max, leverage_high_stage_max
         FROM safety_limits ORDER BY id DESC LIMIT 1;
     """)
     row = cur.fetchone()
@@ -50,13 +50,16 @@ def _load_safety_limits(cur):
             'max_hourly_trades': 15,
             'daily_loss_limit_usdt': -45,
             'max_pyramid_stages': 7,
-            'add_score_threshold': 65,
+            'add_score_threshold': 45,
             'trade_budget_pct': 70,
             'stage_slice_pct': 10,
             'max_stages': 7,
             'stop_loss_pct': 2.0,
             'circuit_breaker_window_sec': 300,
             'circuit_breaker_max_orders': 10,
+            'leverage_min': 3,
+            'leverage_max': 8,
+            'leverage_high_stage_max': 5,
         }
     return {
         'capital_limit_usdt': float(row[0]) if row[0] is not None else 900,
@@ -68,11 +71,65 @@ def _load_safety_limits(cur):
         'add_size_max_pct': float(row[6]) if row[6] is not None else 10,
         'circuit_breaker_window_sec': int(row[7]) if row[7] is not None else 300,
         'circuit_breaker_max_orders': int(row[8]) if row[8] is not None else 10,
-        'add_score_threshold': int(row[9]) if row[9] is not None else 65,
+        'add_score_threshold': int(row[9]) if row[9] is not None else 45,
         'trade_budget_pct': float(row[10]) if row[10] is not None else 70,
         'stage_slice_pct': float(row[11]) if row[11] is not None else 10,
         'max_stages': int(row[12]) if row[12] is not None else 7,
         'stop_loss_pct': float(row[13]) if row[13] is not None else 2.0,
+        'leverage_min': int(row[14]) if row[14] is not None else 3,
+        'leverage_max': int(row[15]) if row[15] is not None else 8,
+        'leverage_high_stage_max': int(row[16]) if row[16] is not None else 5,
+    }
+
+
+def get_equity_limits(cur=None):
+    """Fetch live equity from exchange and compute dynamic limits.
+    Returns {equity, operating_cap, reserve, slice_usdt, max_entry_usdt, source}.
+    Falls back to DB capital_limit_usdt if exchange unavailable.
+    """
+    import exchange_reader
+    bal = exchange_reader.fetch_balance()
+
+    conn = None
+    close_conn = False
+    try:
+        if cur is None:
+            conn = _db_conn()
+            conn.autocommit = True
+            cur = conn.cursor()
+            close_conn = True
+        limits = _load_safety_limits(cur)
+    except Exception:
+        limits = {'capital_limit_usdt': 900}
+    finally:
+        if close_conn and conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if bal.get('data_status') == 'OK' and bal['total'] > 0:
+        equity = bal['total']
+        source = 'exchange'
+    else:
+        # Fallback: DB-based (backward compatible)
+        equity = limits.get('capital_limit_usdt', 900)
+        source = 'db_fallback'
+
+    operating_cap = equity * 0.70   # operating funds
+    reserve = equity * 0.30         # reserve funds
+    slice_usdt = operating_cap / 7  # per-stage slice (= equity * 10%)
+
+    return {
+        'equity': round(equity, 2),
+        'operating_cap': round(operating_cap, 2),
+        'reserve': round(reserve, 2),
+        'slice_usdt': round(slice_usdt, 2),
+        'max_entry_usdt': round(operating_cap, 2),
+        'source': source,
+        'leverage_min': limits.get('leverage_min', 3),
+        'leverage_max': limits.get('leverage_max', 8),
+        'leverage_high_stage_max': limits.get('leverage_high_stage_max', 5),
     }
 
 
@@ -176,14 +233,22 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
             break
     if consec_stops >= 3:
         try:
-            cur.execute("""UPDATE trade_switch SET enabled = false
-                           WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);""")
+            import trade_switch_recovery
+            trade_switch_recovery.set_off_with_reason(cur, 'consecutive_stops')
         except Exception as e:
             _log(f'CONSECUTIVE STOPS: trade_switch UPDATE failed: {e}')
         _log(f'CONSECUTIVE STOPS AUTO-HALT: {consec_stops} stops today → trade_switch OFF')
         return (False, f"consecutive stop-loss auto-halt ({consec_stops} stops)")
 
     return (True, 'all checks passed')
+
+
+def is_gate_pass(cur):
+    """Check if safety gate passes (for auto-recovery decision).
+    Wraps run_all_checks with emergency=True to skip daily/hourly limits.
+    Returns (ok: bool, reason: str).
+    """
+    return run_all_checks(cur, emergency=True)
 
 
 def get_block_reason_code(cur, limits=None):
@@ -213,15 +278,14 @@ def get_block_reason_code(cur, limits=None):
 
 
 def check_total_exposure(cur, add_usdt, limits=None):
-    '''Check if adding add_usdt exceeds capital limit.'''
-    if limits is None:
-        limits = _load_safety_limits(cur)
+    '''Check if adding add_usdt exceeds operating cap (equity-based).'''
+    eq = get_equity_limits(cur)
     cur.execute('SELECT capital_used_usdt FROM position_state WHERE symbol = %s;', (SYMBOL,))
     row = cur.fetchone()
     current = float(row[0]) if row and row[0] else 0
-    cap = limits['capital_limit_usdt'] * limits['trade_budget_pct'] / 100
+    cap = eq['operating_cap']
     if current + add_usdt > cap:
-        return (False, f'total exposure would exceed budget ({current + add_usdt:.0f} > {cap:.0f})')
+        return (False, f'total exposure would exceed operating cap ({current + add_usdt:.0f} > {cap:.0f})')
     return (True, 'ok')
 
 
@@ -257,10 +321,9 @@ def get_add_slice_pct():
 
 
 def get_add_slice_usdt(cur, limits=None):
-    '''Get ADD slice amount in USDT.'''
-    if limits is None:
-        limits = _load_safety_limits(cur)
-    return limits['capital_limit_usdt'] * STAGE_SLICE_PCT / 100
+    '''Get ADD slice amount in USDT (equity-based).'''
+    eq = get_equity_limits(cur)
+    return eq['slice_usdt']
 
 
 def compute_start_stage(score):
@@ -281,8 +344,6 @@ def get_stage_entry_pct(start_stage):
 
 
 def get_entry_usdt(cur, start_stage, limits=None):
-    '''Get entry USDT amount for a given start stage.'''
-    if limits is None:
-        limits = _load_safety_limits(cur)
-    pct = get_stage_entry_pct(start_stage)
-    return limits['capital_limit_usdt'] * pct / 100
+    '''Get entry USDT amount for a given start stage (equity-based).'''
+    eq = get_equity_limits(cur)
+    return eq['slice_usdt'] * start_stage

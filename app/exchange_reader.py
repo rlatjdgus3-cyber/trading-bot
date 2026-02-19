@@ -317,7 +317,7 @@ def compute_wait_reason(cur=None, gate_status=None):
             cur = conn.cursor()
             close_conn = True
 
-        # 0. trade_switch OFF → WAIT_SWITCH (최우선)
+        # trade_switch OFF → WAIT_SWITCH
         cur.execute(
             "SELECT enabled FROM trade_switch ORDER BY id DESC LIMIT 1;")
         row = cur.fetchone()
@@ -344,6 +344,18 @@ def compute_wait_reason(cur=None, gate_status=None):
         """, (SYMBOL,))
         if int(cur.fetchone()[0]) > 0:
             return ('WAIT_ORDER_FILL', '실행큐 대기/전송 중')
+
+        # 4. Capital cap exceeded -> WAIT_CAP
+        try:
+            import safety_manager
+            eq = safety_manager.get_equity_limits(cur)
+            cur.execute('SELECT capital_used_usdt FROM position_state WHERE symbol = %s;', (SYMBOL,))
+            row = cur.fetchone()
+            used = float(row[0]) if row and row[0] else 0
+            if used >= eq['operating_cap']:
+                return ('WAIT_CAP', f'자본 한도 도달: {used:.0f}/{eq["operating_cap"]:.0f} USDT')
+        except Exception:
+            pass
 
         return ('WAIT_SIGNAL', '모든 조건 통과, 신호 대기 중')
     except Exception as e:
@@ -461,7 +473,7 @@ def fetch_execution_context(cur=None):
         try:
             cur.execute("""
                 SELECT id, order_type, direction, status, requested_qty,
-                       to_char(created_at, 'MM-DD HH24:MI') as ts_str
+                       to_char(order_sent_at, 'MM-DD HH24:MI') as ts_str
                 FROM execution_log
                 WHERE status IN ('FILLED', 'PARTIAL')
                 ORDER BY id DESC LIMIT 1;
@@ -593,7 +605,7 @@ def build_report_exchange_block():
             try:
                 cur.execute("""
                     SELECT id, order_type, direction, status, requested_qty,
-                           to_char(created_at, 'MM-DD HH24:MI') as ts_str
+                           to_char(order_sent_at, 'MM-DD HH24:MI') as ts_str
                     FROM execution_log
                     WHERE status IN ('FILLED', 'PARTIAL')
                     ORDER BY id DESC LIMIT 1;

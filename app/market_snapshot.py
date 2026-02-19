@@ -143,6 +143,43 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
     ma_50 = _sma(closes[-50:]) if len(closes) >= 50 else None
     ma_200 = _sma(closes[-200:]) if len(closes) >= 200 else None
 
+    # EMA (9/21/50)
+    def _ema(xs, period):
+        if len(xs) < period:
+            return None
+        multiplier = 2 / (period + 1)
+        ema_val = _sma(xs[:period])
+        for p in xs[period:]:
+            ema_val = (p - ema_val) * multiplier + ema_val
+        return ema_val
+
+    ema_9 = _ema(closes, 9)
+    ema_21 = _ema(closes, 21)
+    ema_50 = _ema(closes, 50) if len(closes) >= 50 else None
+
+    # VWAP (UTC 00:00 intraday reset)
+    vwap_val = None
+    try:
+        from datetime import datetime, timezone
+        utc_today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cum_vp = 0.0
+        cum_vol = 0.0
+        for r in rows:
+            row_ts = r[0]
+            if hasattr(row_ts, 'astimezone'):
+                row_ts_utc = row_ts.astimezone(timezone.utc)
+            else:
+                row_ts_utc = row_ts.replace(tzinfo=timezone.utc)
+            if row_ts_utc >= utc_today:
+                typical = (float(r[2]) + float(r[3]) + float(r[4])) / 3
+                vol_r = float(r[5])
+                cum_vp += typical * vol_r
+                cum_vol += vol_r
+        if cum_vol > 0:
+            vwap_val = cum_vp / cum_vol
+    except Exception:
+        pass
+
     # Upsert indicators
     ts_last = rows[-1][0]
     cur.execute("""
@@ -151,22 +188,26 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
             bb_mid, bb_up, bb_dn,
             ich_tenkan, ich_kijun, ich_span_a, ich_span_b,
             vol, vol_ma20, vol_spike,
-            rsi_14, atr_14, ma_50, ma_200
+            rsi_14, atr_14, ma_50, ma_200,
+            ema_9, ema_21, ema_50, vwap
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (symbol, tf, ts) DO UPDATE SET
             bb_mid=EXCLUDED.bb_mid, bb_up=EXCLUDED.bb_up, bb_dn=EXCLUDED.bb_dn,
             ich_tenkan=EXCLUDED.ich_tenkan, ich_kijun=EXCLUDED.ich_kijun,
             ich_span_a=EXCLUDED.ich_span_a, ich_span_b=EXCLUDED.ich_span_b,
             vol=EXCLUDED.vol, vol_ma20=EXCLUDED.vol_ma20, vol_spike=EXCLUDED.vol_spike,
             rsi_14=EXCLUDED.rsi_14, atr_14=EXCLUDED.atr_14,
-            ma_50=EXCLUDED.ma_50, ma_200=EXCLUDED.ma_200
+            ma_50=EXCLUDED.ma_50, ma_200=EXCLUDED.ma_200,
+            ema_9=EXCLUDED.ema_9, ema_21=EXCLUDED.ema_21,
+            ema_50=EXCLUDED.ema_50, vwap=EXCLUDED.vwap
     """, (
         sym, TF, ts_last,
         bb_mid, bb_upper, bb_lower,
         tenkan, kijun, span_a, span_b,
         vol_last, vol_ma20, vol_last > vol_ma20 * 2,
         rsi_14, atr_14, ma_50, ma_200,
+        ema_9, ema_21, ema_50, vwap_val,
     ))
 
     # 4. 24h high/low from DB
@@ -251,6 +292,10 @@ def build_snapshot(exchange, cur, symbol=None) -> dict:
         'rsi_14': rsi_14,
         'ma_50': ma_50,
         'ma_200': ma_200,
+        'ema_9': ema_9,
+        'ema_21': ema_21,
+        'ema_50': ema_50,
+        'vwap': vwap_val,
         'vol_last': vol_last,
         'vol_ma20': vol_ma20,
         'vol_ratio': vol_ratio,

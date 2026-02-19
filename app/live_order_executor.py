@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-live_order_executor.py  --  300 USDT Live Trading Daemon
+live_order_executor.py  --  Dynamic Capital Live Trading Daemon
 
 Polls signals_action_v3 (OPEN) and trade_decision (CLOSE) every 3 seconds.
 Guard chain prevents unintended orders.  All decisions logged to live_executor_log.
@@ -25,16 +25,13 @@ from dotenv import load_dotenv
 load_dotenv("/root/trading-bot/app/.env")
 from db_config import get_conn
 import exchange_compliance as ecl
+from trading_config import SYMBOL, ALLOWED_SYMBOLS
 
 # ============================================================
 # Constants
 # ============================================================
-SYMBOL = "BTC/USDT:USDT"
-ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
-USDT_CAP = 300                     # hard cap per order
-CAPITAL_CAP_USDT = 900             # total exposure hard cap
 POLL_SEC = 3                       # main loop interval
-MIN_ORDER_INTERVAL_SEC = 60        # rate-limit between orders
+MIN_ORDER_INTERVAL_SEC = 10        # was 60 — scalp-optimized
 EMERGENCY_LOSS_PCT = -2.0          # unrealised PnL threshold for auto-close
 KILL_SWITCH_PATH = "/root/trading-bot/app/KILL_SWITCH"
 EQ_DRY_RUN = os.getenv("EQ_DRY_RUN", "1") != "0"  # default True = log-only
@@ -110,6 +107,19 @@ def exchange():
 
 
 # ============================================================
+# Dynamic capital helpers
+# ============================================================
+def _get_order_cap(cur=None):
+    """Per-order USDT cap = 1 stage slice (equity * 10%). Min 5 USDT."""
+    try:
+        import safety_manager
+        eq = safety_manager.get_equity_limits(cur)
+        return max(5, min(eq['slice_usdt'], eq['operating_cap']))
+    except Exception:
+        return 300  # fallback
+
+
+# ============================================================
 # Symbol whitelist + Exposure cap
 # ============================================================
 def _check_symbol_allowed(symbol):
@@ -128,21 +138,25 @@ def get_btc_exposure_usdt(ex):
 
 
 def enforce_exposure_cap(ex, requested_usdt, cur=None):
-    """Check exposure cap. Returns (allowed_usdt, reason_or_None).
+    """Check exposure cap (equity-based dynamic). Returns (allowed_usdt, reason_or_None).
     Shrinks requested_usdt if cap would be exceeded.
     Blocks (returns 0) if remaining < minNotional (~5 USDT).
     """
+    import safety_manager
+    eq = safety_manager.get_equity_limits(cur)
+    cap = eq['operating_cap']
+
     exposure = get_btc_exposure_usdt(ex)
-    remaining = max(0, CAPITAL_CAP_USDT - exposure)
+    remaining = max(0, cap - exposure)
     if requested_usdt <= remaining:
         return requested_usdt, None
     if remaining < 5:  # below minNotional
-        reason = f"CAP_EXCEEDED: exp={exposure:.0f} cap={CAPITAL_CAP_USDT}"
+        reason = f"CAP_EXCEEDED: exp={exposure:.0f} cap={cap:.0f}"
         log(f"EXPOSURE CAP BLOCK: {reason}")
         if cur:
             audit(cur, "CAP_BLOCKED", SYMBOL, {
                 "exposure": round(exposure, 2),
-                "cap": CAPITAL_CAP_USDT,
+                "cap": round(cap, 2),
                 "requested": round(requested_usdt, 2),
             })
         return 0, reason
@@ -151,7 +165,7 @@ def enforce_exposure_cap(ex, requested_usdt, cur=None):
     if cur:
         audit(cur, "CAP_SHRINK", SYMBOL, {
             "exposure": round(exposure, 2),
-            "cap": CAPITAL_CAP_USDT,
+            "cap": round(cap, 2),
             "requested": round(requested_usdt, 2),
             "allowed": round(remaining, 2),
         })
@@ -186,7 +200,7 @@ def trade_switch_on(cur) -> bool:
     return bool(row and row[0])
 
 
-ONCE_LOCK_TTL_MIN = 1440  # 24h
+ONCE_LOCK_TTL_MIN = 60  # was 1440 (24h→1h) — scalp re-entry
 
 
 def has_once_lock(cur, symbol: str) -> bool:
@@ -445,11 +459,11 @@ def _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=True):
         _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
                           pos_side, pos_qty, reason)
     elif action_type == "ADD":
-        _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason)
+        _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=meta)
     elif action_type == "REVERSE_CLOSE":
         _eq_handle_reverse_close(ex, cur, eq_id, direction, pos_side, pos_qty, reason)
     elif action_type == "REVERSE_OPEN":
-        _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason)
+        _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason, meta=meta)
     else:
         log(f"EQ id={eq_id} unknown action_type={action_type} — REJECTED")
         _update_eq_status(cur, eq_id, "REJECTED")
@@ -537,7 +551,7 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
     log(f"EQ REDUCE SENT: {pos_side} qty={qty:.6f} order={order.get('id')}")
 
 
-def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
+def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
     """Handle ADD: pyramid add to position."""
     # Protection mode: block OPEN/ADD
     pm_ok, pm_reason = ecl.check_protection_mode_for_action('ADD')
@@ -551,10 +565,11 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
             _send_telegram(report)
         return
 
-    usdt = float(target_usdt) if target_usdt else USDT_CAP
-    usdt = min(usdt, USDT_CAP)
+    order_cap = _get_order_cap(cur)
+    usdt = float(target_usdt) if target_usdt else order_cap
+    usdt = min(usdt, order_cap)
     if usdt <= 0:
-        usdt = USDT_CAP
+        usdt = order_cap
     dir_upper = (direction or "LONG").upper()
 
     # Exposure cap enforcement
@@ -577,7 +592,7 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason):
         return
 
     try:
-        order, exec_price, amount = place_open_order(ex, dir_upper, usdt, cur=cur)
+        order, exec_price, amount = place_open_order(ex, dir_upper, usdt, cur=cur, meta=meta or {})
     except Exception as e:
         log(f"EQ id={eq_id} ADD failed: {e}")
         _update_eq_status(cur, eq_id, "REJECTED")
@@ -638,7 +653,7 @@ def _eq_handle_reverse_close(ex, cur, eq_id, direction, pos_side, pos_qty, reaso
     log(f"EQ REVERSE_CLOSE SENT: {pos_side} qty={pos_qty} order={order.get('id')}")
 
 
-def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
+def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
     """Handle REVERSE_OPEN: open new position as part of reversal."""
     # Protection mode: block OPEN/ADD (REVERSE_OPEN = new position)
     pm_ok, pm_reason = ecl.check_protection_mode_for_action('REVERSE_OPEN')
@@ -652,10 +667,11 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
             _send_telegram(report)
         return
 
-    usdt = float(target_usdt) if target_usdt else USDT_CAP
-    usdt = min(usdt, USDT_CAP)
+    order_cap = _get_order_cap(cur)
+    usdt = float(target_usdt) if target_usdt else order_cap
+    usdt = min(usdt, order_cap)
     if usdt <= 0:
-        usdt = USDT_CAP
+        usdt = order_cap
     dir_upper = (direction or "LONG").upper()
 
     # Exposure cap enforcement
@@ -678,7 +694,7 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason):
         return
 
     try:
-        order, exec_price, amount = place_open_order(ex, dir_upper, usdt, cur=cur)
+        order, exec_price, amount = place_open_order(ex, dir_upper, usdt, cur=cur, meta=meta or {})
     except Exception as e:
         log(f"EQ id={eq_id} REVERSE_OPEN failed: {e}")
         _update_eq_status(cur, eq_id, "REJECTED")
@@ -793,9 +809,26 @@ def place_close_order(ex, side: str, qty: float, cur=None):
         raise
 
 
-def place_open_order(ex, direction: str, usdt_size: float, cur=None):
+def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
     """Market open order with ECL compliance.  direction = 'LONG' or 'SHORT'."""
     _check_symbol_allowed(SYMBOL)
+
+    # Set leverage before order (from leverage_context in meta)
+    try:
+        import leverage_manager
+        lev_ctx = (meta or {}).get('leverage_context', {})
+        if lev_ctx:
+            lev = leverage_manager.compute_leverage(
+                atr_pct=lev_ctx.get('atr_pct', 1.0),
+                regime_score=lev_ctx.get('regime_score', 0),
+                news_shock=abs(lev_ctx.get('news_event_score', 0)) >= 60,
+                confidence=lev_ctx.get('confidence', 0),
+                stage=lev_ctx.get('stage', 0),
+            )
+            leverage_manager.set_exchange_leverage(ex, SYMBOL, lev)
+    except Exception as e:
+        log(f"leverage set warning: {e}")
+
     ticker = ex.fetch_ticker(SYMBOL)
     price = float(ticker["last"])
     amount = usdt_size / price
@@ -892,6 +925,8 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None):
 # ============================================================
 def main():
     log("=== DAEMON START ===")
+    from watchdog_helper import init_watchdog
+    init_watchdog(interval_sec=10)
 
     ex = exchange()
     last_order_ts = 0.0
@@ -1114,9 +1149,10 @@ def _cycle(ex, _last_order_ts_unused):
                 return
 
             # --- Execute OPEN ---
-            usdt_size = min(float(meta.get("qty", USDT_CAP)), USDT_CAP)
+            order_cap = _get_order_cap(cur)
+            usdt_size = min(float(meta.get("qty", order_cap)), order_cap)
             if usdt_size <= 0:
-                usdt_size = USDT_CAP
+                usdt_size = order_cap
 
             # Exposure cap enforcement
             usdt_size, cap_reason = enforce_exposure_cap(ex, usdt_size, cur=cur)

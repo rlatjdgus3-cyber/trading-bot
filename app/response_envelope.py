@@ -32,6 +32,7 @@ WAIT_REASON_KR = {
     'WAIT_RISK_LOCK': '쿨다운/중복방지 잠금 — 주문 발행 금지',
     'WAIT_ORDER_FILL': '거래소 응답/동기화 대기(주문/포지션 확인중)',
     'WAIT_EXCHANGE_SYNC': '거래소 응답/동기화 대기(주문/포지션 확인중)',
+    'WAIT_CAP': '자본 한도 도달 — 추가 진입 불가',
 }
 
 
@@ -72,7 +73,9 @@ def derive_block_reason_code(exec_ctx):
     if wait_reason == 'WAIT_RISK_LOCK':
         return ('COOLDOWN', BLOCK_REASON_MAP['COOLDOWN'])
     if wait_reason in ('WAIT_ORDER_FILL', 'WAIT_EXCHANGE_SYNC'):
-        return ('WAIT_SIGNAL', '거래소 응답/동기화 대기(주문/포지션 확인중)')
+        return ('ONCE_LOCK', '거래소 응답/동기화 대기(주문/포지션 확인중)')
+    if wait_reason == 'WAIT_CAP':
+        return ('CAP_LIMIT', BLOCK_REASON_MAP['CAP_LIMIT'])
 
     return ('WAIT_SIGNAL', BLOCK_REASON_MAP['WAIT_SIGNAL'])
 
@@ -348,7 +351,22 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
     open_orders = orders.get('orders', []) if orders_ok else []
     has_partial = any(float(o.get('filled', 0)) > 0 for o in open_orders)
 
-    sections = ['[요약]']
+    sections = []
+
+    # ── Top badge: ENTRY/GATE/WAIT status ──
+    entry_enabled = exec_ctx.get('entry_enabled')
+    gate_ok_val = exec_ctx.get('gate_ok')
+    wait_reason_val = exec_ctx.get('wait_reason', '')
+    if entry_enabled is False:
+        sections.append('🔴 ENTRY OFF')
+    elif gate_ok_val is False:
+        sections.append('🟡 GATE BLOCKED')
+    elif wait_reason_val and wait_reason_val not in ('', 'N/A'):
+        sections.append(f'🟢 {wait_reason_val}')
+    else:
+        sections.append('🟢 READY')
+
+    sections.append('[요약]')
 
     # ── MISMATCH Warning (first line) ──
     if recon == 'MISMATCH':
@@ -562,14 +580,24 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
     return '\n'.join(sections)
 
 
-def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason):
-    """Format 6-section composite snapshot card."""
+def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason, capital_info=None):
+    """Format 6-section composite snapshot card with optional capital/leverage info."""
     recon = None
     if exch_pos and strat_pos:
         import exchange_reader
         recon = exchange_reader.reconcile(exch_pos, strat_pos)
 
     sections = []
+
+    # ── Top badge: ENTRY/GATE/WAIT status ──
+    if switch_status is False:
+        sections.append('🔴 ENTRY OFF')
+    elif gate_status and not gate_status[0]:
+        sections.append('🟡 GATE BLOCKED')
+    elif wait_reason and wait_reason not in ('', 'N/A'):
+        sections.append(f'🟢 {wait_reason}')
+    else:
+        sections.append('🟢 READY')
 
     # Header
     exch_status = exch_pos.get('data_status', 'ERROR') if exch_pos else 'ERROR'
@@ -641,8 +669,28 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
     else:
         sections.append('[STRATEGY_DB] State: N/A')
 
-    # 4. [RISK] Caps & Limits (compact)
-    sections.append(f'[RISK] (use /risk_config for details)')
+    # 4. [CAPITAL] Equity & Budget
+    if capital_info:
+        eq = capital_info.get('equity', 0)
+        op = capital_info.get('operating_cap', 0)
+        res = capital_info.get('reserve', 0)
+        used = capital_info.get('used_usdt', 0)
+        remaining = capital_info.get('remaining_usdt', 0)
+        source = capital_info.get('source', '?')
+        sections.append(
+            f'[CAPITAL] equity=${eq:,.0f} | 운용=${op:,.0f} 예비=${res:,.0f} ({source})\n'
+            f'  사용={used:,.0f} 잔여={remaining:,.0f} USDT'
+        )
+        # Leverage
+        lev = capital_info.get('leverage_current', 0)
+        lev_rule = capital_info.get('leverage_rule', '?')
+        sections.append(f'[LEVERAGE] current={lev}x | rule={lev_rule}')
+        # Stage
+        stage = capital_info.get('stage', 0)
+        max_stage = capital_info.get('max_stages', 7)
+        sections.append(f'[STAGE] {stage}/{max_stage}')
+    else:
+        sections.append(f'[RISK] (use /risk_config for details)')
 
     # 5. [GATE] Pre-Live Safety
     if gate_status:

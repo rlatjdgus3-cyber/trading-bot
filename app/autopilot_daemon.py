@@ -1,11 +1,11 @@
 """
 autopilot_daemon.py — Autonomous trading daemon.
 
-60-second loop:
+20-second loop:
   1. Check autopilot_config.enabled
   2. Risk checks (trade_switch, LIVE_TRADING, once_lock, daily limit, cooldown, position)
   3. Run direction_scorer.compute_scores()
-  4. If confidence >= 15, create OPEN signal
+  4. If confidence >= MIN_CONFIDENCE (10), create OPEN signal
   5. Log to trade_process_log (source='autopilot')
   6. Telegram notification
 """
@@ -20,11 +20,10 @@ sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[autopilot]'
 SYMBOL = 'BTC/USDT:USDT'
 ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
-USDT_CAP = 900
-POLL_SEC = 60
-COOLDOWN_SEC = 300
+POLL_SEC = 20
+COOLDOWN_SEC = 30  # v2.1 중간 공격형
 MAX_DAILY_TRADES = 10
-MIN_CONFIDENCE = 15
+MIN_CONFIDENCE = 10  # abs(total_score) >= 10 for entry
 DEFAULT_SIZE_PCT = 10
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
 TRADE_SWITCH_DEDUP_KEY = 'autopilot:risk_check:trade_switch_off'
@@ -231,11 +230,6 @@ def _risk_checks(cur=None):
         if elapsed < COOLDOWN_SEC:
             return (False, f'cooldown ({int(elapsed)}/{COOLDOWN_SEC}s)')
 
-    # Check if position already exists
-    cur.execute('SELECT side, total_qty FROM position_state WHERE symbol = %s;', (SYMBOL,))
-    ps_row = cur.fetchone()
-    has_position = ps_row and ps_row[0] and float(ps_row[1] or 0) > 0
-
     return (True, 'ok')
 
 
@@ -269,18 +263,12 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None):
     if not ok:
         return ('BLOCKED', reason)
 
-    cur.execute("""
-            SELECT COUNT(*) FROM news
-            WHERE ts >= now() - interval '1 hour'
-              AND impact_score >= 7;
-        """)
-    if int(cur.fetchone()[0]) > 0:
-        return ('HOLD', '고영향 뉴스 존재')
+    # News does not block chart-based entry (NEWS_CAN_BLOCK_ENTRY = False)
 
     return ('ADD', '모든 조건 충족')
 
 
-def _create_autopilot_signal(cur=None, side=None, scores=None):
+def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=None):
     '''Create OPEN signal for autopilot. Returns signal_id.'''
     if SYMBOL not in ALLOWED_SYMBOLS:
         _log(f'SYMBOL_NOT_ALLOWED: {SYMBOL} — signal skipped')
@@ -293,8 +281,9 @@ def _create_autopilot_signal(cur=None, side=None, scores=None):
     relevant_score = scores.get('long_score', 50) if side == 'LONG' else scores.get('short_score', 50)
     start_stage = safety_manager.compute_start_stage(relevant_score)
     entry_pct = safety_manager.get_stage_entry_pct(start_stage)
-    usdt_amount = safety_manager.get_entry_usdt(cur, start_stage)
-    usdt_amount = min(usdt_amount, USDT_CAP)
+    eq = equity_limits or safety_manager.get_equity_limits(cur)
+    usdt_amount = eq['slice_usdt'] * start_stage
+    usdt_amount = min(usdt_amount, eq['operating_cap'])
     if usdt_amount < 5:
         return 0
     meta = {
@@ -323,9 +312,12 @@ def _create_autopilot_signal(cur=None, side=None, scores=None):
 
 
 def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
-                        start_stage=None, entry_pct=None):
+                        start_stage=None, entry_pct=None, equity_limits=None):
     '''Insert trade_process_log entry.'''
-    import safety_manager
+    if equity_limits is None:
+        import safety_manager
+        equity_limits = safety_manager.get_equity_limits(cur)
+    eq = equity_limits
     context = scores.get('context', {})
     try:
         cur.execute("""
@@ -341,7 +333,7 @@ def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
             scores.get('short_score'),
             scores.get('dominant_side'),
             DEFAULT_SIZE_PCT,
-            USDT_CAP,
+            eq['operating_cap'],
             source,
             start_stage,
             entry_pct,
@@ -362,15 +354,21 @@ def _cycle():
             (ok, reason) = _risk_checks(cur)
             if not ok:
                 if 'trade_switch' in reason.lower():
-                    # Transition ON→OFF: immediate Telegram alert
-                    is_transition = _db_check_trade_switch_transition(cur)
-                    if is_transition:
-                        _log('⚠ trade_switch OFF 전환 감지')
-                        _notify_telegram(
-                            '⚠ trade_switch OFF 전환\n'
-                            'autopilot 매매 일시 중지됨')
-                    # Steady OFF: log only (error_watcher handles 6h remind)
-                    # No stdout noise — error_watcher dedup prevents Telegram spam
+                    # Auto-recovery attempt
+                    import trade_switch_recovery
+                    recovered, rec_reason = trade_switch_recovery.try_auto_recover(cur)
+                    if recovered:
+                        _log(f'AUTO-RECOVERED: {rec_reason}')
+                        _notify_telegram('✅ trade_switch 자동 복구 — gate PASS 확인')
+                        # Skip this cycle, proceed normally next cycle
+                    else:
+                        is_transition = _db_check_trade_switch_transition(cur)
+                        if is_transition:
+                            _log('⚠ trade_switch OFF 전환 감지')
+                            _notify_telegram(
+                                f'⚠ trade_switch OFF 전환\n'
+                                f'autopilot 매매 일시 중지됨\n'
+                                f'복구 상태: {rec_reason}')
                 else:
                     # Non-trade_switch reasons: DB-based log dedup
                     should_log, summary = _db_should_log_risk(cur, reason)
@@ -411,13 +409,15 @@ def _cycle():
                 return
 
             import safety_manager
+            eq = safety_manager.get_equity_limits(cur)
             start_stage = safety_manager.compute_start_stage(
                 scores.get('long_score', 50) if dominant == 'LONG' else scores.get('short_score', 50))
             entry_pct = safety_manager.get_stage_entry_pct(start_stage)
 
-            signal_id = _create_autopilot_signal(cur, dominant, scores)
+            signal_id = _create_autopilot_signal(cur, dominant, scores, equity_limits=eq)
             if signal_id:
-                _log_trade_process(cur, signal_id, scores, 'autopilot', start_stage, entry_pct)
+                _log_trade_process(cur, signal_id, scores, 'autopilot', start_stage, entry_pct,
+                                    equity_limits=eq)
                 _notify_telegram(
                     f'[Autopilot] {dominant} 진입 신호 생성\n'
                     f'- L={scores.get("long_score")} S={scores.get("short_score")} conf={confidence}\n'
@@ -436,6 +436,8 @@ def _cycle():
 
 def main():
     _log('=== AUTOPILOT DAEMON START ===')
+    from watchdog_helper import init_watchdog
+    init_watchdog(interval_sec=10)
     while True:
         if os.path.exists(KILL_SWITCH_PATH):
             _log('KILL_SWITCH detected. Exiting.')

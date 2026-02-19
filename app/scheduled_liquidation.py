@@ -339,12 +339,16 @@ def _insert_pm_decision_log(cur, side, qty, entry_price, current_price):
 
 
 def _sync_position_state(cur):
-    """Reset position_state to flat after close."""
+    """Reset position_state to flat after close (v1 + v2 columns)."""
     cur.execute("""
         UPDATE position_state SET
             side = NULL, total_qty = 0, stage = 0,
             capital_used_usdt = 0, trade_budget_used_pct = 0,
             stage_consumed_mask = 0, accumulated_entry_fee = 0,
+            order_state = 'NONE', planned_qty = 0, filled_qty = 0,
+            planned_usdt = 0, sent_usdt = 0, filled_usdt = 0,
+            last_order_id = NULL, last_order_ts = NULL,
+            state_changed_at = now(),
             updated_at = now()
         WHERE symbol = %s;
     """, (SYMBOL,))
@@ -354,11 +358,17 @@ def _sync_position_state(cur):
 # Trade switch
 # ============================================================
 def set_trade_switch(enabled):
-    """Update trade_switch table."""
+    """Update trade_switch table with off_reason for auto-recovery."""
     def _do(conn, cur):
-        cur.execute(
-            "UPDATE trade_switch SET enabled=%s, updated_at=NOW() WHERE id=1;",
-            (enabled,))
+        if not enabled:
+            import trade_switch_recovery
+            trade_switch_recovery.set_off_with_reason(cur, 'scheduled_settlement')
+        else:
+            cur.execute(
+                "UPDATE trade_switch SET enabled=%s, off_reason=NULL, "
+                "manual_off_until=NULL, updated_at=NOW() "
+                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
+                (enabled,))
     _db_with_retry(_do)
 
 
