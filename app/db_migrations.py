@@ -317,7 +317,7 @@ def ensure_safety_limits_add_threshold(cur):
     '''Add add_score_threshold column to safety_limits.'''
     cur.execute("""
         ALTER TABLE safety_limits
-            ADD COLUMN IF NOT EXISTS add_score_threshold INTEGER NOT NULL DEFAULT 65;
+            ADD COLUMN IF NOT EXISTS add_score_threshold INTEGER NOT NULL DEFAULT 45;
     """)
     _log('ensure_safety_limits_add_threshold done')
 
@@ -1626,6 +1626,16 @@ def run_all():
             ensure_position_state_v2_columns(cur)
             # News trading_impact_weight column
             ensure_news_trading_impact_weight(cur)
+            # Phase: EMA/VWAP indicators + score_weights v3
+            ensure_indicator_ema_vwap_columns(cur)
+            ensure_score_weights_v3(cur)
+            ensure_score_weights_v4(cur)
+            # Phase B: Dynamic leverage columns
+            ensure_safety_limits_leverage_columns(cur)
+            # trade_switch auto-recovery columns
+            ensure_trade_switch_recovery_columns(cur)
+            # trade_switch updated_at defensive migration
+            ensure_trade_switch_updated_at(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -1689,6 +1699,68 @@ def ensure_safety_limits_daily_loss_45(cur):
         WHERE daily_loss_limit_usdt = -150;
     """)
     _log('ensure_safety_limits_daily_loss_45 done')
+
+
+def ensure_indicator_ema_vwap_columns(cur):
+    """Add EMA(9/21/50) and VWAP columns to indicators table."""
+    for col, dtype in (('ema_9', 'NUMERIC'), ('ema_21', 'NUMERIC'),
+                       ('ema_50', 'NUMERIC'), ('vwap', 'NUMERIC')):
+        cur.execute(f"""
+            ALTER TABLE indicators
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_indicator_ema_vwap_columns done')
+
+
+def ensure_score_weights_v3(cur):
+    """Update score_weights to v3: tech=0.60, position=0.15, regime=0.20, news_event=0.05."""
+    cur.execute("""
+        UPDATE score_weights
+        SET tech_w = 0.60, position_w = 0.15, regime_w = 0.20, news_event_w = 0.05
+        WHERE id = (SELECT MAX(id) FROM score_weights) AND tech_w = 0.45;
+    """)
+    _log('ensure_score_weights_v3 done')
+
+
+def ensure_score_weights_v4(cur):
+    """Update score_weights to v4: tech=0.75, position=0.10, regime=0.10, news_event=0.05."""
+    cur.execute("""
+        UPDATE score_weights
+        SET tech_w = 0.75, position_w = 0.10, regime_w = 0.10, news_event_w = 0.05
+        WHERE id = (SELECT MAX(id) FROM score_weights) AND tech_w = 0.60;
+    """)
+    _log('ensure_score_weights_v4 done')
+
+
+def ensure_trade_switch_recovery_columns(cur):
+    """Add off_reason, manual_off_until columns to trade_switch for auto-recovery."""
+    cur.execute("""
+        ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS off_reason TEXT DEFAULT NULL;
+    """)
+    cur.execute("""
+        ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS manual_off_until TIMESTAMPTZ DEFAULT NULL;
+    """)
+    _log('ensure_trade_switch_recovery_columns done')
+
+
+def ensure_safety_limits_leverage_columns(cur):
+    """Add leverage_min, leverage_max, leverage_high_stage_max columns to safety_limits."""
+    for col, dtype in (('leverage_min', 'INT DEFAULT 3'),
+                       ('leverage_max', 'INT DEFAULT 8'),
+                       ('leverage_high_stage_max', 'INT DEFAULT 5')):
+        cur.execute(f"""
+            ALTER TABLE safety_limits
+                ADD COLUMN IF NOT EXISTS {col} {dtype};
+        """)
+    _log('ensure_safety_limits_leverage_columns done')
+
+
+def ensure_trade_switch_updated_at(cur):
+    """Defensive: ensure trade_switch has updated_at column for existing tables."""
+    cur.execute("""
+        ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+    """)
+    _log('ensure_trade_switch_updated_at done')
 
 
 def ensure_data_integrity_audit(cur):

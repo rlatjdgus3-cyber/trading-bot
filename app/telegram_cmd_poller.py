@@ -711,7 +711,12 @@ def _evaluate_strategy_action(scores, pos_state):
                     f'{dominant} stage {st} (score={total_score})', details)
         return ('HOLD', 'no position', details)
 
-    # Stop-loss check
+    # Stop-loss check (v2.1: stage-based tightening)
+    if stage >= 3:
+        sl_pct = min(sl_pct, 1.6)
+    elif stage >= 2:
+        sl_pct = min(sl_pct, 1.8)
+    details['stop_loss_pct'] = sl_pct
     if avg_entry > 0 and price > 0:
         if side == 'long':
             sl_dist = (price - avg_entry) / avg_entry * 100
@@ -721,28 +726,26 @@ def _evaluate_strategy_action(scores, pos_state):
         if sl_dist <= -sl_pct:
             return ('CLOSE', f'stop_loss ({sl_dist:.2f}% vs -{sl_pct}%)', details)
 
-    # Reversal: strong opposite signal (score >= 70)
-    if side == 'long' and dominant == 'SHORT' and short_score >= 70:
-        return ('REVERSE', f'strong SHORT (score={short_score})', details)
-    if side == 'short' and dominant == 'LONG' and long_score >= 70:
-        return ('REVERSE', f'strong LONG (score={long_score})', details)
+    # Reversal / Close check (v3.0: total_score based)
+    if side == 'long' and total_score <= -25:
+        return ('REVERSE', f'strong SHORT (total_score={total_score})', details)
+    if side == 'short' and total_score >= 25:
+        return ('REVERSE', f'strong LONG (total_score={total_score})', details)
 
-    # ADD: trend direction match + score >= 65
+    # Reduce on counter signal (v3.0: total_score based)
+    if side == 'long' and total_score <= -15:
+        return ('REDUCE', f'counter signal (total_score={total_score})', details)
+    if side == 'short' and total_score >= 15:
+        return ('REDUCE', f'counter signal (total_score={total_score})', details)
+
+    # ADD: trend direction match + score >= 60 (v2.1, legacy long_score/short_score)
     if stage < 7 and budget_pct < 70:
         direction = 'LONG' if side == 'long' else 'SHORT'
         if dominant == direction:
             relevant = long_score if direction == 'LONG' else short_score
-            if relevant >= 65:
+            if relevant >= 60:
                 return ('ADD', f'score {relevant} favors {direction} (stage={stage})',
                         details)
-
-    # REDUCE: counter signal strong (counter >= 65, side <= 40)
-    if side == 'long' and short_score >= 65 and long_score <= 40:
-        return ('REDUCE',
-                f'counter signal (long={long_score}, short={short_score})', details)
-    if side == 'short' and long_score >= 65 and short_score <= 40:
-        return ('REDUCE',
-                f'counter signal (long={long_score}, short={short_score})', details)
 
     return ('HOLD', 'no action needed', details)
 
@@ -3026,8 +3029,17 @@ def handle_command(text: str, chat_id: int = 0) -> str:
     if t in ('/close_all', '/전청산'):
         _log('/close_all command received')
         try:
-            from position_manager import close_position
-            result = close_position(STRATEGY_SYMBOL, reason='manual_close_all')
+            import panic_close
+            ex = panic_close.exchange()
+            side, qty = panic_close.get_position(ex)
+            if not side or qty == 0:
+                result = '포지션 없음 (FLAT)'
+            else:
+                if side == 'long':
+                    ex.create_market_sell_order(panic_close.SYMBOL, qty, {'reduceOnly': True})
+                else:
+                    ex.create_market_buy_order(panic_close.SYMBOL, qty, {'reduceOnly': True})
+                result = f'{side.upper()} {qty} 청산 주문 전송'
             return f'✅ 전포지션 청산 요청 완료\n{result}' + \
                 _footer('close_all', 'local', 'local')
         except Exception as e:

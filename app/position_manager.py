@@ -207,12 +207,17 @@ def _build_context(cur=None, pos=None, snapshot=None):
             'tenkan': snapshot.get('tenkan'),
             'ma_50': snapshot.get('ma_50'),
             'ma_200': snapshot.get('ma_200'),
+            'ema_9': snapshot.get('ema_9'),
+            'ema_21': snapshot.get('ema_21'),
+            'ema_50': snapshot.get('ema_50'),
+            'vwap': snapshot.get('vwap'),
         }
     else:
         # Fallback: DB indicators
         cur.execute("""
                 SELECT ich_kijun, rsi_14, atr_14, vol, vol_ma20, vol_spike,
-                       bb_mid, bb_up, bb_dn, ich_tenkan, ma_50, ma_200
+                       bb_mid, bb_up, bb_dn, ich_tenkan, ma_50, ma_200,
+                       ema_9, ema_21, ema_50, vwap
                 FROM indicators
                 WHERE symbol = %s AND tf = '1m'
                 ORDER BY ts DESC LIMIT 1;
@@ -232,6 +237,10 @@ def _build_context(cur=None, pos=None, snapshot=None):
                 'tenkan': float(row[9]) if row[9] else None,
                 'ma_50': float(row[10]) if row[10] else None,
                 'ma_200': float(row[11]) if row[11] else None,
+                'ema_9': float(row[12]) if row[12] else None,
+                'ema_21': float(row[13]) if row[13] else None,
+                'ema_50': float(row[14]) if row[14] else None,
+                'vwap': float(row[15]) if row[15] else None,
             }
         else:
             ctx['indicators'] = {}
@@ -1299,6 +1308,7 @@ def _decide(ctx=None):
     vol_ratio = vol / vol_ma if vol_ma and vol_ma > 0 else 1
     long_score = scores.get('long_score', 50)
     short_score = scores.get('short_score', 50)
+    total_score = scores.get('total_score', 0)
     stage = ps.get('stage', 0)
     news = ctx.get('news', [])
 
@@ -1315,47 +1325,50 @@ def _decide(ctx=None):
         else:
             sl_dist = (entry - price) / entry * 100
 
-        sl_pct = scores.get('dynamic_stop_loss_pct', 2.0)
+        # Stage-based stop-loss tightening (v2.1)
+        sl_base = scores.get('dynamic_stop_loss_pct', 2.0)
+        if stage >= 3:
+            sl_pct = min(sl_base, 1.6)
+        elif stage >= 2:
+            sl_pct = min(sl_base, 1.8)
+        else:
+            sl_pct = sl_base  # 2.0% (default)
         if sl_dist <= -sl_pct:
             return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%)')
 
-    # Reversal check
-    if side == 'long' and dominant == 'SHORT' and short_score >= 70:
+    # Reversal / Close check (v3.0: total_score based)
+    if side == 'long' and total_score <= -25:
         confirms = _structure_confirms(ctx, 'SHORT')
-        if confirms >= 3:
-            return ('REVERSE', f'strong SHORT reversal (score={short_score}, confirms={confirms})')
+        if confirms >= 2:
+            return ('REVERSE', f'strong SHORT reversal (total_score={total_score}, confirms={confirms})')
+        return ('CLOSE', f'SHORT signal without structure (total_score={total_score}, confirms={confirms})')
 
-    if side == 'short' and dominant == 'LONG' and long_score >= 70:
+    if side == 'short' and total_score >= 25:
         confirms = _structure_confirms(ctx, 'LONG')
-        if confirms >= 3:
-            return ('REVERSE', f'strong LONG reversal (score={long_score}, confirms={confirms})')
+        if confirms >= 2:
+            return ('REVERSE', f'strong LONG reversal (total_score={total_score}, confirms={confirms})')
+        return ('CLOSE', f'LONG signal without structure (total_score={total_score}, confirms={confirms})')
 
-    # ADD check
+    # Reduce on counter signal (v3.0: total_score based)
+    if side == 'long' and total_score <= -15:
+        return ('REDUCE', f'counter signal (total_score={total_score})')
+    if side == 'short' and total_score >= 15:
+        return ('REDUCE', f'counter signal (total_score={total_score})')
+
+    # ADD check (v2.1: threshold 60, legacy long_score/short_score)
     if stage < 7 and ps.get('budget_used_pct', 0) < 70:
         direction = 'LONG' if side == 'long' else 'SHORT'
         if dominant == direction:
             relevant = long_score if direction == 'LONG' else short_score
-            if relevant >= 65:
-                # News counter-signal guard (Section B.3)
-                news_score = scores.get('news_event_score', 0)
-                if direction == 'LONG' and news_score <= -40:
-                    _log(f'ADD blocked: bearish news_event_score={news_score} vs LONG')
-                elif direction == 'SHORT' and news_score >= 40:
-                    _log(f'ADD blocked: bullish news_event_score={news_score} vs SHORT')
-                else:
-                    return ('ADD', f'score {relevant} favors {direction}, stage={stage}')
-
-    # Reduce on strong counter signal
-    if side == 'long' and short_score >= 65 and long_score <= 40:
-        return ('REDUCE', f'counter signal (long={long_score}, short={short_score})')
-    if side == 'short' and long_score >= 65 and short_score <= 40:
-        return ('REDUCE', f'counter signal (long={long_score}, short={short_score})')
+            if relevant >= 60:
+                return ('ADD', f'score {relevant} favors {direction}, stage={stage}')
 
     return ('HOLD', 'no action needed')
 
 
 def _structure_confirms(ctx=None, target_side=None):
-    '''Count structure confirmations for reversal. Returns 0-4.'''
+    '''Count structure confirmations for reversal. Returns 0-5.
+    Threshold: 2. Added EMA(9/21) confirmation.'''
     confirms = 0
     ind = ctx.get('indicators', {})
     price = ctx.get('price', 0)
@@ -1365,6 +1378,8 @@ def _structure_confirms(ctx=None, target_side=None):
     rsi = ind.get('rsi')
     ma50 = ind.get('ma_50')
     ma200 = ind.get('ma_200')
+    ema_9 = ind.get('ema_9')
+    ema_21 = ind.get('ema_21')
 
     if target_side == 'LONG':
         if tenkan is not None and kijun is not None and tenkan > kijun:
@@ -1375,6 +1390,8 @@ def _structure_confirms(ctx=None, target_side=None):
             confirms += 1
         if price and kijun and price > kijun:
             confirms += 1
+        if ema_9 is not None and ema_21 is not None and ema_9 > ema_21:
+            confirms += 1
     else:  # SHORT
         if tenkan is not None and kijun is not None and tenkan < kijun:
             confirms += 1
@@ -1384,8 +1401,26 @@ def _structure_confirms(ctx=None, target_side=None):
             confirms += 1
         if price and kijun and price < kijun:
             confirms += 1
+        if ema_9 is not None and ema_21 is not None and ema_9 < ema_21:
+            confirms += 1
 
     return confirms
+
+
+def _build_leverage_context(ctx):
+    """Build leverage context dict for executor from market context."""
+    ind = ctx.get('indicators', {})
+    scores = ctx.get('scores', {})
+    price = ctx.get('price', 0)
+    atr = ind.get('atr', 0)
+    atr_pct = (atr / price * 100) if price and atr else 1.0
+    return {
+        'atr_pct': round(atr_pct, 3),
+        'regime_score': scores.get('regime_score', 0),
+        'news_event_score': scores.get('news_event_score', 0),
+        'confidence': scores.get('confidence', 0),
+        'stage': ctx.get('pos_state', {}).get('stage', 0),
+    }
 
 
 def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
@@ -2006,16 +2041,18 @@ def _cycle():
                 import safety_manager
                 add_usdt = safety_manager.get_add_slice_usdt(cur)
                 direction = pos.get('side', '').upper()
+                lev_ctx = _build_leverage_context(ctx)
                 _enqueue_action(
                     cur, 'ADD', direction,
                     target_usdt=add_usdt,
                     reason=reason,
                     pm_decision_id=dec_id,
-                    priority=5)
+                    priority=5,
+                    meta={'leverage_context': lev_ctx})
             elif action == 'REDUCE':
                 _enqueue_action(
                     cur, 'REDUCE', pos.get('side', '').upper(),
-                    reduce_pct=30,
+                    reduce_pct=50,
                     reason=reason,
                     pm_decision_id=dec_id,
                     priority=3)
@@ -2073,6 +2110,8 @@ def _cycle():
 
 def main():
     _log(f'=== POSITION MANAGER START ===')
+    from watchdog_helper import init_watchdog
+    init_watchdog(interval_sec=10)
     _log(f'BUILD_SHA={BUILD_SHA} CONFIG_VERSION={CONFIG_VERSION} CALLER={CALLER}')
     _send_telegram(report_formatter.format_service_start(
         BUILD_SHA, CONFIG_VERSION, {

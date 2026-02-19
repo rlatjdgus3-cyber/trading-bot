@@ -2,7 +2,7 @@
 score_engine.py — Unified Score Engine (central orchestrator).
 
 Computes a 4-axis weighted total score:
-  TOTAL = 0.45*TECH + 0.25*POSITION + 0.25*REGIME + 0.05*NEWS_EVENT
+  TOTAL = 0.75*TECH + 0.10*POSITION + 0.10*REGIME + 0.05*NEWS_EVENT
 
 REGIME: Based on price_event_stats (pure price-action volatility spike patterns).
 NEWS_EVENT: Supplementary only (weight reduced due to limited historical data).
@@ -21,9 +21,9 @@ sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[score_engine]'
 SYMBOL = 'BTC/USDT:USDT'
 DEFAULT_WEIGHTS = {
-    'tech_w': 0.45,
-    'position_w': 0.25,
-    'regime_w': 0.25,
+    'tech_w': 0.75,
+    'position_w': 0.10,
+    'regime_w': 0.10,
     'news_event_w': 0.05}
 STAGE_THRESHOLDS = [
     (75, 7),
@@ -31,8 +31,8 @@ STAGE_THRESHOLDS = [
     (55, 5),
     (45, 4),
     (35, 3),
-    (25, 2),
-    (0, 1)]
+    (20, 2),
+    (10, 1)]
 
 
 def _log(msg):
@@ -229,7 +229,7 @@ def _compute_regime_from_events(cur):
 def compute_total(cur=None, exchange=None):
     '''Compute unified 4-axis total score.
 
-    Formula: TOTAL = 0.45*TECH + 0.25*POSITION + 0.25*REGIME + 0.05*NEWS_EVENT
+    Formula: TOTAL = 0.75*TECH + 0.10*POSITION + 0.10*REGIME + 0.05*NEWS_EVENT
 
     GUARD: NEWS_EVENT is supplementary only.
            If both TECH and POSITION are neutral (abs < 10),
@@ -309,7 +309,7 @@ def compute_total(cur=None, exchange=None):
             btc_qqq_regime = regime_correlation.get_current_regime(cur)
             base_news_w = weights['news_event_w']
             if btc_qqq_regime == 'COUPLED_RISK':
-                weights['news_event_w'] = 0.15
+                weights['news_event_w'] = min(0.05, 0.05)
             elif btc_qqq_regime == 'DECOUPLED':
                 weights['news_event_w'] = 0.02
             # Redistribute delta across other 3 axes proportionally
