@@ -12,6 +12,7 @@ telegram_cmd.env
 *.truncated_backup
 .backup_*/
 _recovered/
+_archive/
 
 # Logs
 *.log
