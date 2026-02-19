@@ -10,7 +10,7 @@ Thread-safe via threading.Lock (position_manager uses threads).
 import time
 import threading
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 LOG_PREFIX = '[order_throttle]'
 
@@ -51,7 +51,7 @@ _state = {
     'db_error_consecutive': 0,
     'last_reject_reason': '',
     'last_reject_ts': 0.0,
-    'recent_attempts': [],          # list of float timestamps (sliding 1hr window)
+    'recent_attempts': [],          # list of float timestamps (sliding 1hr, ENTRY only)
 }
 _loaded = False
 _lock = threading.Lock()
@@ -68,13 +68,16 @@ def _ensure_loaded(cur):
     Safe to call repeatedly (idempotent after first load).
     """
     global _loaded
-    if _loaded:
-        return
+    # FIX #8: check _loaded under lock to prevent double-load race
+    with _lock:
+        if _loaded:
+            return
     try:
         cur.execute("""
             SELECT extract(epoch FROM ts)
             FROM order_attempt_log
             WHERE symbol = 'BTC/USDT:USDT'
+              AND action_type NOT IN ('CLOSE', 'REDUCE', 'REVERSE_CLOSE', 'FULL_CLOSE')
               AND ts >= now() - interval '1 hour'
             ORDER BY ts;
         """)
@@ -85,22 +88,32 @@ def _ensure_loaded(cur):
         _log(f'loaded {len(rows)} recent attempts from DB')
     except Exception as e:
         _log(f'_ensure_loaded error (non-fatal): {e}')
-        _loaded = True  # mark loaded to avoid repeated failures
+        # FIX #3: set _loaded under lock even on exception path
+        with _lock:
+            _loaded = True
 
 
 # ── Sliding window helpers ───────────────────────────────
 
-def _prune_old_attempts():
-    """Remove attempts older than 1 hour from in-memory list."""
-    cutoff = time.time() - 3600
+def _prune_old_attempts(now=None):
+    """Remove attempts older than 1 hour from in-memory list.
+    Must be called while _lock is held.
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - 3600
     _state['recent_attempts'] = [
         ts for ts in _state['recent_attempts'] if ts > cutoff
     ]
 
 
-def _count_recent(window_sec):
-    """Count attempts within the last window_sec seconds."""
-    cutoff = time.time() - window_sec
+def _count_recent(window_sec, now=None):
+    """Count attempts within the last window_sec seconds.
+    Must be called while _lock is held.
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - window_sec
     return sum(1 for ts in _state['recent_attempts'] if ts > cutoff)
 
 
@@ -113,8 +126,9 @@ def record_attempt(cur, action_type, direction, outcome,
     """
     now = time.time()
 
-    # DB insert
+    # DB insert — FIX #9: use savepoint to prevent failed-transaction state
     try:
+        cur.execute("SAVEPOINT sp_record_attempt;")
         cur.execute("""
             INSERT INTO order_attempt_log
                 (symbol, action_type, direction, outcome,
@@ -125,42 +139,50 @@ def record_attempt(cur, action_type, direction, outcome,
             reject_reason, error_code,
             json.dumps(detail or {}, default=str),
         ))
+        cur.execute("RELEASE SAVEPOINT sp_record_attempt;")
     except Exception as e:
         _log(f'record_attempt DB error: {e}')
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_record_attempt;")
+        except Exception:
+            pass
 
-    # In-memory update
+    # In-memory update — FIX #6: only count non-EXIT actions against rate limit
     with _lock:
-        _state['recent_attempts'].append(now)
         _state['last_order_ts'] = now
         _state['last_action_ts'][action_type] = now
-        _prune_old_attempts()
+        if action_type not in EXIT_ACTIONS:
+            _state['recent_attempts'].append(now)
+        _prune_old_attempts(now)
 
 
 def check_rate_limit(cur=None, symbol='BTC/USDT:USDT'):
     """Check 12/hr and 4/10min rate limits.
     Returns (ok, reason, next_allowed_ts).
     """
+    # FIX #1 + #10: snapshot list and compute everything inside _lock with consistent 'now'
     with _lock:
-        _prune_old_attempts()
-        hourly = _count_recent(3600)
-        ten_min = _count_recent(600)
+        now = time.time()
+        _prune_old_attempts(now)
+        hourly = _count_recent(3600, now)
+        ten_min = _count_recent(600, now)
+        attempts_snapshot = list(_state['recent_attempts'])
 
     if hourly >= MAX_ATTEMPTS_PER_HOUR:
-        # Find oldest attempt in window to calculate when it expires
-        cutoff = time.time() - 3600
+        cutoff = now - 3600
         oldest_in_window = min(
-            (ts for ts in _state['recent_attempts'] if ts > cutoff),
-            default=time.time())
+            (ts for ts in attempts_snapshot if ts > cutoff),
+            default=now)
         next_ts = oldest_in_window + 3600
         return (False,
                 f'hourly_limit ({hourly}/{MAX_ATTEMPTS_PER_HOUR})',
                 next_ts)
 
     if ten_min >= MAX_ATTEMPTS_PER_10MIN:
-        cutoff = time.time() - 600
+        cutoff = now - 600
         oldest_in_window = min(
-            (ts for ts in _state['recent_attempts'] if ts > cutoff),
-            default=time.time())
+            (ts for ts in attempts_snapshot if ts > cutoff),
+            default=now)
         next_ts = oldest_in_window + 600
         return (False,
                 f'10min_limit ({ten_min}/{MAX_ATTEMPTS_PER_10MIN})',
@@ -179,7 +201,6 @@ def check_cooldown(action_type):
 
     with _lock:
         last_ts = _state['last_action_ts'].get(action_type, 0)
-        # Also check generic last_order_ts for base cooldown
         last_any = _state['last_order_ts']
 
     now = time.time()
@@ -249,8 +270,11 @@ def check_all(cur, action_type, symbol='BTC/USDT:USDT'):
 def handle_rejection(cur, error_code, reject_reason):
     """Handle order rejection: set backoff based on rejection reason.
     Called after exchange or compliance rejection.
+    FIX #2: _auto_halt_trading called outside _lock to prevent stall.
     """
     reason_lower = (reject_reason or '').lower()
+    should_halt = False
+    halt_reason = ''
 
     with _lock:
         _state['last_reject_reason'] = (reject_reason or '')[:200]
@@ -266,9 +290,9 @@ def handle_rejection(cur, error_code, reject_reason):
             _log(f'RATE_LIMIT_HIT: locked for {RATE_LIMIT_LOCKOUT_SEC}s')
             return
 
-        # 2. Min qty
+        # 2. Min qty — FIX #5: proper parenthesization
         if (('최소' in (reject_reason or '') and '수량' in (reject_reason or ''))
-                or 'min' in reason_lower and ('qty' in reason_lower or 'notional' in reason_lower)):
+                or ('min' in reason_lower and ('qty' in reason_lower or 'notional' in reason_lower))):
             _state['entry_lock_until'] = time.time() + 60
             _state['entry_lock_reason'] = 'MIN_QTY'
             _state['network_consecutive'] = 0
@@ -280,22 +304,27 @@ def handle_rejection(cur, error_code, reject_reason):
                 or 'ON CONFLICT' in (reject_reason or '')):
             _state['db_error_consecutive'] += 1
             if _state['db_error_consecutive'] >= DB_ERROR_MAX_CONSECUTIVE:
-                _auto_halt_trading(cur, 'db_error_auto_halt')
+                should_halt = True
+                halt_reason = 'db_error_auto_halt'
             _state['entry_lock_until'] = time.time() + DB_ERROR_BACKOFF_SEC
             _state['entry_lock_reason'] = 'DB_ERROR'
             _log(f'DB_ERROR: consecutive={_state["db_error_consecutive"]}, '
                  f'locked for {DB_ERROR_BACKOFF_SEC}s')
-            return
+            # don't return yet — need to call _auto_halt outside lock
+        else:
+            # 4. Network / other errors
+            _state['network_consecutive'] += 1
+            backoff = min(
+                NETWORK_BACKOFF_BASE * (2 ** (_state['network_consecutive'] - 1)),
+                NETWORK_BACKOFF_MAX)
+            _state['entry_lock_until'] = time.time() + backoff
+            _state['entry_lock_reason'] = 'NETWORK_ERROR'
+            _log(f'NETWORK_ERROR: consecutive={_state["network_consecutive"]}, '
+                 f'backoff={backoff}s')
 
-        # 4. Network / other errors
-        _state['network_consecutive'] += 1
-        backoff = min(
-            NETWORK_BACKOFF_BASE * (2 ** (_state['network_consecutive'] - 1)),
-            NETWORK_BACKOFF_MAX)
-        _state['entry_lock_until'] = time.time() + backoff
-        _state['entry_lock_reason'] = 'NETWORK_ERROR'
-        _log(f'NETWORK_ERROR: consecutive={_state["network_consecutive"]}, '
-             f'backoff={backoff}s')
+    # FIX #2: call _auto_halt_trading OUTSIDE _lock
+    if should_halt:
+        _auto_halt_trading(halt_reason)
 
 
 def handle_success(action_type):
@@ -311,113 +340,129 @@ def handle_success(action_type):
 
 def get_throttle_status(cur=None):
     """Get full throttle status dict for /snapshot and /debug."""
+    # FIX #12: extract scalars under lock, format datetimes outside
     with _lock:
-        _prune_old_attempts()
         now = time.time()
+        _prune_old_attempts(now)
 
-        hourly_count = _count_recent(3600)
-        ten_min_count = _count_recent(600)
+        hourly_count = _count_recent(3600, now)
+        ten_min_count = _count_recent(600, now)
 
         entry_locked = _state['entry_lock_until'] > now
         lock_expires = _state['entry_lock_until']
         lock_reason = _state['entry_lock_reason']
 
-        # Compute per-action cooldown remaining
         cooldowns = {}
         for action, cd_sec in ACTION_COOLDOWNS.items():
             if cd_sec <= 0:
                 continue
             last = _state['last_action_ts'].get(action, 0)
             if last > 0:
-                remaining = max(0, cd_sec - (now - last))
-                cooldowns[action] = remaining
+                cooldowns[action] = max(0, cd_sec - (now - last))
             else:
                 cooldowns[action] = 0
 
-        # Base cooldown
         last_any = _state['last_order_ts']
         base_remaining = max(0, COOLDOWN_AFTER_ANY_ORDER_SEC - (now - last_any)) if last_any > 0 else 0
 
-        lock_expires_str = ''
-        if entry_locked:
-            try:
-                lock_expires_str = datetime.fromtimestamp(
-                    lock_expires, tz=timezone.utc
-                ).strftime('%H:%M:%S UTC')
-            except Exception:
-                lock_expires_str = '?'
-
         last_reject = _state['last_reject_reason']
-        last_reject_ts_str = ''
-        if _state['last_reject_ts'] > 0:
-            try:
-                last_reject_ts_str = datetime.fromtimestamp(
-                    _state['last_reject_ts'], tz=timezone.utc
-                ).strftime('%H:%M:%S UTC')
-            except Exception:
-                last_reject_ts_str = '?'
+        last_reject_ts = _state['last_reject_ts']
+        net_consecutive = _state['network_consecutive']
+        db_consecutive = _state['db_error_consecutive']
+        last_order_ts = _state['last_order_ts']
 
-        return {
-            'hourly_count': hourly_count,
-            'hourly_limit': MAX_ATTEMPTS_PER_HOUR,
-            '10min_count': ten_min_count,
-            '10min_limit': MAX_ATTEMPTS_PER_10MIN,
-            'entry_locked': entry_locked,
-            'lock_reason': lock_reason,
-            'lock_expires_ts': lock_expires,
-            'lock_expires_str': lock_expires_str,
-            'last_reject': last_reject,
-            'last_reject_ts': _state['last_reject_ts'],
-            'last_reject_ts_str': last_reject_ts_str,
-            'cooldowns': cooldowns,
-            'base_cooldown_remaining': base_remaining,
-            'network_consecutive': _state['network_consecutive'],
-            'db_error_consecutive': _state['db_error_consecutive'],
-            'last_order_ts': _state['last_order_ts'],
-        }
+    # Format datetimes outside lock
+    lock_expires_str = ''
+    if entry_locked:
+        try:
+            lock_expires_str = datetime.fromtimestamp(
+                lock_expires, tz=timezone.utc
+            ).strftime('%H:%M:%S UTC')
+        except Exception:
+            lock_expires_str = '?'
+
+    last_reject_ts_str = ''
+    if last_reject_ts > 0:
+        try:
+            last_reject_ts_str = datetime.fromtimestamp(
+                last_reject_ts, tz=timezone.utc
+            ).strftime('%H:%M:%S UTC')
+        except Exception:
+            last_reject_ts_str = '?'
+
+    return {
+        'hourly_count': hourly_count,
+        'hourly_limit': MAX_ATTEMPTS_PER_HOUR,
+        '10min_count': ten_min_count,
+        '10min_limit': MAX_ATTEMPTS_PER_10MIN,
+        'entry_locked': entry_locked,
+        'lock_reason': lock_reason,
+        'lock_expires_ts': lock_expires,
+        'lock_expires_str': lock_expires_str,
+        'last_reject': last_reject,
+        'last_reject_ts': last_reject_ts,
+        'last_reject_ts_str': last_reject_ts_str,
+        'cooldowns': cooldowns,
+        'base_cooldown_remaining': base_remaining,
+        'network_consecutive': net_consecutive,
+        'db_error_consecutive': db_consecutive,
+        'last_order_ts': last_order_ts,
+    }
 
 
 # ── Internal helpers ─────────────────────────────────────
 
-def _auto_halt_trading(cur, reason):
-    """Auto-halt trading by setting trade_switch OFF with reason."""
+def _auto_halt_trading(reason):
+    """Auto-halt trading by setting trade_switch OFF with reason.
+    FIX #7/#11: uses its own DB connection instead of passed cursor.
+    """
+    conn = None
     try:
-        cur.execute("""
-            UPDATE trade_switch
-            SET enabled = false, off_reason = %s, updated_at = now()
-            WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
-        """, (reason,))
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = false, off_reason = %s, updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (reason,))
         _log(f'AUTO HALT: trade_switch OFF, reason={reason}')
-
-        # Send telegram notification
-        try:
-            import urllib.parse
-            import urllib.request
-            cfg = {}
+    except Exception as e:
+        _log(f'_auto_halt_trading DB error: {e}')
+    finally:
+        if conn:
             try:
-                with open('/root/trading-bot/app/telegram_cmd.env') as f:
-                    for line in f:
-                        line = line.strip()
-                        if '=' in line and not line.startswith('#'):
-                            k, v = line.split('=', 1)
-                            cfg[k.strip()] = v.strip()
+                conn.close()
             except Exception:
                 pass
-            token = cfg.get('TELEGRAM_BOT_TOKEN', '')
-            chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
-            if token and chat_id:
-                text = (f'🛑 AUTO HALT: trade_switch OFF\n'
-                        f'사유: {reason}\n'
-                        f'DB 오류 {DB_ERROR_MAX_CONSECUTIVE}회 연속 — 수동 확인 필요\n'
-                        f'/trade on 으로 재개')
-                url = f'https://api.telegram.org/bot{token}/sendMessage'
-                data = urllib.parse.urlencode({
-                    'chat_id': chat_id,
-                    'text': text,
-                    'disable_web_page_preview': 'true'}).encode('utf-8')
-                req = urllib.request.Request(url, data=data, method='POST')
-                urllib.request.urlopen(req, timeout=5)
+
+    # Send telegram notification
+    try:
+        import urllib.parse
+        import urllib.request
+        cfg = {}
+        try:
+            with open('/root/trading-bot/app/telegram_cmd.env') as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.split('=', 1)
+                        cfg[k.strip()] = v.strip()
         except Exception:
             pass
-    except Exception as e:
-        _log(f'_auto_halt_trading error: {e}')
+        token = cfg.get('TELEGRAM_BOT_TOKEN', '')
+        chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
+        if token and chat_id:
+            text = (f'🛑 AUTO HALT: trade_switch OFF\n'
+                    f'사유: {reason}\n'
+                    f'DB 오류 {DB_ERROR_MAX_CONSECUTIVE}회 연속 — 수동 확인 필요\n'
+                    f'/trade on 으로 재개')
+            url = f'https://api.telegram.org/bot{token}/sendMessage'
+            data = urllib.parse.urlencode({
+                'chat_id': chat_id,
+                'text': text,
+                'disable_web_page_preview': 'true'}).encode('utf-8')
+            req = urllib.request.Request(url, data=data, method='POST')
+            urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
