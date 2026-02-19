@@ -130,9 +130,8 @@ def record_attempt(cur, action_type, direction, outcome,
     """
     now = time.time()
 
-    # DB insert — FIX #9: use savepoint to prevent failed-transaction state
+    # DB insert (autocommit-safe: no SAVEPOINT needed)
     try:
-        cur.execute("SAVEPOINT sp_record_attempt;")
         cur.execute("""
             INSERT INTO order_attempt_log
                 (symbol, action_type, direction, outcome,
@@ -143,13 +142,8 @@ def record_attempt(cur, action_type, direction, outcome,
             reject_reason, error_code,
             json.dumps(detail or {}, default=str),
         ))
-        cur.execute("RELEASE SAVEPOINT sp_record_attempt;")
     except Exception as e:
         _log(f'record_attempt DB error: {e}')
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT sp_record_attempt;")
-        except Exception:
-            pass
 
     # In-memory update — FIX #6: only count non-EXIT actions against rate limit
     with _lock:
@@ -157,8 +151,10 @@ def record_attempt(cur, action_type, direction, outcome,
         _state['last_action_ts'][action_type] = now
         if action_type not in EXIT_ACTIONS:
             _state['recent_attempts'].append(now)
-        _state['last_signal_key'] = f'{direction}:{action_type}'
-        _state['last_signal_ts'] = now
+        # Only set signal dedup key on SUCCESS (DRY_RUN/ERROR should not block next real attempt)
+        if outcome == 'SUCCESS':
+            _state['last_signal_key'] = f'{direction}:{action_type}'
+            _state['last_signal_ts'] = now
         _prune_old_attempts(now)
 
 

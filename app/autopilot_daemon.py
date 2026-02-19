@@ -463,8 +463,8 @@ def _cycle():
                 if wr == 'WAIT_ORDER_FILL':
                     _log(f'WAIT_ORDER_FILL: signal creation blocked ({wd})')
                     return
-            except Exception:
-                pass  # FAIL-OPEN
+            except Exception as e:
+                _log(f'WAIT_ORDER_FILL check failed (FAIL-OPEN): {e}')
 
             import direction_scorer
             scores = direction_scorer.compute_scores()
@@ -553,9 +553,9 @@ def _cycle():
                             """, (SYMBOL, direction, add_usdt, add_reason))
                             eq_row = cur.fetchone()
                             _log(f'ADD enqueued: eq_id={eq_row[0] if eq_row else None}')
-                            if current_price > 0:
-                                _last_add_price = current_price
-                                _last_add_ts = time.time()
+                            # Record price for dedup (reset if unavailable to avoid stale blocks)
+                            _last_add_price = current_price if current_price > 0 else 0
+                            _last_add_ts = time.time()
                 else:
                     _log(f'position exists, {decision}: {add_reason}')
                 return

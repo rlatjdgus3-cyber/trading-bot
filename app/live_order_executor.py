@@ -443,7 +443,7 @@ def _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=True):
 
     # THROTTLE gate: check order throttle before entry actions
     if action_type in ("ADD", "REVERSE_OPEN"):
-        throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, action_type)
+        throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, action_type, direction=direction)
         if not throttle_ok:
             log(f"EQ id={eq_id} {action_type} throttled: {throttle_reason}")
             # Keep PENDING (5-min expire_at will auto-GC)

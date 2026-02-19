@@ -63,7 +63,7 @@ def _load_safety_limits(cur):
         }
     return {
         'capital_limit_usdt': float(row[0]) if row[0] is not None else 900,
-        'max_daily_trades': int(row[1]) if row[1] is not None else 20,
+        'max_daily_trades': int(row[1]) if row[1] is not None else 60,
         'max_hourly_trades': int(row[2]) if row[2] is not None else 15,
         'daily_loss_limit_usdt': float(row[3]) if row[3] is not None else -45,
         'max_pyramid_stages': int(row[4]) if row[4] is not None else 7,

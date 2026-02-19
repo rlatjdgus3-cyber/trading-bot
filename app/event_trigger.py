@@ -619,27 +619,32 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
     for k in expired:
         del _last_trigger_ts[k]
 
+    # Whipsaw guard: check BEFORE bundle flush so triggers are not lost.
+    # Requires a separate volume_spike trigger alongside a level break trigger.
+    accumulated = list(_event_bundle.get('triggers', [])) + surviving
+    has_vol_spike_trigger = any(t.get('type') == 'volume_spike' for t in accumulated)
+    has_level_break = any(t.get('type') in ('vah_break', 'val_break') for t in accumulated)
+    if has_vol_spike_trigger and has_level_break:
+        ws_first = _event_bundle.get('whipsaw_first_ts', 0)
+        if ws_first == 0:
+            _event_bundle['whipsaw_first_ts'] = time.time()
+            _log('WHIPSAW_GUARD: vol_spike+level_break detected, starting 120s wait')
+            # Don't flush yet — keep triggers in bundle for re-evaluation
+            bundle_triggers(surviving)  # accumulate without consuming
+            return EventResult()
+        elapsed_ws = time.time() - ws_first
+        if elapsed_ws < WHIPSAW_GUARD_SEC:
+            _log(f'WHIPSAW_GUARD: vol_spike+level_break, {WHIPSAW_GUARD_SEC - elapsed_ws:.0f}s remaining')
+            bundle_triggers(surviving)
+            return EventResult()
+        # 120s elapsed → pass through, reset timer
+        _event_bundle['whipsaw_first_ts'] = 0
+
     # Section 6: bundle triggers within 30s window
     bundled = bundle_triggers(surviving)
     if not bundled:
         _log(f'triggers buffered for bundling: {[t["type"] for t in surviving]}')
         return EventResult()  # still accumulating, return DEFAULT
-
-    # Whipsaw guard: vol_spike + level_break coincide → 120s wait
-    has_vol_spike = any(t.get('type') == 'volume_spike' or t.get('vol_spike') for t in bundled)
-    has_level_break = any(t.get('type') in ('vah_break', 'val_break') for t in bundled)
-    if has_vol_spike and has_level_break:
-        ws_first = _event_bundle.get('whipsaw_first_ts', 0)
-        if ws_first == 0:
-            _event_bundle['whipsaw_first_ts'] = time.time()
-            _log('WHIPSAW_GUARD: vol_spike+level_break detected, starting 120s wait')
-            return EventResult()
-        elapsed_ws = time.time() - ws_first
-        if elapsed_ws < WHIPSAW_GUARD_SEC:
-            _log(f'WHIPSAW_GUARD: vol_spike+level_break, {WHIPSAW_GUARD_SEC - elapsed_ws:.0f}s remaining')
-            return EventResult()
-        # 120s elapsed → pass through, reset timer
-        _event_bundle['whipsaw_first_ts'] = 0
 
     eh = compute_event_hash(bundled, symbol=symbol, price=price)
     _log(f'EVENT: triggers={[t["type"] for t in bundled]} hash={eh[:12]}')

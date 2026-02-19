@@ -225,7 +225,7 @@ def ensure_safety_limits(cur):
         CREATE TABLE IF NOT EXISTS public.safety_limits (
             id                    BIGSERIAL PRIMARY KEY,
             capital_limit_usdt    NUMERIC NOT NULL DEFAULT 900,
-            max_daily_trades      INTEGER NOT NULL DEFAULT 20,
+            max_daily_trades      INTEGER NOT NULL DEFAULT 60,
             max_hourly_trades     INTEGER NOT NULL DEFAULT 8,
             daily_loss_limit_usdt NUMERIC NOT NULL DEFAULT -45,
             max_pyramid_stages    INTEGER NOT NULL DEFAULT 3,
