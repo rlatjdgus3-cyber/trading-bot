@@ -251,7 +251,9 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None):
     cur.execute('SELECT stage FROM position_state WHERE symbol = %s;', (SYMBOL,))
     ps_row = cur.fetchone()
     pyramid_stage = int(ps_row[0]) if ps_row else 0
-    (ok, reason) = safety_manager.check_pyramid_allowed(cur, pyramid_stage)
+    import regime_reader
+    _regime_ctx = regime_reader.get_current_regime(cur)
+    (ok, reason) = safety_manager.check_pyramid_allowed(cur, pyramid_stage, regime_ctx=_regime_ctx)
     if not ok:
         return ('BLOCKED', reason)
 
@@ -281,6 +283,14 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
     now_unix = int(time.time())
     relevant_score = scores.get('long_score', 50) if side == 'LONG' else scores.get('short_score', 50)
     start_stage = safety_manager.compute_start_stage(relevant_score)
+    # Regime-based stage cap
+    import regime_reader
+    _regime_ctx = regime_reader.get_current_regime(cur)
+    regime_stage_max = regime_reader.get_stage_limit(_regime_ctx['regime'], _regime_ctx.get('shock_type'))
+    start_stage = min(start_stage, regime_stage_max)
+    if start_stage <= 0:
+        _log(f'REGIME 차단: stage_limit=0 ({_regime_ctx["regime"]}/{_regime_ctx.get("shock_type")})')
+        return 0
     entry_pct = safety_manager.get_stage_entry_pct(start_stage)
     eq = equity_limits or safety_manager.get_equity_limits(cur)
     usdt_amount = eq['slice_usdt'] * start_stage
@@ -387,6 +397,13 @@ def _cycle():
 
             _log(f'scores: L={scores.get("long_score")} S={scores.get("short_score")} '
                  f'conf={confidence} side={dominant}')
+
+            # Regime check: SHOCK/VETO blocks new entries
+            import regime_reader
+            regime_ctx = regime_reader.get_current_regime(cur)
+            if regime_ctx['available'] and regime_ctx['regime'] == 'SHOCK' and regime_ctx.get('shock_type') == 'VETO':
+                _log(f'REGIME VETO: 진입 차단 (flow_bias={regime_ctx.get("flow_bias")})')
+                return
 
             # Check existing position
             cur.execute('SELECT side, total_qty FROM position_state WHERE symbol = %s;', (SYMBOL,))

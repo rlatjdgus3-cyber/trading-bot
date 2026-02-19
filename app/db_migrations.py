@@ -1642,6 +1642,8 @@ def run_all():
             ensure_order_attempt_log(cur)
             # UNIQUE indexes for all ON CONFLICT targets (InvalidColumnReference fix)
             ensure_upsert_constraints(cur)
+            # Market context table + view (regime classification)
+            ensure_market_context_table(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -1896,6 +1898,56 @@ def ensure_upsert_constraints(cur):
             _log(f'ensure_upsert_constraints: {idx_name} on {table}({col_list}) OK')
         except Exception as e:
             _log(f'ensure_upsert_constraints {table} skip: {e}')
+
+
+def ensure_market_context_table(cur):
+    """Create market_context table + latest view for regime classification."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_context (
+            id              BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol          TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            timeframe       TEXT NOT NULL DEFAULT '1m',
+            regime          TEXT NOT NULL,
+            regime_confidence NUMERIC DEFAULT 0,
+            adx_14          NUMERIC,
+            plus_di         NUMERIC,
+            minus_di        NUMERIC,
+            bbw_ratio       NUMERIC,
+            poc             NUMERIC,
+            vah             NUMERIC,
+            val             NUMERIC,
+            price_vs_va     TEXT,
+            flow_bias       NUMERIC,
+            flow_shock      BOOLEAN DEFAULT false,
+            shock_type      TEXT,
+            shock_direction TEXT,
+            breakout_confirmed BOOLEAN DEFAULT false,
+            breakout_conditions JSONB DEFAULT '{}'::jsonb,
+            raw_inputs      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            UNIQUE(symbol, timeframe, ts)
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_mctx_symbol_ts
+        ON market_context(symbol, ts DESC);
+    """)
+    cur.execute("""
+        CREATE OR REPLACE VIEW market_context_latest AS
+        SELECT DISTINCT ON (symbol)
+            id, ts, symbol, timeframe,
+            regime, regime_confidence,
+            adx_14, plus_di, minus_di, bbw_ratio,
+            poc, vah, val, price_vs_va,
+            flow_bias, flow_shock,
+            shock_type, shock_direction,
+            breakout_confirmed, breakout_conditions,
+            raw_inputs,
+            EXTRACT(EPOCH FROM (now() - ts)) AS age_seconds
+        FROM market_context
+        ORDER BY symbol, ts DESC;
+    """)
+    _log('ensure_market_context_table done')
 
 
 if __name__ == '__main__':

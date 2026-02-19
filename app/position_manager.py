@@ -360,6 +360,13 @@ def _build_context(cur=None, pos=None, snapshot=None):
         traceback.print_exc()
         ctx['decision_history'] = {}
 
+    # Market regime context (FAIL-OPEN: UNKNOWN if unavailable)
+    try:
+        import regime_reader
+        ctx['regime_ctx'] = regime_reader.get_current_regime(cur)
+    except Exception:
+        ctx['regime_ctx'] = {'regime': 'UNKNOWN', 'available': False}
+
     return ctx
 
 
@@ -1393,13 +1400,21 @@ def _decide(ctx=None):
     if side == 'short' and total_score >= 15:
         return ('REDUCE', f'counter signal (total_score={total_score})')
 
-    # ADD check (v2.1: threshold 60, legacy long_score/short_score)
-    if stage < 7 and ps.get('budget_used_pct', 0) < 70:
+    # ADD check (v2.1: threshold 60, regime-aware stage limit)
+    regime_ctx = ctx.get('regime_ctx', {})
+    regime_stage_max = 7  # FAIL-OPEN default
+    if regime_ctx.get('available'):
+        import regime_reader
+        regime_stage_max = regime_reader.get_stage_limit(
+            regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
+    if regime_stage_max == 0:
+        return ('HOLD', f'REGIME VETO: ADD 차단 ({regime_ctx.get("regime")})')
+    if stage < regime_stage_max and ps.get('budget_used_pct', 0) < 70:
         direction = 'LONG' if side == 'long' else 'SHORT'
         if dominant == direction:
             relevant = long_score if direction == 'LONG' else short_score
             if relevant >= 60:
-                return ('ADD', f'score {relevant} favors {direction}, stage={stage}')
+                return ('ADD', f'score {relevant} favors {direction}, stage={stage}/{regime_stage_max}')
 
     return ('HOLD', 'no action needed')
 

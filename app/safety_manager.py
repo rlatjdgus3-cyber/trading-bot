@@ -298,12 +298,23 @@ def check_total_exposure(cur, add_usdt, limits=None):
     return (True, 'ok')
 
 
-def check_pyramid_allowed(cur, current_stage, limits=None):
-    '''Check if pyramiding (ADD) is allowed at current stage.'''
+def check_pyramid_allowed(cur, current_stage, limits=None, regime_ctx=None):
+    '''Check if pyramiding (ADD) is allowed at current stage.
+    regime_ctx: optional dict from regime_reader.get_current_regime() for mode-based limits.
+    '''
     if limits is None:
         limits = _load_safety_limits(cur)
-    if current_stage >= limits['max_stages']:
-        return (False, f'max stages reached ({current_stage}/{limits["max_stages"]})')
+    max_stages = limits['max_stages']
+
+    # Regime-based stage cap (FAIL-OPEN: regime_ctx=None preserves existing behavior)
+    if regime_ctx and regime_ctx.get('available'):
+        import regime_reader
+        regime_max = regime_reader.get_stage_limit(
+            regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
+        max_stages = min(max_stages, regime_max)
+
+    if current_stage >= max_stages:
+        return (False, f'max stages reached ({current_stage}/{max_stages})')
     return (True, 'ok')
 
 
