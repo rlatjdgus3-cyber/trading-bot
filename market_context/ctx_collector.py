@@ -20,7 +20,6 @@ from ctx_utils import _log, send_telegram, ExponentialBackoff, load_env
 import regime_classifier
 
 POLL_SEC = 30
-SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 
 
 def _sdnotify(state):
@@ -39,73 +38,83 @@ def _sdnotify(state):
         pass
 
 
+def _get_symbol():
+    return os.getenv('SYMBOL', 'BTC/USDT:USDT')
+
+
 def _cycle(ro_conn, rw_conn):
     """One classification cycle:
     1. Read market data from main DB (RO)
     2. Classify regime (RANGE/BREAKOUT/SHOCK)
     3. Upsert to market_context table (RW)
     """
+    symbol = _get_symbol()
+
     with ro_conn.cursor() as cur:
-        result = regime_classifier.classify(cur, SYMBOL)
+        result = regime_classifier.classify(cur, symbol)
 
     if not result:
         _log('classify returned None, skipping')
         return
 
-    # Upsert to market_context
-    with rw_conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO market_context (
-                ts, symbol, timeframe,
-                regime, regime_confidence,
-                adx_14, plus_di, minus_di, bbw_ratio,
-                poc, vah, val, price_vs_va,
-                flow_bias, flow_shock,
-                shock_type, shock_direction,
-                breakout_confirmed, breakout_conditions,
-                raw_inputs
-            ) VALUES (
-                now(), %s, '1m',
-                %s, %s,
-                %s, %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s,
-                %s, %s,
-                %s, %s::jsonb,
-                %s::jsonb
-            )
-            ON CONFLICT (symbol, timeframe, ts) DO UPDATE SET
-                regime = EXCLUDED.regime,
-                regime_confidence = EXCLUDED.regime_confidence,
-                adx_14 = EXCLUDED.adx_14,
-                plus_di = EXCLUDED.plus_di,
-                minus_di = EXCLUDED.minus_di,
-                bbw_ratio = EXCLUDED.bbw_ratio,
-                poc = EXCLUDED.poc,
-                vah = EXCLUDED.vah,
-                val = EXCLUDED.val,
-                price_vs_va = EXCLUDED.price_vs_va,
-                flow_bias = EXCLUDED.flow_bias,
-                flow_shock = EXCLUDED.flow_shock,
-                shock_type = EXCLUDED.shock_type,
-                shock_direction = EXCLUDED.shock_direction,
-                breakout_confirmed = EXCLUDED.breakout_confirmed,
-                breakout_conditions = EXCLUDED.breakout_conditions,
-                raw_inputs = EXCLUDED.raw_inputs;
-        """, (
-            SYMBOL,
-            result['regime'], result['confidence'],
-            result.get('adx_14'), result.get('plus_di'), result.get('minus_di'),
-            result.get('bbw_ratio'),
-            result.get('poc'), result.get('vah'), result.get('val'),
-            result.get('price_vs_va'),
-            result.get('flow_bias'), result.get('flow_shock'),
-            result.get('shock_type'), result.get('shock_direction'),
-            result.get('breakout_confirmed'),
-            json.dumps(result.get('breakout_conditions', {}), default=str),
-            json.dumps(result.get('raw_inputs', {}), default=str),
-        ))
-    rw_conn.commit()
+    # Upsert to market_context (with rollback on error)
+    try:
+        with rw_conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO market_context (
+                    ts, symbol, timeframe,
+                    regime, regime_confidence,
+                    adx_14, plus_di, minus_di, bbw_ratio,
+                    poc, vah, val, price_vs_va,
+                    flow_bias, flow_shock,
+                    shock_type, shock_direction,
+                    breakout_confirmed, breakout_conditions,
+                    raw_inputs
+                ) VALUES (
+                    now(), %s, '1m',
+                    %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s::jsonb,
+                    %s::jsonb
+                )
+                ON CONFLICT (symbol, timeframe, ts) DO UPDATE SET
+                    regime = EXCLUDED.regime,
+                    regime_confidence = EXCLUDED.regime_confidence,
+                    adx_14 = EXCLUDED.adx_14,
+                    plus_di = EXCLUDED.plus_di,
+                    minus_di = EXCLUDED.minus_di,
+                    bbw_ratio = EXCLUDED.bbw_ratio,
+                    poc = EXCLUDED.poc,
+                    vah = EXCLUDED.vah,
+                    val = EXCLUDED.val,
+                    price_vs_va = EXCLUDED.price_vs_va,
+                    flow_bias = EXCLUDED.flow_bias,
+                    flow_shock = EXCLUDED.flow_shock,
+                    shock_type = EXCLUDED.shock_type,
+                    shock_direction = EXCLUDED.shock_direction,
+                    breakout_confirmed = EXCLUDED.breakout_confirmed,
+                    breakout_conditions = EXCLUDED.breakout_conditions,
+                    raw_inputs = EXCLUDED.raw_inputs;
+            """, (
+                symbol,
+                result['regime'], result['confidence'],
+                result.get('adx_14'), result.get('plus_di'), result.get('minus_di'),
+                result.get('bbw_ratio'),
+                result.get('poc'), result.get('vah'), result.get('val'),
+                result.get('price_vs_va'),
+                result.get('flow_bias'), result.get('flow_shock'),
+                result.get('shock_type'), result.get('shock_direction'),
+                result.get('breakout_confirmed'),
+                json.dumps(result.get('breakout_conditions', {}), default=str),
+                json.dumps(result.get('raw_inputs', {}), default=str),
+            ))
+        rw_conn.commit()
+    except Exception:
+        rw_conn.rollback()
+        raise
 
     _log(f'regime={result["regime"]} conf={result["confidence"]} '
          f'adx={result.get("adx_14")} flow={result.get("flow_bias")} '
@@ -147,7 +156,7 @@ def main():
             traceback.print_exc()
             backoff.fail(str(e))
 
-            # Reconnect on DB errors
+            # Reconnect on any error (handles broken pipes, failed transactions)
             for conn in (ro_conn, rw_conn):
                 if conn:
                     try:
@@ -157,6 +166,8 @@ def main():
             ro_conn = None
             rw_conn = None
 
+        # Watchdog even on error cycles
+        _sdnotify('WATCHDOG=1')
         time.sleep(POLL_SEC)
 
 

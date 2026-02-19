@@ -40,7 +40,8 @@ def generate_report(days=7):
             if cur.fetchone()[0] < 2:
                 return 'Tables not ready (market_context or execution_log missing)'
 
-            # Mode-specific performance
+            # Mode-specific performance (parameterized interval)
+            interval_str = f'{int(days)} days'
             cur.execute("""
                 SELECT
                     mc.regime,
@@ -55,12 +56,12 @@ def generate_report(days=7):
                     WHERE symbol = el.symbol AND ts <= el.ts
                     ORDER BY ts DESC LIMIT 1
                 ) mc ON true
-                WHERE el.ts >= now() - interval '%s days'
+                WHERE el.ts >= now() - %s::interval
                   AND el.status IN ('FILLED', 'VERIFIED')
                   AND el.realized_pnl IS NOT NULL
                 GROUP BY mc.regime
                 ORDER BY mc.regime;
-            """ % int(days))
+            """, (interval_str,))
             regime_rows = cur.fetchall()
 
             # Flow bias bucket analysis
@@ -81,12 +82,12 @@ def generate_report(days=7):
                     WHERE symbol = el.symbol AND ts <= el.ts
                     ORDER BY ts DESC LIMIT 1
                 ) mc ON true
-                WHERE el.ts >= now() - interval '%s days'
+                WHERE el.ts >= now() - %s::interval
                   AND el.status IN ('FILLED', 'VERIFIED')
                   AND el.realized_pnl IS NOT NULL
                 GROUP BY flow_bucket
                 ORDER BY flow_bucket;
-            """ % int(days))
+            """, (interval_str,))
             flow_rows = cur.fetchall()
 
             # Regime distribution
@@ -94,9 +95,9 @@ def generate_report(days=7):
                 SELECT regime, COUNT(*) as cnt,
                        ROUND(AVG(regime_confidence)::numeric, 1) as avg_conf
                 FROM market_context
-                WHERE ts >= now() - interval '%s days'
+                WHERE ts >= now() - %s::interval
                 GROUP BY regime ORDER BY cnt DESC;
-            """ % int(days))
+            """, (interval_str,))
             dist_rows = cur.fetchall()
 
         # Format report

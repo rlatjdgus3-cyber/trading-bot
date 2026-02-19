@@ -131,8 +131,10 @@ def classify(cur, symbol='BTC/USDT:USDT'):
         if len(c5_rows) >= 5:
             now_px = float(c5_rows[0][0])
             ago_px = float(c5_rows[4][0])
-            if ago_px > 0:
+            if ago_px > 0 and now_px > 0:
                 ret_5m = (now_px - ago_px) / ago_px * 100
+                # Sanity cap: bad data can't produce absurd returns
+                ret_5m = max(-50, min(50, ret_5m))
         raw['ret_5m'] = round(ret_5m, 4)
     except Exception as e:
         _log(f'ret_5m error: {e}')
@@ -186,7 +188,15 @@ def classify(cur, symbol='BTC/USDT:USDT'):
 
     # 1. SHOCK (highest priority)
     if abs(ret_5m) >= 2.0 or vol_ratio_5m >= 3.0 or flow_shock:
-        shock_direction = 'UP' if ret_5m > 0 else 'DOWN'
+        # Direction: use price move if significant, else flow_bias, else None
+        if abs(ret_5m) >= 0.5:
+            shock_direction = 'UP' if ret_5m > 0 else 'DOWN'
+        elif flow_bias > 20:
+            shock_direction = 'UP'
+        elif flow_bias < -20:
+            shock_direction = 'DOWN'
+        else:
+            shock_direction = None
         shock_type = _classify_shock_type(ret_5m, flow_bias, breakout_direction)
         confidence = min(100, int(abs(ret_5m) * 20 + vol_ratio_5m * 10))
         confidence = max(confidence, 60)
@@ -230,7 +240,7 @@ def classify(cur, symbol='BTC/USDT:USDT'):
 
     if bo_count >= 2:
         confidence = min(100, 50 + bo_count * 15)
-        if adx_14 and adx_14 > 30:
+        if adx_14 is not None and adx_14 > 30:
             confidence = min(100, confidence + 10)
 
         return {

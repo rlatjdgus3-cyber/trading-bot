@@ -66,6 +66,7 @@ def compute_flow(cur, symbol='BTC/USDT:USDT'):
         _log(f'flow funding error: {e}')
 
     # --- Orderbook imbalance ---
+    ob_imbalance = 0
     try:
         cur.execute("""
             SELECT orderbook_imbalance FROM liquidity_snapshots
@@ -74,10 +75,10 @@ def compute_flow(cur, symbol='BTC/USDT:USDT'):
         """, (symbol,))
         row = cur.fetchone()
         if row and row[0]:
-            imb = float(row[0])
+            ob_imbalance = float(row[0])
             # imbalance > 0 -> more bids -> bullish, < 0 -> more asks -> bearish
-            ob_score = max(-100, min(100, imb * 100))
-        components['ob_imbalance'] = float(row[0]) if row and row[0] else 0
+            ob_score = max(-100, min(100, ob_imbalance * 100))
+        components['ob_imbalance'] = ob_imbalance
         components['ob_score'] = round(ob_score, 1)
     except Exception as e:
         _log(f'flow orderbook error: {e}')
@@ -103,7 +104,8 @@ def compute_flow(cur, symbol='BTC/USDT:USDT'):
 
     if abs(oi_change_pct) > 5 and vol_spike:
         flow_shock = True
-    if abs(funding_rate) > 0.001:
+    # Extreme funding: 0.03% per 8h = 1.37% annualized — genuinely unusual
+    if abs(funding_rate) > 0.0003:
         flow_shock = True
 
     return {
