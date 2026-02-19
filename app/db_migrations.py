@@ -1636,6 +1636,12 @@ def run_all():
             ensure_trade_switch_recovery_columns(cur)
             # trade_switch updated_at defensive migration
             ensure_trade_switch_updated_at(cur)
+            # live_order_once_lock table (was missing from migrations)
+            ensure_live_order_once_lock(cur)
+            # Order throttle attempt log
+            ensure_order_attempt_log(cur)
+            # UNIQUE indexes for all ON CONFLICT targets (InvalidColumnReference fix)
+            ensure_upsert_constraints(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -1777,6 +1783,119 @@ def ensure_data_integrity_audit(cur):
         );
     """)
     _log('ensure_data_integrity_audit done')
+
+
+def ensure_live_order_once_lock(cur):
+    """Create live_order_once_lock table with UNIQUE(symbol) for ON CONFLICT support."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.live_order_once_lock (
+            id          BIGSERIAL PRIMARY KEY,
+            symbol      TEXT NOT NULL,
+            opened_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            expires_at  TIMESTAMPTZ
+        );
+    """)
+    # Ensure UNIQUE constraint on symbol (required for ON CONFLICT (symbol))
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_once_lock_symbol
+        ON public.live_order_once_lock (symbol);
+    """)
+    _log('ensure_live_order_once_lock done')
+
+
+def ensure_order_attempt_log(cur):
+    """Order throttle attempt log — tracks every order attempt for rate limiting."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.order_attempt_log (
+            id           BIGSERIAL PRIMARY KEY,
+            ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol       TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            action_type  TEXT NOT NULL,
+            direction    TEXT,
+            outcome      TEXT NOT NULL,
+            reject_reason TEXT,
+            error_code   INTEGER,
+            source       TEXT DEFAULT 'executor',
+            detail       JSONB DEFAULT '{}'::jsonb
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_oal_ts ON order_attempt_log(ts DESC);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_oal_symbol_ts ON order_attempt_log(symbol, ts DESC);')
+    _log('ensure_order_attempt_log done')
+
+
+def ensure_upsert_constraints(cur):
+    """Ensure UNIQUE indexes exist for all tables that use ON CONFLICT.
+
+    Without matching UNIQUE/EXCLUSION constraints, Postgres raises
+    InvalidColumnReference on INSERT ... ON CONFLICT.
+    For each table, deduplicate existing rows first (keep newest id),
+    then create UNIQUE INDEX IF NOT EXISTS.
+    """
+    targets = [
+        # (table, columns, index_name, id_col_for_dedup)
+        ('live_order_once_lock', ['symbol'], 'uq_once_lock_symbol', 'id'),
+        ('candles', ['symbol', 'tf', 'ts'], 'uq_candles_symbol_tf_ts', 'id'),
+        ('indicators', ['symbol', 'tf', 'ts'], 'uq_indicators_symbol_tf_ts', 'id'),
+        ('vol_profile', ['symbol', 'tf', 'ts'], 'uq_vol_profile_symbol_tf_ts', 'id'),
+        ('nasdaq_proxy', ['ts', 'symbol'], 'uq_nasdaq_proxy_ts_symbol', 'id'),
+    ]
+    for table, cols, idx_name, id_col in targets:
+        try:
+            # Check if table exists
+            cur.execute("""
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s;
+            """, (table,))
+            if not cur.fetchone():
+                continue  # table doesn't exist yet, skip
+
+            # Check if index already exists
+            cur.execute("""
+                SELECT 1 FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = %s AND indexname = %s;
+            """, (table, idx_name))
+            if cur.fetchone():
+                continue  # index already exists
+
+            col_list = ', '.join(cols)
+
+            # Check for duplicates
+            cur.execute(f"""
+                SELECT {col_list}, COUNT(*) c
+                FROM {table}
+                GROUP BY {col_list}
+                HAVING COUNT(*) > 1
+                LIMIT 1;
+            """)
+            has_dupes = cur.fetchone()
+
+            if has_dupes:
+                # Remove duplicates: keep row with highest id
+                _log(f'dedup {table} on ({col_list}) before UNIQUE index')
+                cur.execute(f"""
+                    DELETE FROM {table} t
+                    USING (
+                        SELECT {id_col},
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY {col_list}
+                                   ORDER BY {id_col} DESC
+                               ) AS rn
+                        FROM {table}
+                    ) d
+                    WHERE t.{id_col} = d.{id_col} AND d.rn > 1;
+                """)
+                deleted = cur.rowcount
+                _log(f'dedup {table}: deleted {deleted} duplicate rows')
+
+            # Create UNIQUE index
+            cur.execute(f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
+                ON public.{table} ({col_list});
+            """)
+            _log(f'ensure_upsert_constraints: {idx_name} on {table}({col_list}) OK')
+        except Exception as e:
+            _log(f'ensure_upsert_constraints {table} skip: {e}')
 
 
 if __name__ == '__main__':

@@ -324,6 +324,23 @@ def compute_wait_reason(cur=None, gate_status=None):
         if row and not row[0]:
             return ('WAIT_SWITCH', 'trade_switch OFF → 신규 진입 불가')
 
+        # Order throttle check → WAIT_RATE_LIMIT
+        try:
+            import order_throttle
+            t_ok, t_reason, t_meta = order_throttle.check_all(cur, 'OPEN')
+            if not t_ok:
+                next_ts = t_meta.get('next_allowed_ts')
+                if next_ts:
+                    from datetime import datetime as _dt, timezone as _tz
+                    next_str = _dt.fromtimestamp(next_ts, tz=_tz.utc).strftime('%H:%M:%S UTC')
+                    return ('WAIT_RATE_LIMIT', f'주문 속도 제한: {t_reason} (해제: {next_str})')
+                cd_rem = t_meta.get('cooldown_remaining')
+                if cd_rem:
+                    return ('WAIT_RATE_LIMIT', f'쿨다운 대기: {t_reason} ({cd_rem:.0f}초)')
+                return ('WAIT_RATE_LIMIT', f'주문 속도 제한: {t_reason}')
+        except ImportError:
+            pass
+
         # 1. gate BLOCKED → WAIT_GATED
         if gate_status is not None:
             gate_ok, _gate_reason = gate_status

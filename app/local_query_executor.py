@@ -106,6 +106,7 @@ def execute(query_type=None, original_text=None):
         'debug_once_lock_clear': _debug_once_lock_clear,
         'debug_backfill_ack': _debug_backfill_ack,
         'debug_gate_details': _debug_gate_details,
+        'debug_order_throttle': _debug_order_throttle,
         'reconcile': _reconcile}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
@@ -748,17 +749,44 @@ def _score_summary(_text=None):
         pos_c = pos * pos_w
         regime_c = regime * regime_w
         news_c = ne * news_w
+        # Signal stage (from score engine: stg1/stg2/... thresholds)
+        abs_score = r.get('abs_score', abs(total))
+        signal_stage_label = f'stg{stage}'
+        # Position stage (from position_state DB: 0-7 pyramid)
+        pos_stage = 0
+        pos_capital_pct = 0
+        try:
+            conn_ps = _db()
+            with conn_ps.cursor() as cur_ps:
+                cur_ps.execute(
+                    "SELECT stage, capital_used_usdt FROM position_state WHERE symbol = %s;",
+                    ('BTC/USDT:USDT',))
+                ps_row = cur_ps.fetchone()
+                if ps_row:
+                    pos_stage = int(ps_row[0]) if ps_row[0] else 0
+                    used_usdt = float(ps_row[1]) if ps_row[1] else 0
+                    import safety_manager
+                    eq = safety_manager.get_equity_limits(cur_ps)
+                    op_cap = eq.get('operating_cap', 1)
+                    pos_capital_pct = round(used_usdt / op_cap * 100, 0) if op_cap > 0 else 0
+            conn_ps.close()
+        except Exception:
+            pass
+
         lines = [
             f"📊 스코어 엔진 (4축)",
             f"━━━━━━━━━━━━━━━━━━",
-            f"총점: {total:+.1f} → {dominant} (stage {stage})",
+            f"총점: {total:+.1f} → {dominant}",
             f"",
             f"기술(TECH):   {tech:+.0f} × {tech_w} = {tech_c:+.1f}",
             f"포지션(POS):  {pos:+.0f} × {pos_w} = {pos_c:+.1f}",
             f"레짐(REG):    {regime:+.0f} × {regime_w} = {regime_c:+.1f}",
             f"뉴스(NEWS):   {ne:+.0f} × {news_w} = {news_c:+.1f}{' [차단됨]' if guarded else ''}",
             f"",
-            f"엔진권고: {dominant} stg{stage} (총점 {total:+.1f})",
+            f"Signal Stage: {signal_stage_label} (score={abs_score:.0f}, threshold: stg1>=10, stg2>=20, stg5>=55, stg6>=65, stg7>=75)",
+            f"Position Stage: {pos_stage}/7 (capital used: {pos_capital_pct:.0f}%)",
+            f"",
+            f"엔진권고: {dominant} {signal_stage_label} (총점 {total:+.1f})",
         ]
         # 현재 포지션 정보
         try:
@@ -4221,6 +4249,66 @@ def _db_monthly_stats(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'⚠ 월별 통계 오류: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _debug_order_throttle(_text=None):
+    """주문 속도 제한 상태 + 60분 타임라인."""
+    import order_throttle
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            status = order_throttle.get_throttle_status(cur)
+            lines = ['🚦 Order Throttle Guard', '━━━━━━━━━━━━━━━━━━']
+            # Rate limits
+            lines.append(f'📊 Rate Limits')
+            lines.append(f'  1h: {status["hourly_count"]}/{status["hourly_limit"]}')
+            lines.append(f'  10m: {status["10min_count"]}/{status["10min_limit"]}')
+            # Entry lock
+            if status.get('entry_locked'):
+                lines.append(f'🔒 ENTRY LOCKED: {status["lock_reason"]}')
+                lines.append(f'  expires: {status["lock_expires_str"]}')
+            else:
+                lines.append('🔓 Entry: UNLOCKED')
+            # Cooldowns
+            lines.append(f'\n⏱ Cooldowns')
+            for action, remaining in status.get('cooldowns', {}).items():
+                icon = '⏳' if remaining > 0 else '✅'
+                lines.append(f'  {icon} {action}: {remaining:.0f}s' if remaining > 0 else f'  {icon} {action}: ready')
+            # Last reject
+            if status.get('last_reject'):
+                lines.append(f'\n❌ Last Reject')
+                lines.append(f'  {status["last_reject"][:100]}')
+                lines.append(f'  at: {status.get("last_reject_ts_str", "?")}')
+            # Backoff state
+            if status.get('network_consecutive', 0) > 0:
+                lines.append(f'🌐 Network errors: {status["network_consecutive"]} consecutive')
+            if status.get('db_error_consecutive', 0) > 0:
+                lines.append(f'💾 DB errors: {status["db_error_consecutive"]} consecutive')
+            # 60-min timeline from DB
+            cur.execute("""
+                SELECT date_trunc('minute', ts) AS m, count(*),
+                       count(*) FILTER (WHERE outcome='SUCCESS'),
+                       count(*) FILTER (WHERE outcome IN ('REJECTED','ERROR','BLOCKED'))
+                FROM order_attempt_log
+                WHERE symbol='BTC/USDT:USDT' AND ts >= now()-interval '60 minutes'
+                GROUP BY m ORDER BY m;
+            """)
+            rows = cur.fetchall()
+            if rows:
+                lines.append(f'\n📈 60-min Timeline ({len(rows)} active minutes)')
+                for m, cnt, ok, fail in rows[-20:]:
+                    bar = '█' * min(ok, 10) + '░' * min(fail, 10)
+                    lines.append(f'  {m.strftime("%H:%M")} {bar} ({ok}/{fail})')
+            return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ order_throttle error: {e}'
     finally:
         if conn:
             try:

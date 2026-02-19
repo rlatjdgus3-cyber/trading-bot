@@ -26,6 +26,7 @@ load_dotenv("/root/trading-bot/app/.env")
 from db_config import get_conn
 import exchange_compliance as ecl
 from trading_config import SYMBOL, ALLOWED_SYMBOLS
+import order_throttle
 
 # ============================================================
 # Constants
@@ -440,6 +441,14 @@ def _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=True):
             log(f"EQ id={eq_id} waiting on depends_on={dep_id} (status={dep_row[0]})")
             return  # stay PENDING, retry next cycle
 
+    # THROTTLE gate: check order throttle before entry actions
+    if action_type in ("ADD", "REVERSE_OPEN"):
+        throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, action_type)
+        if not throttle_ok:
+            log(f"EQ id={eq_id} {action_type} throttled: {throttle_reason}")
+            # Keep PENDING (5-min expire_at will auto-GC)
+            return
+
     # ENTRY gate: ADD/REVERSE_OPEN require entry_enabled
     if action_type in ("ADD", "REVERSE_OPEN") and not entry_enabled:
         log(f"EQ id={eq_id} {action_type} REJECTED — trade_switch OFF (entry disabled)")
@@ -523,6 +532,20 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
     else:
         qty = pos_qty * 0.3  # default 30%
 
+    # ── min_qty enforcement for REDUCE ──
+    try:
+        info = ecl.get_market_info(ex, SYMBOL)
+        min_qty = info['minQty']
+        if qty < min_qty:
+            log(f"REDUCE qty {qty:.6f} < min_qty {min_qty} — switching to FULL CLOSE "
+                f"(pos_qty={pos_qty})")
+            qty = pos_qty  # full position close instead of partial
+    except Exception as e:
+        log(f"REDUCE min_qty check warning: {e}")
+
+    log(f"REDUCE ORDER_DETAIL: qty={qty:.6f} pos_qty={pos_qty:.6f} "
+        f"reduce_pct={reduce_pct} reason={reason}")
+
     if EQ_DRY_RUN:
         log(f"[EQ_DRY_RUN] REDUCE {pos_side} qty={qty:.6f} (of {pos_qty}) reason={reason}"
             f" — WOULD CALL place_close_order()")
@@ -589,6 +612,7 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
             "eq_id": eq_id, "action": "ADD", "direction": dir_upper,
             "usdt": usdt, "reason": reason,
         })
+        order_throttle.record_attempt(cur, 'ADD', dir_upper, 'DRY_RUN')
         return
 
     try:
@@ -598,6 +622,7 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
         _update_eq_status(cur, eq_id, "REJECTED")
         audit(cur, "EQ_REJECTED", SYMBOL, {
             "eq_id": eq_id, "reason": f"compliance/exchange: {e}"})
+        # record_attempt already called inside place_open_order on failure
         return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "ADD", dir_upper, amount, reason,
@@ -691,6 +716,7 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason, meta
             "eq_id": eq_id, "action": "REVERSE_OPEN", "direction": dir_upper,
             "usdt": usdt, "reason": reason,
         })
+        order_throttle.record_attempt(cur, 'REVERSE_OPEN', dir_upper, 'DRY_RUN')
         return
 
     try:
@@ -750,6 +776,17 @@ def get_position(ex):
 def place_close_order(ex, side: str, qty: float, cur=None):
     """reduceOnly market close with ECL compliance."""
     _check_symbol_allowed(SYMBOL)
+
+    # ── min_qty enforcement for close ──
+    try:
+        info = ecl.get_market_info(ex, SYMBOL)
+        min_qty = info['minQty']
+        if qty < min_qty:
+            log(f"CLOSE MIN_QTY ADJUST: {qty:.6f} -> {min_qty} (min_qty enforcement)")
+            qty = min_qty
+    except Exception as e:
+        log(f"CLOSE min_qty check warning: {e}")
+
     # Compliance validation
     order_params = {
         'action': 'SELL' if side == 'long' else 'BUY',
@@ -787,6 +824,8 @@ def place_close_order(ex, side: str, qty: float, cur=None):
                 cur, 'ORDER_SENT', SYMBOL, order_params,
                 compliance_passed=True,
                 detail={'corrected': comp.was_corrected, 'final_qty': final_qty})
+            order_throttle.record_attempt(cur, 'CLOSE', side.upper(), 'SUCCESS')
+        order_throttle.handle_success('CLOSE')
         return order
     except Exception as e:
         error_code, raw_msg = ecl.extract_bybit_error_code(e)
@@ -794,6 +833,12 @@ def place_close_order(ex, side: str, qty: float, cur=None):
         log(f"BYBIT ERROR close: code={error_code} {error_info['korean_message']}")
         _send_telegram(ecl.format_rejection_telegram(error_info))
         ecl.record_error(SYMBOL, error_code=error_code)
+        if cur:
+            order_throttle.record_attempt(
+                cur, 'CLOSE', side.upper(), 'ERROR',
+                reject_reason=error_info.get('korean_message', str(e)),
+                error_code=error_code)
+        order_throttle.handle_rejection(cur, error_code, error_info.get('korean_message', str(e)))
         # Trigger market info refresh on specific errors
         if ecl.should_refresh_on_error(error_code):
             ecl.force_refresh_market_info(
@@ -831,8 +876,42 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
 
     ticker = ex.fetch_ticker(SYMBOL)
     price = float(ticker["last"])
-    amount = usdt_size / price
+    raw_amount = usdt_size / price
     info = ecl.get_market_info(ex, SYMBOL)
+
+    # ── min_qty enforcement ──
+    min_qty = info['minQty']
+    min_notional = info['minNotional']
+    amount = raw_amount
+    if amount < min_qty:
+        amount = min_qty
+        adjusted_usdt = amount * price
+        if adjusted_usdt < min_notional:
+            log(f"OPEN BLOCK: even min_qty={min_qty} fails minNotional "
+                f"({adjusted_usdt:.2f} < {min_notional})")
+            raise ValueError(
+                f"min_qty adjusted amount still below minNotional "
+                f"({adjusted_usdt:.2f} < {min_notional})")
+        log(f"MIN_QTY ADJUST: {raw_amount:.6f} -> {amount} (min_qty={min_qty})")
+
+    # ── Pre-order detail log ──
+    try:
+        import safety_manager as _sm
+        _eq = _sm.get_equity_limits(cur)
+        _slice = _eq.get('slice_usdt', 0)
+    except Exception:
+        _slice = 0
+    try:
+        positions = ex.fetch_positions([SYMBOL])
+        _lev = 0
+        for _p in positions:
+            if _p.get('symbol') == SYMBOL:
+                _lev = float(_p.get('leverage') or 0)
+                break
+    except Exception:
+        _lev = 0
+    log(f"ORDER_DETAIL: requested_qty={raw_amount:.6f} adjusted_qty={amount:.6f} "
+        f"min_qty={min_qty} slice_usdt={_slice:.0f} leverage={_lev}")
 
     # Compliance validation
     order_params = {
@@ -843,7 +922,7 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
         'reduce_only': False,
         'order_type': 'market',
         'position_qty': 0,
-        'usdt_value': usdt_size,
+        'usdt_value': max(usdt_size, amount * price),
     }
     comp = ecl.validate_bybit_compliance(ex, order_params, SYMBOL)
 
@@ -871,6 +950,8 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
                 cur, 'ORDER_SENT', SYMBOL, order_params,
                 compliance_passed=True,
                 detail={'corrected': comp.was_corrected, 'final_amount': final_amount})
+            order_throttle.record_attempt(cur, 'OPEN', direction, 'SUCCESS')
+        order_throttle.handle_success('OPEN')
         return order, price, final_amount
     except Exception as e:
         error_code, raw_msg = ecl.extract_bybit_error_code(e)
@@ -878,6 +959,12 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
         log(f"BYBIT ERROR open: code={error_code} {error_info['korean_message']}")
         _send_telegram(ecl.format_rejection_telegram(error_info))
         ecl.record_error(SYMBOL, error_code=error_code)
+        if cur:
+            order_throttle.record_attempt(
+                cur, 'OPEN', direction, 'ERROR',
+                reject_reason=error_info.get('korean_message', str(e)),
+                error_code=error_code)
+        order_throttle.handle_rejection(cur, error_code, error_info.get('korean_message', str(e)))
         # Trigger market info refresh on specific errors
         if ecl.should_refresh_on_error(error_code):
             ecl.force_refresh_market_info(
@@ -943,10 +1030,12 @@ def main():
     with conn.cursor() as cur:
         ensure_log_table(cur)
         ensure_close_state_table(cur)
-        # Ensure compliance_log table exists
+        # Ensure compliance_log + once_lock constraints exist
         try:
             import db_migrations
             db_migrations.ensure_compliance_log(cur)
+            db_migrations.ensure_live_order_once_lock(cur)
+            db_migrations.ensure_upsert_constraints(cur)
         except Exception:
             pass
         audit(cur, "DAEMON_START", SYMBOL, {"pid": os.getpid()})
@@ -986,6 +1075,9 @@ def _cycle(ex, _last_order_ts_unused):
     conn = db_conn()
     try:
         with conn.cursor() as cur:
+            # --- Order throttle: load recent attempts from DB ---
+            order_throttle._ensure_loaded(cur)
+
             # --- Guard: trade_switch (ENTRY only) ---
             # EXIT actions (CLOSE, stoploss, REDUCE) always run regardless of switch.
             entry_enabled = trade_switch_on(cur)
@@ -1124,12 +1216,13 @@ def _cycle(ex, _last_order_ts_unused):
                 mark_processed(cur, sig_id)
                 return
 
-            # Guard: rate limit
-            now = time.time()
-            if now - _state["last_order_ts"] < MIN_ORDER_INTERVAL_SEC:
-                log(f"GUARD: rate limit — {MIN_ORDER_INTERVAL_SEC}s not elapsed")
+            # Guard: order throttle (replaces simple rate limit)
+            throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, 'OPEN')
+            if not throttle_ok:
+                log(f"GUARD: throttle — {throttle_reason}")
                 audit(cur, "GUARD_BLOCK", SYMBOL, {
-                    "signal_id": sig_id, "guard": "rate_limit",
+                    "signal_id": sig_id, "guard": "order_throttle",
+                    "reason": throttle_reason,
                 })
                 # do NOT mark processed — retry next cycle
                 return

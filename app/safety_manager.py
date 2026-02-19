@@ -123,7 +123,9 @@ def get_equity_limits(cur=None):
     max_stages = limits.get('max_stages', 7)
     operating_cap = equity * operating_ratio
     reserve = equity * (1 - operating_ratio)
-    slice_usdt = operating_cap / max_stages if max_stages > 0 else operating_cap
+    SLICE_MIN_USDT = 100  # scalp minimum entry floor
+    raw_slice = operating_cap / max_stages if max_stages > 0 else operating_cap
+    slice_usdt = max(raw_slice, SLICE_MIN_USDT)
 
     return {
         'equity': round(equity, 2),

@@ -1009,6 +1009,27 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
     # ── OPEN_LONG / OPEN_SHORT ──
     if action in ('OPEN_LONG', 'OPEN_SHORT'):
         direction = 'LONG' if action == 'OPEN_LONG' else 'SHORT'
+
+        # EVENT GUARD 1: FLAT + EVENT -> chart signal required
+        if not pos_side:
+            scores = ctx.get('scores', {})
+            abs_score = abs(scores.get('total_score', 0))
+            if abs_score < 20:
+                _log(f'EVENT OPEN blocked: FLAT, abs_score={abs_score} < 20')
+                return ('HOLD', result)
+
+        # EVENT GUARD 2: same-direction ADD -> EVENT alone forbidden
+        if pos_side and pos_side == direction:
+            _log(f'EVENT ADD same-dir blocked: {pos_side} + EVENT {direction}')
+            return ('HOLD', result)
+
+        # EVENT GUARD 3: cooldown check
+        import order_throttle
+        cd_ok, cd_reason, _ = order_throttle.check_cooldown(action_type='ADD')
+        if not cd_ok:
+            _log(f'EVENT OPEN cooldown: {cd_reason}')
+            return ('HOLD', result)
+
         if pos_side and pos_side != direction:
             _log(f'GPT-mini {action} conflicts with {pos_side} — skipped')
             return ('HOLD', result)
@@ -1035,6 +1056,23 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
         if not pos_side:
             _log('GPT-mini REVERSE skipped: no position')
             return ('HOLD', result)
+
+        # EVENT GUARD: REVERSE -> chart confirmation + cooldown
+        scores = ctx.get('scores', {})
+        total_score = scores.get('total_score', 0)
+        if pos_side == 'LONG' and total_score > -20:
+            _log(f'EVENT REVERSE blocked: LONG->SHORT but total_score={total_score} > -20')
+            return ('HOLD', result)
+        if pos_side == 'SHORT' and total_score < 20:
+            _log(f'EVENT REVERSE blocked: SHORT->LONG but total_score={total_score} < 20')
+            return ('HOLD', result)
+
+        import order_throttle
+        cd_ok, cd_reason, _ = order_throttle.check_cooldown(action_type='REVERSE_OPEN')
+        if not cd_ok:
+            _log(f'EVENT REVERSE cooldown: {cd_reason}')
+            return ('HOLD', result)
+
         eq_id = _enqueue_reverse(
             cur, pos,
             reason=f'event_mini_{trigger_types[0] if trigger_types else "unknown"}',
@@ -1444,7 +1482,9 @@ def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
         cur, kwargs.get('target_usdt', 0), emergency=emergency)
     if not ok and action_type == 'ADD':
         _log(f'safety block: {reason}')
-        _send_telegram(f'🚫 주문 거부 — 사유: {report_formatter._kr_safety_reason(reason)}')
+        _send_telegram_throttled(
+            f'🚫 주문 거부 — 사유: {report_formatter._kr_safety_reason(reason)}',
+            msg_type='order_reject')
         return None
     cur.execute("""
         INSERT INTO execution_queue

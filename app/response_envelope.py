@@ -33,6 +33,9 @@ WAIT_REASON_KR = {
     'WAIT_ORDER_FILL': '거래소 응답/동기화 대기(주문/포지션 확인중)',
     'WAIT_EXCHANGE_SYNC': '거래소 응답/동기화 대기(주문/포지션 확인중)',
     'WAIT_CAP': '자본 한도 도달 — 추가 진입 불가',
+    'WAIT_RATE_LIMIT': '주문 속도 제한 — 시간당/10분 주문 한도 도달',
+    'WAIT_MIN_QTY': '최소 주문 수량 미달 — 자본 부족',
+    'WAIT_DB_ERROR': 'DB 오류 백오프 — 자동 복구 대기 중',
 }
 
 
@@ -693,14 +696,13 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         used = capital_info.get('used_usdt', 0)
         remaining = capital_info.get('remaining_usdt', 0)
         source = capital_info.get('source', '?').upper()
+        pct_int = int(ratio * 100)
         sections.append(
             f'[CAPITAL]\n'
             f'  - equity_total: {eq:,.2f} USDT ({source})\n'
-            f'  - operating_ratio: {ratio:.2f}\n'
-            f'  - operating_cap: {op:,.2f} USDT (= {eq:,.2f} x {ratio:.2f})\n'
-            f'  - reserve_cap: {res:,.2f} USDT (= {eq:,.2f} - {op:,.2f})\n'
-            f'  - stage_plan: {max_stg} steps\n'
-            f'  - slice_per_step: {slc:,.2f} USDT (= {op:,.2f} / {max_stg})\n'
+            f'  - Operating Cap: {op:,.2f} USDT (equity {eq:,.0f} * {pct_int}%)\n'
+            f'  - Stage Slice: {slc:,.2f} USDT (cap / {max_stg} stages)\n'
+            f'  - reserve_cap: {res:,.2f} USDT\n'
             f'  - used_cap: {used:,.2f} USDT\n'
             f'  - remaining_cap: {remaining:,.2f} USDT'
         )
@@ -710,7 +712,7 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         sections.append(f'[LEVERAGE] current={lev}x | rule={lev_rule}')
         # Stage
         stage = capital_info.get('stage', 0)
-        sections.append(f'[STAGE] {stage}/{max_stg}')
+        sections.append(f'[STAGE] Position: {stage}/{max_stg} (capital used: {used:,.2f}/{op:,.2f} USDT)')
     else:
         sections.append(f'[RISK] (use /risk_config for details)')
 
@@ -726,6 +728,26 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
     else:
         gate_str = 'N/A'
     sections.append(f'[GATE] Safety: {gate_str}')
+
+    # 5.5 [GUARD] Order Throttle
+    if capital_info:
+        try:
+            import order_throttle
+            ts = order_throttle.get_throttle_status()
+            guard_lines = ['[GUARD] Order Throttle']
+            guard_lines.append(f'  attempts: {ts["hourly_count"]}/{ts["hourly_limit"]} (1h) | '
+                              f'{ts["10min_count"]}/{ts["10min_limit"]} (10m)')
+            if ts.get('entry_locked'):
+                guard_lines.append(f'  ENTRY LOCKED: {ts["lock_reason"]} -> {ts["lock_expires_str"]}')
+            if ts.get('last_reject'):
+                guard_lines.append(f'  last_reject: {ts["last_reject"][:80]}')
+                guard_lines.append(f'  last_reject_ts: {ts.get("last_reject_ts_str", "?")}')
+            cd_active = [f'{k}={v:.0f}s' for k, v in ts.get('cooldowns', {}).items() if v > 0]
+            if cd_active:
+                guard_lines.append(f'  cooldowns: {", ".join(cd_active)}')
+            sections.append('\n'.join(guard_lines))
+        except Exception:
+            pass
 
     # 6. [SWITCH] Entry/Exit + WAIT_REASON
     if switch_status is not None:

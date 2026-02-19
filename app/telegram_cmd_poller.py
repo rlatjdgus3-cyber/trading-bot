@@ -2179,6 +2179,8 @@ _DEBUG_SUBCMDS = {
     'bf_ack': 'debug_backfill_ack',
     'gate_details': 'debug_gate_details',
     'gate': 'debug_gate_details',
+    'order_throttle': 'debug_order_throttle',
+    'throttle': 'debug_order_throttle',
 }
 
 _DEBUG_HELP = (
@@ -2206,6 +2208,7 @@ _DEBUG_HELP = (
     '  /debug system_stability — 시스템 안정성 점수 + 게이트 PASS/FAIL\n'
     '  /debug state — 시스템 상태 변수\n'
     '  /debug gate_details — 서비스별 gate 상세 (dual-source)\n'
+    '  /debug order_throttle — 주문 속도 제한 상태 + 60분 타임라인\n'
     '  /debug on|off — 디버그 모드 토글\n'
     '\n'
     '  aliases: reaction, coverage, backfill, dryrun, gate,\n'
@@ -2919,6 +2922,15 @@ def _comprehensive_report(text: str) -> str:
 
 def handle_command(text: str, chat_id: int = 0) -> str:
     t = (text or "").strip()
+
+    # Benchmark service routing (separate process)
+    if t.startswith('/bench') or t.startswith('/apply_proposal') or t.startswith('/apply_confirm'):
+        import subprocess
+        result = subprocess.run(
+            ['/usr/bin/python3', '/root/trading-bot/benchmark_service/bench_telegram.py', '--handle', t],
+            capture_output=True, text=True, timeout=30)
+        return (result.stdout.strip() or result.stderr.strip() or '(no response)') + \
+            _footer('benchmark', 'direct', 'bench_service')
 
     # Phase 0: Minimal direct commands (no GPT cost)
     if t in ("/help", "help"):
