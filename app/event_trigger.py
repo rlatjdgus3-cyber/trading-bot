@@ -40,6 +40,13 @@ PRICE_SPIKE_15M_PCT = 3.0
 # ── volume spike ───────────────────────────────────────────
 VOL_SPIKE_RATIO = 2.0  # vol_last >= 2.0 * vol_ma20
 
+# ── v14: "strong event" gate ──────────────────────────────
+# EVENT triggers now require stronger conditions to fire
+STRONG_VOL_SPIKE_RATIO = 2.0         # vol >= 2.0x MA20
+STRONG_VOL_BODY_MIN_PCT = 0.4        # abs(body_5m_pct) >= 0.4%
+STRONG_CHANGE_5M_MIN_PCT = 0.6       # abs(change_5m_pct) >= 0.6%
+STRONG_NEWS_SCORE_MIN = 60           # abs(news_score) >= 60
+
 # ── level breaks (POC/VAH/VAL) ────────────────────────────
 POC_SHIFT_MIN_PCT = 0.3
 VAH_VAL_SUSTAIN_CANDLES = 3
@@ -495,6 +502,49 @@ def should_send_telegram_event(trigger_types) -> bool:
     return True
 
 
+def is_event_add_allowed(regime='UNKNOWN'):
+    """v14: Check if EVENT mode should allow ADD orders.
+    RANGE mode: EVENT→ADD is blocked (analysis/alert only).
+    BREAKOUT mode: EVENT→ADD is allowed.
+    """
+    try:
+        import regime_reader
+        r_params = regime_reader.get_regime_params(regime, None)
+        return not r_params.get('event_add_blocked', False)
+    except Exception:
+        return True  # FAIL-OPEN
+
+
+def is_strong_event(snapshot) -> tuple:
+    """v14: Check if current conditions meet "strong event" criteria.
+    Returns (is_strong, reasons).
+
+    Strong event requires at least one of:
+    1. vol >= 2.0x MA20 AND abs(body_5m) >= 0.4%
+    2. abs(change_5m) >= 0.6%
+    3. abs(news_score) >= 60
+    4. BB 2-candle breakout with volume
+    """
+    reasons = []
+    vol_ratio = snapshot.get('vol_ratio', 0) if snapshot else 0
+    returns = snapshot.get('returns', {}) if snapshot else {}
+    ret_5m = returns.get('ret_5m')
+
+    # Condition 1: volume + body
+    if vol_ratio >= STRONG_VOL_SPIKE_RATIO:
+        body_5m = abs(ret_5m) if ret_5m is not None else 0
+        if body_5m >= STRONG_VOL_BODY_MIN_PCT:
+            reasons.append(f'vol={vol_ratio:.1f}x+body={body_5m:.2f}%')
+
+    # Condition 2: 5m change
+    if ret_5m is not None and abs(ret_5m) >= STRONG_CHANGE_5M_MIN_PCT:
+        reasons.append(f'change_5m={ret_5m:.2f}%')
+
+    # Condition 3 is checked by caller (news_score from scores dict)
+
+    return (len(reasons) > 0, reasons)
+
+
 class EventResult:
     """Result of event evaluation."""
 
@@ -684,16 +734,21 @@ def _check_price_spikes(snapshot) -> list:
 
 
 def _check_volume_spike(snapshot) -> list:
-    """Check vol_ratio against threshold — edge-based (False→True only)."""
+    """Check vol_ratio against threshold — edge-based (False→True only).
+    v14: also requires abs(ret_5m) >= 0.4% (body confirmation) to reduce noise."""
     triggers = []
     vol_ratio = snapshot.get('vol_ratio', 0)
-    now_active = vol_ratio >= VOL_SPIKE_RATIO
+    returns = snapshot.get('returns', {})
+    ret_5m = returns.get('ret_5m')
+    body_ok = ret_5m is not None and abs(ret_5m) >= STRONG_VOL_BODY_MIN_PCT
+    now_active = vol_ratio >= VOL_SPIKE_RATIO and body_ok
     was_active = _prev_edge_state['volume_spike']
     if now_active and not was_active:
         triggers.append({
             'type': 'volume_spike',
             'value': round(vol_ratio, 2),
             'threshold': VOL_SPIKE_RATIO,
+            'body_pct': round(abs(ret_5m), 2) if ret_5m else 0,
         })
     _prev_edge_state['volume_spike'] = now_active
     return triggers
@@ -744,33 +799,36 @@ def _check_level_breaks(snapshot, cur=None) -> list:
         _prev_level_state['poc_zone'] = current_zone
 
     # VAH break: trigger only on first sustained break (transition from below to above)
+    # v14: require volume confirmation (vol >= 1.5x MA20) to suppress noise
     candles = snapshot.get('candles_1m', [])
+    vol_ratio = snapshot.get('vol_ratio', 0)
     if vah and len(candles) >= VAH_VAL_SUSTAIN_CANDLES:
         recent = candles[:VAH_VAL_SUSTAIN_CANDLES]
         now_above_vah = all(c.get('c', 0) > vah for c in recent)
         was_above_vah = _prev_level_state.get('above_vah', False)
-        if now_above_vah and not was_above_vah:
+        if now_above_vah and not was_above_vah and vol_ratio >= 1.5:
             triggers.append({
                 'type': 'vah_break',
                 'value': price,
                 'vah': vah,
                 'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
-                'vol_spike': snapshot.get('vol_ratio', 0) >= VOL_SPIKE_RATIO,
+                'vol_spike': vol_ratio >= VOL_SPIKE_RATIO,
             })
         _prev_level_state['above_vah'] = now_above_vah
 
     # VAL break: trigger only on first sustained break (transition from above to below)
+    # v14: require volume confirmation (vol >= 1.5x MA20)
     if val and len(candles) >= VAH_VAL_SUSTAIN_CANDLES:
         recent = candles[:VAH_VAL_SUSTAIN_CANDLES]
         now_below_val = all(c.get('c', 0) < val for c in recent)
         was_below_val = _prev_level_state.get('below_val', False)
-        if now_below_val and not was_below_val:
+        if now_below_val and not was_below_val and vol_ratio >= 1.5:
             triggers.append({
                 'type': 'val_break',
                 'value': price,
                 'val': val,
                 'sustained_candles': VAH_VAL_SUSTAIN_CANDLES,
-                'vol_spike': snapshot.get('vol_ratio', 0) >= VOL_SPIKE_RATIO,
+                'vol_spike': vol_ratio >= VOL_SPIKE_RATIO,
             })
         _prev_level_state['below_val'] = now_below_val
 

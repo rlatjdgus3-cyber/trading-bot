@@ -35,6 +35,17 @@ STAGE_THRESHOLDS = [
     (10, 1)]
 
 
+def _signal_stage_label(abs_score):
+    """Map absolute score to signal stage label (stg0-stg3)."""
+    if abs_score >= 65:
+        return 'stg3'  # strong
+    if abs_score >= 45:
+        return 'stg2'  # medium
+    if abs_score >= 10:
+        return 'stg1'  # weak
+    return 'stg0'  # no signal
+
+
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
 
@@ -374,6 +385,7 @@ def compute_total(cur=None, exchange=None):
             'abs_score': abs_score,
             'dominant_side': dominant_side,
             'stage': stage,
+            'signal_stage': _signal_stage_label(abs_score),
             'dynamic_stop_loss_pct': dynamic_sl,
             'tech_score': tech_score,
             'position_score': position_score,

@@ -14,9 +14,13 @@ LOG_PREFIX = '[regime_reader]'
 # ── Regime transition cooldown state ──
 _prev_regime = None
 _prev_regime_ts = 0
+_prev_regime_held_since = 0          # timestamp when current regime was first accepted
 _consecutive_same = 0
 TRANSITION_COOLDOWN_SEC = 60
 TRANSITION_CONFIRM_COUNT = 2
+# Direction-specific minimum hold times (seconds)
+RANGE_TO_BREAKOUT_MIN_HOLD_SEC = 20 * 60     # 20 minutes
+BREAKOUT_TO_RANGE_MIN_HOLD_SEC = 30 * 60     # 30 minutes
 
 
 def _log(msg):
@@ -44,12 +48,14 @@ def _default():
 
 
 def _apply_transition_cooldown(new_regime):
-    """Apply transition cooldown: require 2 consecutive same classifications
-    or 60 seconds elapsed before accepting a regime change.
+    """Apply transition cooldown with direction-specific minimum hold times.
+
+    RANGE→BREAKOUT: require 2 consecutive confirms + 20 min minimum hold
+    BREAKOUT→RANGE: require 2 consecutive confirms + 30 min minimum hold
 
     Returns the effective regime (may be the previous one during cooldown).
     """
-    global _prev_regime, _prev_regime_ts, _consecutive_same
+    global _prev_regime, _prev_regime_ts, _consecutive_same, _prev_regime_held_since
 
     now = time.time()
 
@@ -57,6 +63,7 @@ def _apply_transition_cooldown(new_regime):
         # First call ever — accept immediately
         _prev_regime = new_regime
         _prev_regime_ts = now
+        _prev_regime_held_since = now
         _consecutive_same = 1
         return new_regime
 
@@ -65,34 +72,40 @@ def _apply_transition_cooldown(new_regime):
         _consecutive_same += 1
         return new_regime
 
-    # Different regime detected
-    _consecutive_same += 1 if new_regime == getattr(_apply_transition_cooldown, '_pending', None) else 0
+    # Different regime detected — check direction-specific minimum hold
+    held_sec = now - _prev_regime_held_since
+    if _prev_regime == 'RANGE' and new_regime == 'BREAKOUT':
+        min_hold = RANGE_TO_BREAKOUT_MIN_HOLD_SEC
+    elif _prev_regime == 'BREAKOUT' and new_regime == 'RANGE':
+        min_hold = BREAKOUT_TO_RANGE_MIN_HOLD_SEC
+    else:
+        min_hold = TRANSITION_COOLDOWN_SEC
 
-    elapsed = now - _prev_regime_ts
-    if elapsed >= TRANSITION_COOLDOWN_SEC:
-        # Cooldown expired — accept transition
-        _prev_regime = new_regime
-        _prev_regime_ts = now
-        _consecutive_same = 1
-        _apply_transition_cooldown._pending = None
-        return new_regime
+    if held_sec < min_hold:
+        # Minimum hold not met — keep previous regime
+        _log(f'transition hold: {_prev_regime}→{new_regime} blocked '
+             f'(held {held_sec:.0f}s < {min_hold}s)')
+        return _prev_regime
 
-    # Track pending regime for consecutive counting
-    if getattr(_apply_transition_cooldown, '_pending', None) == new_regime:
+    # Track pending regime for consecutive confirmation (single increment per call)
+    pending = getattr(_apply_transition_cooldown, '_pending', None)
+    if pending == new_regime:
         _consecutive_same += 1
     else:
         _apply_transition_cooldown._pending = new_regime
         _consecutive_same = 1
 
-    if _consecutive_same >= TRANSITION_CONFIRM_COUNT:
-        # Confirmed by consecutive readings
+    elapsed = now - _prev_regime_ts
+    if _consecutive_same >= TRANSITION_CONFIRM_COUNT or elapsed >= TRANSITION_COOLDOWN_SEC:
+        # Confirmed by consecutive readings or cooldown expired
         _prev_regime = new_regime
         _prev_regime_ts = now
+        _prev_regime_held_since = now
         _consecutive_same = 1
         _apply_transition_cooldown._pending = None
         return new_regime
 
-    # Still in cooldown — keep previous regime
+    # Still waiting for confirmation — keep previous regime
     return _prev_regime
 
 
@@ -159,7 +172,7 @@ def get_current_regime(cur, symbol='BTC/USDT:USDT'):
 def get_stage_limit(regime, shock_type=None):
     """Get maximum stage count for a given regime.
 
-    RANGE:          3
+    RANGE:          2
     BREAKOUT:       7
     SHOCK/VETO:     0  (block all entries)
     SHOCK/RISK_DOWN: 2
@@ -167,7 +180,7 @@ def get_stage_limit(regime, shock_type=None):
     UNKNOWN:        7  (FAIL-OPEN, no restriction)
     """
     if regime == 'RANGE':
-        return 3
+        return 2
     if regime == 'BREAKOUT':
         return 7
     if regime == 'SHOCK':
@@ -186,30 +199,65 @@ def get_stage_limit(regime, shock_type=None):
 
 REGIME_PARAMS = {
     'RANGE': {
-        'tp_mode': 'fixed',  'tp_pct_min': 0.3, 'tp_pct_max': 0.8,
-        'sl_pct': 1.0,
+        'tp_mode': 'fixed',  'tp_pct_min': 0.3, 'tp_pct_max': 0.7,
+        'sl_pct': 0.8,
         'leverage_min': 3, 'leverage_max': 5,
         'stage_max': 2,
         'entry_filter': 'band_edge',   # BB/VA boundary within 0.3%
         'entry_proximity_pct': 0.3,
         'add_score_threshold': 70,
+        # TIME STOP & entry caps
+        'time_stop_min': 25,
+        'max_entries_per_hour': 3,
+        'consec_loss_cooldown_min': 45,
+        'add_min_profit_pct': 0.25,
+        # RSI filter
+        'rsi_oversold': 30,
+        'rsi_overbought': 70,
+        # v14: ADD 속도 제어
+        'add_min_interval_sec': 480,     # 8분 간격
+        'max_adds_per_30m': 2,
+        'same_dir_reentry_cooldown_sec': 600,  # 10분
+        'add_retest_required': True,     # VWAP/BB_mid 되돌림 필요
+        # v14: EVENT 제한 — RANGE에서 EVENT→즉시ADD 금지
+        'event_add_blocked': True,
     },
     'BREAKOUT': {
         'tp_mode': 'trailing',  'trail_pct': 0.8, 'trail_activate_pct': 0.5,
-        'sl_pct': 2.0,
-        'leverage_min': 5, 'leverage_max': 8,
-        'stage_max': 6,
+        'tp_pct_min': 0.8, 'tp_pct_max': 2.0,
+        'sl_pct': 1.2,
+        'leverage_min': 3, 'leverage_max': 8,
+        'stage_max': 7,
         'entry_filter': 'breakout_confirm',  # VA breakout confirmed
         'confirm_candles': 2,
-        'add_score_threshold': 55,
+        'add_score_threshold': 50,
+        # Fake breakout & ADD gate
+        'fake_breakout_retracement_pct': 60,
+        'add_min_profit_pct': 0.4,
+        # Trailing SL to breakeven
+        'trailing_be_threshold_pct': 0.8,
+        # Stage-based leverage ranges
+        'stage_leverage': {1: (3, 5), 2: (4, 6), 3: (4, 6), 4: (4, 6),
+                           5: (5, 8), 6: (5, 8), 7: (5, 8)},
+        # v14: ADD 속도 제어
+        'add_min_interval_sec': 120,     # 2분 간격
+        'max_adds_per_30m': 4,
+        'same_dir_reentry_cooldown_sec': 300,  # 5분
+        'add_retest_required': False,    # 돌파 모드: 리테스트 불필요
+        'event_add_blocked': False,
     },
     'SHOCK': {
-        'tp_mode': 'fixed',  'tp_pct_min': 0.0, 'tp_pct_max': 0.0,
+        'tp_mode': 'fixed',  'tp_pct_min': 0.5, 'tp_pct_max': 1.0,
         'sl_pct': 1.5,
         'leverage_min': 3, 'leverage_max': 3,
         'stage_max': 0,
         'entry_filter': 'blocked',
         'add_score_threshold': 999,
+        'add_min_interval_sec': 9999,
+        'max_adds_per_30m': 0,
+        'add_retest_required': False,
+        'add_min_profit_pct': 999,
+        'event_add_blocked': True,
     },
     'UNKNOWN': {  # FAIL-OPEN: identical to existing behavior
         'tp_mode': 'fixed',  'tp_pct_min': 0.5, 'tp_pct_max': 1.5,
@@ -218,6 +266,10 @@ REGIME_PARAMS = {
         'stage_max': 7,
         'entry_filter': 'none',
         'add_score_threshold': 45,
+        'add_min_interval_sec': 300,
+        'max_adds_per_30m': 3,
+        'add_retest_required': False,
+        'event_add_blocked': False,
     },
 }
 

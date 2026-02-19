@@ -287,7 +287,7 @@ def _build_context(cur=None, pos=None, snapshot=None):
     cur.execute("""
             SELECT side, total_qty, avg_entry_price, stage,
                    trade_budget_used_pct, next_stage_available,
-                   peak_upnl_pct
+                   peak_upnl_pct, order_state
             FROM position_state WHERE symbol = %s;
         """, (SYMBOL,))
     ps_row = cur.fetchone()
@@ -300,9 +300,22 @@ def _build_context(cur=None, pos=None, snapshot=None):
             'budget_used_pct': float(ps_row[4]) if ps_row[4] else 0,
             'next_stage': int(ps_row[5]) if ps_row[5] else 0,
             'peak_upnl_pct': float(ps_row[6]) if ps_row[6] is not None else 0,
+            'order_state': ps_row[7] if ps_row[7] else 'IDLE',
         }
     else:
         ctx['pos_state'] = {}
+
+    # Position entry timestamp (for TIME STOP)
+    try:
+        cur.execute("""
+            SELECT last_fill_at FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED' AND order_type IN ('OPEN', 'ADD')
+            ORDER BY last_fill_at DESC LIMIT 1;
+        """, (SYMBOL,))
+        ts_row = cur.fetchone()
+        ctx['position_entry_ts'] = ts_row[0].timestamp() if ts_row and ts_row[0] else None
+    except Exception:
+        ctx['position_entry_ts'] = None
 
     # News
     cur.execute("""
@@ -1027,14 +1040,23 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
                 _log(f'EVENT OPEN blocked: FLAT, abs_score={abs_score} < 20')
                 return ('HOLD', result)
 
-        # EVENT GUARD 2: same-direction ADD -> EVENT alone forbidden
+        # EVENT GUARD 2 + 2.5 (v14): regime-based EVENT ADD control
+        import event_trigger as _et_guard
+        regime_ctx = ctx.get('regime_ctx', {})
+        regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
         if pos_side and pos_side == direction:
-            _log(f'EVENT ADD same-dir blocked: {pos_side} + EVENT {direction}')
+            # Same-direction ADD from EVENT: only allow in BREAKOUT
+            if not _et_guard.is_event_add_allowed(regime):
+                _log(f'EVENT ADD same-dir blocked: {pos_side}+{direction} regime={regime}')
+                return ('HOLD', result)
+        elif not _et_guard.is_event_add_allowed(regime):
+            _log(f'EVENT ADD blocked by regime: {regime} (event_add_blocked=True)')
             return ('HOLD', result)
 
         # EVENT GUARD 3: cooldown check
         import order_throttle
-        cd_ok, cd_reason, _ = order_throttle.check_cooldown(action_type='ADD')
+        action_for_cd = 'ADD' if pos_side else 'OPEN'
+        cd_ok, cd_reason, _ = order_throttle.check_cooldown(action_type=action_for_cd)
         if not cd_ok:
             _log(f'EVENT OPEN cooldown: {cd_reason}')
             return ('HOLD', result)
@@ -1414,6 +1436,11 @@ def _decide(ctx=None):
     if not pos or not side:
         return ('HOLD', 'no position')
 
+    # Order in flight — wait for fill confirmation
+    order_state = ps.get('order_state', 'IDLE')
+    if order_state == 'SENT':
+        return ('HOLD', 'order in flight — waiting for fill confirmation')
+
     dominant = scores.get('dominant_side', 'LONG')
 
     # ── Regime-based TP check (before SL) ──
@@ -1430,6 +1457,28 @@ def _decide(ctx=None):
         tp_result = _check_take_profit(ctx, regime_params, regime_ctx)
         if tp_result:
             return tp_result
+
+    # ── TIME STOP (RANGE mode only) ──
+    if regime_ctx.get('regime') == 'RANGE' and regime_params:
+        time_stop_min = regime_params.get('time_stop_min', 25)
+        entry_ts = ctx.get('position_entry_ts')
+        if entry_ts:
+            import time as _time
+            elapsed_min = (_time.time() - entry_ts) / 60
+            if elapsed_min >= time_stop_min:
+                return ('CLOSE', f'TIME STOP: {elapsed_min:.0f}min >= {time_stop_min}min (RANGE)')
+
+    # ── Trailing SL to breakeven (BREAKOUT mode) ──
+    be_sl_active = False
+    if regime_params and regime_ctx.get('regime') == 'BREAKOUT' and entry and entry > 0:
+        be_threshold = regime_params.get('trailing_be_threshold_pct', 0.8)
+        if side == 'long':
+            upnl_for_be = (price - entry) / entry * 100
+        else:
+            upnl_for_be = (entry - price) / entry * 100
+        if upnl_for_be >= be_threshold:
+            be_sl_active = True
+            fee_buffer_pct = 0.12  # estimated round-trip fees
 
     # Stop-loss check
     if atr and atr > 0 and entry and entry > 0:
@@ -1450,8 +1499,14 @@ def _decide(ctx=None):
             sl_pct = min(sl_base, 1.8)
         else:
             sl_pct = sl_base
+
+        # Trailing BE: tighten SL to breakeven + fees when in profit
+        if be_sl_active:
+            sl_pct = min(sl_pct, fee_buffer_pct)
+
         if sl_dist <= -sl_pct:
-            return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%)')
+            be_tag = ' [BE trail]' if be_sl_active else ''
+            return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%){be_tag}')
 
     # Reversal / Close check (v3.0: total_score based)
     if side == 'long' and total_score <= -25:
@@ -1472,20 +1527,41 @@ def _decide(ctx=None):
     if side == 'short' and total_score >= 15:
         return ('REDUCE', f'counter signal (total_score={total_score})')
 
-    # ADD check (v2.1: threshold 60, regime-aware stage limit)
+    # ADD check (v3.0: profit-zone gate + regime-unified threshold)
     regime_ctx = ctx.get('regime_ctx', {})
     regime_stage_max = 7  # FAIL-OPEN default
+    regime_params = None
     if regime_ctx.get('available'):
         import regime_reader
         regime_stage_max = regime_reader.get_stage_limit(
             regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
+        regime_params = regime_reader.get_regime_params(
+            regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
     if regime_stage_max == 0:
         return ('HOLD', f'REGIME VETO: ADD 차단 ({regime_ctx.get("regime")})')
+
+    # Profit-zone-only ADD (loss-zone averaging forbidden)
+    if entry and entry > 0:
+        if side == 'long':
+            upnl_pct = (price - entry) / entry * 100
+        else:
+            upnl_pct = (entry - price) / entry * 100
+        add_min_profit = 0.25
+        if regime_params:
+            add_min_profit = regime_params.get('add_min_profit_pct', 0.25)
+        if upnl_pct < add_min_profit:
+            return ('HOLD', f'ADD 차단: 손실구간 물타기 금지 (uPnL={upnl_pct:.2f}%)')
+
+    # Unified ADD threshold from regime params
+    add_threshold = 45
+    if regime_params:
+        add_threshold = regime_params.get('add_score_threshold', 45)
+
     if stage < regime_stage_max and ps.get('budget_used_pct', 0) < 70:
         direction = 'LONG' if side == 'long' else 'SHORT'
         if dominant == direction:
             relevant = long_score if direction == 'LONG' else short_score
-            if relevant >= 60:
+            if relevant >= add_threshold:
                 return ('ADD', f'score {relevant} favors {direction}, stage={stage}/{regime_stage_max}')
 
     return ('HOLD', 'no action needed')
@@ -1556,13 +1632,18 @@ def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
     import safety_manager
 
     # Duplicate action check: block if same action_type already PENDING/PICKED
+    # CLOSE 계열은 SENT도 차단 → 첫 CLOSE가 SENT인 동안 재enqueue 방지
     if action_type in ('REDUCE', 'CLOSE', 'ADD', 'REVERSE_CLOSE', 'REVERSE_OPEN') and direction:
+        if action_type in ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE'):
+            dedup_statuses = ('PENDING', 'PICKED', 'SENT')
+        else:
+            dedup_statuses = ('PENDING', 'PICKED')
         cur.execute("""
             SELECT id FROM execution_queue
             WHERE symbol = %s AND action_type = %s AND direction = %s
-              AND status IN ('PENDING', 'PICKED')
+              AND status IN %s
               AND ts >= now() - interval '5 minutes';
-        """, (SYMBOL, action_type, direction))
+        """, (SYMBOL, action_type, direction, dedup_statuses))
         if cur.fetchone():
             _log(f'duplicate {action_type} {direction} blocked (already pending in queue)')
             return None
@@ -2198,12 +2279,21 @@ def _cycle():
                     pm_decision_id=dec_id,
                     priority=3)
             elif action == 'CLOSE':
-                _enqueue_action(
+                eq_id = _enqueue_action(
                     cur, 'CLOSE', pos.get('side', '').upper(),
                     target_qty=pos.get('qty'),
                     reason=reason,
                     pm_decision_id=dec_id,
                     priority=2)
+                # TP CLOSE 시 peak 리셋 → trailing TP 재트리거 방지
+                if eq_id and reason and 'TP' in reason:
+                    try:
+                        cur.execute("""
+                            UPDATE position_state SET peak_upnl_pct = 0
+                            WHERE symbol = %s;
+                        """, (SYMBOL,))
+                    except Exception:
+                        pass
             elif action == 'REVERSE':
                 _enqueue_reverse(
                     cur, pos,

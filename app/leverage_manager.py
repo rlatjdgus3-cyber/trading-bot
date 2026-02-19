@@ -8,7 +8,7 @@ Rules (v2.1, score-based):
   - abs_score >= 25: base 7x (8x if ATR < 1%)
   - abs_score >= 15: base 5x (6x if ATR < 1%)
   - abs_score < 15:  base 3x (4x if ATR < 1%)
-  - news_shock or daily_loss -> cap at 3x
+  - news >= 80 -> cap at 4x; news >= 60 -> cap at 5x; daily_loss -> cap at 3x
   - Stage >= 5 -> cap at 5x; Stage >= 3 -> cap at 6x
 """
 import sys
@@ -56,9 +56,19 @@ def compute_leverage(atr_pct, regime_score, news_shock, confidence, stage,
         if atr_pct < 1.0:
             base = 4
 
-    # Safety overrides
-    if news_shock or daily_loss:
+    # Safety overrides: news-adjusted leverage reduction
+    if daily_loss:
         base = min(base, 3)
+    # Graduated news impact on leverage (news_shock: bool or abs(news_score))
+    _news_abs = 0
+    if news_shock is True:
+        _news_abs = 60
+    elif isinstance(news_shock, (int, float)):
+        _news_abs = abs(news_shock)
+    if _news_abs >= 80:
+        base = min(base, 4)
+    elif _news_abs >= 60:
+        base = min(base, 5)
 
     # Stage cap: stages 5-7 max 5x, stages 3-4 max 6x
     if stage >= 5:
@@ -72,6 +82,13 @@ def compute_leverage(atr_pct, regime_score, news_shock, confidence, stage,
             import regime_reader
             params = regime_reader.get_regime_params(regime, shock_type)
             base = max(params['leverage_min'], min(params['leverage_max'], base))
+
+            # BREAKOUT stage-specific leverage ranges
+            if regime == 'BREAKOUT':
+                stage_lev = params.get('stage_leverage', {})
+                if stage in stage_lev:
+                    lev_min, lev_max = stage_lev[stage]
+                    base = max(lev_min, min(lev_max, base))
         except Exception:
             pass  # FAIL-OPEN: skip clamping on error
 

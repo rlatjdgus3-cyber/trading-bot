@@ -913,6 +913,10 @@ def format_strategy_report(claude_action, parsed, engine_action, engine_reason,
     lines.append('[📊 점수 상세]')
     lines.append(f'- TECH: {tech:+.0f} | POS: {pos_score:+.0f} | '
                  f'REGIME: {regime:+.0f} | NEWS: {news_s:+.0f}')
+    sig_stage = scores.get('signal_stage', '?')
+    pos_stage = _safe_int(scores.get('stage', 0))
+    capital_pct = _safe_float(scores.get('context', {}).get('budget_used_pct', 0)) if isinstance(scores.get('context'), dict) else 0
+    lines.append(f'- 권고강도: {sig_stage} | 분할단계: stage {pos_stage}/7')
     lines.append(f'- 엔진 참조: {_kr_action(engine_action or "HOLD")}')
     if engine_reason:
         lines.append(f'  ({engine_reason})')
@@ -1593,7 +1597,8 @@ def format_news_strategy_report(data, detail=False):
     pos_c = pos_s * pos_w
     regime_c = regime * regime_w
     news_c = news_s * news_w_ax
-    lines.append(f'Score: TOTAL {total:+.1f} → {side} stg{stage}')
+    _sig_stage = scores.get('signal_stage', f'stg{stage}')
+    lines.append(f'Score: TOTAL {total:+.1f} → {side} 권고강도:{_sig_stage} 분할단계:stage {stage}/7')
     lines.append(f'  기술({tech:+.0f}×{tech_w}={tech_c:+.1f}) '
                  f'포지션({pos_s:+.0f}×{pos_w}={pos_c:+.1f}) '
                  f'레짐({regime:+.0f}×{regime_w}={regime_c:+.1f}) '

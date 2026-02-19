@@ -109,7 +109,8 @@ def execute(query_type=None, original_text=None):
         'debug_order_throttle': _debug_order_throttle,
         'reconcile': _reconcile,
         'mctx_status': _mctx_status,
-        'mode_params': _mode_params}
+        'mode_params': _mode_params,
+        'combined_snapshot': _combined_snapshot}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -615,6 +616,201 @@ def _risk_config(_text=None):
                 pass
 
 
+def _combined_snapshot(_text=None):
+    """Combined status: regime + position + score + wait reason."""
+    lines = []
+    conn = None
+    scores = {}
+    regime_ctx = {}
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            # 1. Current regime
+            try:
+                import regime_reader
+                regime_ctx = regime_reader.get_current_regime(cur)
+                regime = regime_ctx.get('regime', 'UNKNOWN')
+                conf = regime_ctx.get('confidence', 0)
+                lines.append(f'모드: {regime} (신뢰도: {conf}%)')
+                if regime_ctx.get('in_transition'):
+                    lines.append('  (레짐 전환 쿨다운 중)')
+            except Exception as e:
+                lines.append(f'모드: 조회 실패 ({e})')
+
+            # 2. Exchange position (4-block)
+            try:
+                fact_text = _fact_snapshot(_text)
+                lines.append('')
+                lines.append(fact_text)
+            except Exception as e:
+                lines.append(f'스냅샷 조회 실패: {e}')
+
+            # 3. Score summary
+            try:
+                import score_engine
+                scores = score_engine.compute_total()
+                total = scores.get('total_score', 0)
+                dominant = scores.get('dominant_side', '?')
+                sig_stage = scores.get('signal_stage', '?')
+                stage = scores.get('stage', 0)
+                abs_score = scores.get('abs_score', 0)
+                lines.append('')
+                lines.append(f'스코어: total={total:+.1f}, 권고강도: {sig_stage} (abs={abs_score:.0f})')
+                lines.append(f'방향: {dominant}, 분할단계: stage {stage}/7')
+            except Exception as e:
+                lines.append(f'스코어 조회 실패: {e}')
+
+            # 4. WAIT reason (what conditions are missing)
+            _scores = scores
+            _regime_ctx = regime_ctx
+            try:
+                wr, wd = exchange_reader.compute_wait_reason(cur=cur)
+                lines.append('')
+                if wr != 'READY':
+                    lines.append(f'대기 사유: {wr}')
+                    lines.append(f'  부족 조건: {wd}')
+                    # Enumerate specific missing conditions
+                    missing = _compute_missing_conditions(cur, _scores, _regime_ctx)
+                    if missing:
+                        for m in missing:
+                            lines.append(f'  - {m}')
+                else:
+                    lines.append('상태: 진입 대기 중 (조건 충족 시 주문)')
+            except Exception as e:
+                lines.append(f'대기 사유 조회 실패: {e}')
+
+            # 5. Signal suppression + Regime + ADD control (v14)
+            try:
+                import autopilot_daemon
+                sp = autopilot_daemon.get_signal_policy_snapshot(cur)
+
+                # 5a. Regime info
+                lines.append('')
+                lines.append('── REGIME ──')
+                regime = sp.get('regime', 'UNKNOWN')
+                regime_conf = sp.get('regime_confidence', 0)
+                bbw = sp.get('regime_bbw_ratio')
+                adx = sp.get('regime_adx')
+                lines.append(f'REGIME: {regime} (conf={regime_conf}%)')
+                bbw_str = f'{bbw:.2f}' if bbw is not None else 'N/A'
+                adx_str = f'{adx:.1f}' if adx is not None else 'N/A'
+                lines.append(f'  근거: BBW={bbw_str}, ADX={adx_str}')
+                lines.append(f'max_stage: {sp.get("max_stage", "?")}')
+                if sp.get('in_transition'):
+                    lines.append('  (레짐 전환 쿨다운 중)')
+
+                # 5b. Signal suppression
+                lines.append('')
+                lines.append('── 신호 억제 ──')
+                lines.append(f'start_stage: {sp["start_stage_policy"]}')
+                lines.append(f'conf: {sp["conf_thresholds"]}')
+                cd_long = sp.get('cooldown_LONG_remaining', 0)
+                cd_short = sp.get('cooldown_SHORT_remaining', 0)
+                lines.append(f'재신호 쿨다운: {sp["repeat_cooldown_sec"]}s (L={cd_long}s, S={cd_short}s)')
+                for d in ('LONG', 'SHORT'):
+                    ts_key = f'last_signal_{d}_ts'
+                    if ts_key in sp:
+                        lines.append(f'최근 {d}: {sp[ts_key]}')
+                lines.append(f'억제 사유: {sp["last_suppress_reason"]}')
+                if sp.get('stop_cooldown_active'):
+                    lines.append(f'손절 쿨다운: 활성 ({sp["stop_cooldown_remaining"]}s)')
+                else:
+                    lines.append('손절 쿨다운: 비활성')
+
+                # 5c. ADD control
+                lines.append('')
+                lines.append('── ADD 제어 ──')
+                lines.append(f'ADD 간격: {sp.get("add_min_interval_sec", "?")}s '
+                             f'(잔여: {sp.get("add_interval_remaining", 0)}s)')
+                lines.append(f'ADD 30분: {sp.get("adds_30m_count", 0)}/{sp.get("adds_30m_limit", "?")}')
+                lines.append(f'리테스트 필수: {"YES" if sp.get("add_retest_required") else "NO"}')
+                lines.append(f'EVENT→ADD: {"차단" if sp.get("event_add_blocked") else "허용"}')
+                next_add = sp.get('next_add_earliest', 'NOW')
+                lines.append(f'다음 ADD 가능: {next_add}')
+
+                # 5d. Order throttle
+                lines.append('')
+                lines.append('── ORDER THROTTLE ──')
+                lines.append(f'시간당: {sp.get("throttle_hourly", "?")}')
+                lines.append(f'10분당: {sp.get("throttle_10min", "?")}')
+                if sp.get('throttle_locked'):
+                    lines.append(f'잠금: {sp.get("throttle_lock_reason", "")}')
+                try:
+                    import order_throttle
+                    ots = order_throttle.get_state_snapshot()
+                    if ots.get('next_try_str'):
+                        lines.append(f'next_try: {ots["next_try_str"]} ({ots.get("next_try_reason", "")})')
+                    else:
+                        lines.append('next_try: READY')
+                    if ots.get('last_reject_reason'):
+                        lines.append(f'마지막 거부: {ots["last_reject_reason"]}')
+                except Exception:
+                    pass
+
+            except Exception as e:
+                lines.append(f'정책 조회 실패: {e}')
+
+    except Exception as e:
+        lines.append(f'combined_snapshot 오류: {e}')
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return '\n'.join(lines)
+
+
+def _compute_missing_conditions(cur, scores, regime_ctx):
+    """Enumerate specific unmet conditions for entry."""
+    missing = []
+    try:
+        abs_score = scores.get('abs_score', 0) if scores else 0
+        regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
+
+        if abs_score < 45:
+            missing.append(f'total_score 부족 ({abs_score:.0f} < 45)')
+
+        if regime == 'RANGE':
+            # Check band proximity
+            vah = regime_ctx.get('vah')
+            val = regime_ctx.get('val')
+            price = scores.get('price') if scores else None
+            if vah and val and price:
+                try:
+                    near_val = abs(price - val) / val * 100 <= 0.3 if val > 0 else False
+                    near_vah = abs(price - vah) / vah * 100 <= 0.3 if vah > 0 else False
+                    if not near_val and not near_vah:
+                        missing.append(f'밴드 경계 미도달 (VAL={val:.0f} VAH={vah:.0f} price={price:.0f}, 0.3% 이내 필요)')
+                except Exception:
+                    pass
+
+            # Check RSI (5m preferred, 1m fallback)
+            rsi_5m = None
+            try:
+                for _tf in ('5m', '1m'):
+                    cur.execute("""
+                        SELECT rsi_14 FROM indicators
+                        WHERE symbol = 'BTC/USDT:USDT' AND tf = %s
+                        ORDER BY ts DESC LIMIT 1;
+                    """, (_tf,))
+                    rsi_row = cur.fetchone()
+                    if rsi_row and rsi_row[0] is not None:
+                        rsi_5m = float(rsi_row[0])
+                        break
+                if rsi_5m is not None and not (rsi_5m <= 30 or rsi_5m >= 70):
+                    missing.append(f'RSI 조건 미달 (현재 {rsi_5m:.0f}, 30 이하 또는 70 이상 필요)')
+            except Exception:
+                pass
+
+        if regime == 'BREAKOUT':
+            if not regime_ctx.get('breakout_confirmed'):
+                missing.append('5m close-confirm 부족 (2캔들 필요)')
+    except Exception:
+        pass
+    return missing
+
+
 def _fact_snapshot(_text=None):
     """Comprehensive fact snapshot: EXCHANGE + ORDER + STRATEGY_DB + GATE/WAIT.
     Gathers all execution context for full pipeline visibility."""
@@ -751,9 +947,9 @@ def _score_summary(_text=None):
         pos_c = pos * pos_w
         regime_c = regime * regime_w
         news_c = ne * news_w
-        # Signal stage (from score engine: stg1/stg2/... thresholds)
+        # Signal stage (from score engine: stg0/stg1/stg2/stg3)
         abs_score = r.get('abs_score', abs(total))
-        signal_stage_label = f'stg{stage}'
+        signal_stage_label = r.get('signal_stage', f'stg{stage}')
         # Position stage (from position_state DB: 0-7 pyramid)
         pos_stage = 0
         pos_capital_pct = 0
@@ -785,8 +981,8 @@ def _score_summary(_text=None):
             f"레짐(REG):    {regime:+.0f} × {regime_w} = {regime_c:+.1f}",
             f"뉴스(NEWS):   {ne:+.0f} × {news_w} = {news_c:+.1f}{' [차단됨]' if guarded else ''}",
             f"",
-            f"Signal Stage: {signal_stage_label} (score={abs_score:.0f}, threshold: stg1>=10, stg2>=20, stg5>=55, stg6>=65, stg7>=75)",
-            f"Position Stage: {pos_stage}/7 (capital used: {pos_capital_pct:.0f}%)",
+            f"권고강도: {signal_stage_label} (score={abs_score:.0f}, stg1>=10, stg2>=45, stg3>=65)",
+            f"분할단계: stage {pos_stage}/7 (capital used: {pos_capital_pct:.0f}%)",
             f"",
             f"엔진권고: {dominant} {signal_stage_label} (총점 {total:+.1f})",
         ]
@@ -2013,6 +2209,49 @@ def _debug_gate_details(_text=None):
         verdict = 'PASS'
     lines.append(f'gate_verdict: {verdict}')
     lines.append(f'health_check_ts: {snapshot.get("health_check_ts", "?")}')
+
+    # ── Extended: Regime + Entry Filter + Throttle + Rejection ──
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            # Current regime + confidence
+            try:
+                import regime_reader
+                rc = regime_reader.get_current_regime(cur)
+                lines.append('')
+                lines.append(f'regime: {rc.get("regime")} (confidence={rc.get("confidence")}%, '
+                             f'transition={rc.get("in_transition")}, stale={rc.get("stale")})')
+            except Exception as e:
+                lines.append(f'regime: error ({e})')
+
+            # Trade switch status
+            try:
+                sw = exchange_reader.fetch_trade_switch_status()
+                lines.append(f'trade_switch: {sw}')
+            except Exception as e:
+                lines.append(f'trade_switch: error ({e})')
+
+            # Throttle status
+            try:
+                import order_throttle
+                state = order_throttle.get_state_snapshot()
+                lines.append(f'throttle: attempts_1h={state.get("attempts_1h", "?")} '
+                             f'cooldown_remaining={state.get("cooldown_remaining", 0):.0f}s '
+                             f'entry_locked={state.get("entry_locked", False)}')
+                if state.get('last_reject_reason'):
+                    lines.append(f'  last_reject: {state.get("last_reject_reason")} '
+                                 f'(cooldown={state.get("rejection_cooldown_remaining", 0):.0f}s)')
+            except Exception as e:
+                lines.append(f'throttle: error ({e})')
+    except Exception:
+        pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     return '\n'.join(lines)
 

@@ -443,7 +443,14 @@ def _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=True):
 
     # THROTTLE gate: check order throttle before entry actions
     if action_type in ("ADD", "REVERSE_OPEN"):
-        throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, action_type, direction=direction)
+        _regime_for_throttle = None
+        try:
+            import regime_reader
+            _rc = regime_reader.get_current_regime(cur)
+            _regime_for_throttle = _rc.get('regime') if _rc.get('available') else None
+        except Exception:
+            pass
+        throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, action_type, direction=direction, regime=_regime_for_throttle)
         if not throttle_ok:
             log(f"EQ id={eq_id} {action_type} throttled: {throttle_reason}")
             # Keep PENDING (5-min expire_at will auto-GC)
@@ -463,7 +470,10 @@ def _process_eq_item(ex, cur, item, pos_side, pos_qty, entry_enabled=True):
     _update_position_order_state(cur, eq_id, action_type, direction, target_usdt)
 
     if action_type in ("CLOSE", "FULL_CLOSE"):
-        _eq_handle_close(ex, cur, eq_id, direction, pos_side, pos_qty, reason)
+        close_qty = pos_qty  # default: live Bybit qty
+        if target_qty and float(target_qty) > 0:
+            close_qty = min(float(target_qty), pos_qty)  # target_qty 우선, live 상한
+        _eq_handle_close(ex, cur, eq_id, direction, pos_side, close_qty, reason)
     elif action_type == "REDUCE":
         _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
                           pos_side, pos_qty, reason)
@@ -858,15 +868,28 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
     """Market open order with ECL compliance.  direction = 'LONG' or 'SHORT'."""
     _check_symbol_allowed(SYMBOL)
 
+    # ── Pre-order minimum validation (before ECL) ──
+    try:
+        _pre_info = ex.markets.get(SYMBOL, {})
+        _pre_limits = _pre_info.get('limits', {})
+        _pre_min_cost = float(_pre_limits.get('cost', {}).get('min', 0) or 0)
+        if _pre_min_cost > 0 and usdt_size < _pre_min_cost:
+            log(f'ORDER BLOCKED: usdt_size {usdt_size:.2f} < minNotional {_pre_min_cost}')
+            _send_telegram(f'주문 차단: 최소금액 미달 ({usdt_size:.2f} < {_pre_min_cost})')
+            return None
+    except Exception as e:
+        log(f'pre-validation check warning: {e}')
+
     # Set leverage before order (from leverage_context in meta)
     try:
         import leverage_manager
         lev_ctx = (meta or {}).get('leverage_context', {})
         if lev_ctx:
+            _news_score = lev_ctx.get('news_event_score', 0)
             lev = leverage_manager.compute_leverage(
                 atr_pct=lev_ctx.get('atr_pct', 1.0),
                 regime_score=lev_ctx.get('regime_score', 0),
-                news_shock=abs(lev_ctx.get('news_event_score', 0)) >= 60,
+                news_shock=abs(_news_score),
                 confidence=lev_ctx.get('confidence', 0),
                 stage=lev_ctx.get('stage', 0),
                 regime=lev_ctx.get('regime'),
@@ -1221,7 +1244,14 @@ def _cycle(ex, _last_order_ts_unused):
                 return
 
             # Guard: order throttle (replaces simple rate limit)
-            throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, 'OPEN', direction=direction)
+            _regime_for_throttle = None
+            try:
+                import regime_reader
+                _rc = regime_reader.get_current_regime(cur)
+                _regime_for_throttle = _rc.get('regime') if _rc.get('available') else None
+            except Exception:
+                pass
+            throttle_ok, throttle_reason, throttle_meta = order_throttle.check_all(cur, 'OPEN', direction=direction, regime=_regime_for_throttle)
             if not throttle_ok:
                 log(f"GUARD: throttle — {throttle_reason}")
                 audit(cur, "GUARD_BLOCK", SYMBOL, {

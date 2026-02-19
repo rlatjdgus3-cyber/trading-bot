@@ -5,7 +5,7 @@ autopilot_daemon.py — Autonomous trading daemon.
   1. Check autopilot_config.enabled
   2. Risk checks (trade_switch, LIVE_TRADING, once_lock, daily limit, cooldown, position)
   3. Run direction_scorer.compute_scores()
-  4. If confidence >= MIN_CONFIDENCE (10), create OPEN signal
+  4. If confidence >= MIN_CONFIDENCE (35), create OPEN signal (v3: +cooldown+stage1)
   5. Log to trade_process_log (source='autopilot')
   6. Telegram notification
 """
@@ -23,8 +23,13 @@ ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
 POLL_SEC = 20
 COOLDOWN_SEC = 30  # v2.1 중간 공격형
 MAX_DAILY_TRADES = 60
-MIN_CONFIDENCE = 10  # abs(total_score) >= 10 for entry
+MIN_CONFIDENCE = 35  # v3: conf>=35 진입 허용 (35-49: stage1 only, >=50: 기존 로직)
+CONF_ADD_THRESHOLD = 50  # conf>=50 이어야 ADD 허용
 DEFAULT_SIZE_PCT = 10
+REPEAT_SIGNAL_COOLDOWN_SEC = 600  # 동일 방향 재신호 쿨다운 10분
+STOP_LOSS_COOLDOWN_WINDOW_SEC = 3600  # 손절 감시 윈도우 60분
+STOP_LOSS_COOLDOWN_TRIGGER = 2  # 연속 손절 N회 이상이면 쿨다운
+STOP_LOSS_COOLDOWN_PAUSE_SEC = 1800  # 손절 쿨다운 30분
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
 TRADE_SWITCH_DEDUP_KEY = 'autopilot:risk_check:trade_switch_off'
 LOG_COOLDOWN_SEC = 1800  # 30min log dedup (non-trade_switch reasons)
@@ -99,6 +104,8 @@ def _db_should_log_risk(cur, reason):
             FROM alert_dedup_state WHERE key = %s;
         """, (key,))
         row = cur.fetchone()
+        if not row:
+            return (True, '')
         elapsed = row[0]
         suppressed = row[1] or 0
 
@@ -121,6 +128,193 @@ def _db_should_log_risk(cur, reason):
             return (False, '')
     except Exception:
         return (True, '')
+
+
+# ── Signal suppression state (snapshot용) ──
+_last_suppress_reason = ''
+_last_suppress_ts = 0
+
+
+def _record_signal_emission(cur, symbol, direction):
+    """Record signal emission timestamp in DB for cooldown tracking."""
+    key = f'autopilot:signal:{symbol}:{direction}'
+    cur.execute("""
+        INSERT INTO alert_dedup_state (key, last_sent_ts, suppressed_count)
+        VALUES (%s, now(), 0)
+        ON CONFLICT (key) DO UPDATE
+        SET last_sent_ts = now(), suppressed_count = 0;
+    """, (key,))
+
+
+def _is_in_repeat_cooldown(cur, symbol, direction, cooldown_sec=None):
+    """Check if same symbol+direction signal was emitted within cooldown window.
+    Returns (in_cooldown: bool, remaining_sec: int)."""
+    if cooldown_sec is None:
+        cooldown_sec = REPEAT_SIGNAL_COOLDOWN_SEC
+    key = f'autopilot:signal:{symbol}:{direction}'
+    try:
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (now() - last_sent_ts))::int
+            FROM alert_dedup_state WHERE key = %s;
+        """, (key,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            elapsed = row[0]
+            if elapsed < cooldown_sec:
+                return (True, cooldown_sec - elapsed)
+    except Exception:
+        pass
+    return (False, 0)
+
+
+def _check_stop_loss_cooldown(cur, symbol):
+    """Check consecutive stop-loss events. If >= TRIGGER within window, block for PAUSE duration.
+    Returns (ok, reason, remaining_sec)."""
+    try:
+        cur.execute("""
+            SELECT last_fill_at FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+              AND order_type IN ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE')
+              AND realized_pnl < 0
+              AND last_fill_at >= now() - make_interval(secs => %s)
+            ORDER BY last_fill_at DESC;
+        """, (symbol, STOP_LOSS_COOLDOWN_WINDOW_SEC))
+        rows = cur.fetchall()
+        stop_count = len(rows)
+        if stop_count >= STOP_LOSS_COOLDOWN_TRIGGER and rows:
+            from datetime import datetime, timezone
+            last_stop_ts = rows[0][0]
+            if last_stop_ts.tzinfo is None:
+                last_stop_ts = last_stop_ts.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - last_stop_ts).total_seconds()
+            if elapsed < STOP_LOSS_COOLDOWN_PAUSE_SEC:
+                remaining = int(STOP_LOSS_COOLDOWN_PAUSE_SEC - elapsed)
+                return (False,
+                        f'COOLDOWN_AFTER_CONSECUTIVE_STOPS: stops={stop_count} '
+                        f'window={STOP_LOSS_COOLDOWN_WINDOW_SEC // 60}m '
+                        f'cooldown={STOP_LOSS_COOLDOWN_PAUSE_SEC // 60}m',
+                        remaining)
+    except Exception as e:
+        _log(f'stop_loss_cooldown check error (FAIL-OPEN): {e}')
+    return (True, '', 0)
+
+
+def should_emit_signal(cur, symbol, direction, conf):
+    """Central gate: decide if a new signal should be emitted.
+    Returns (ok, reason).
+    """
+    global _last_suppress_reason, _last_suppress_ts
+    now_ts = int(time.time())
+
+    # 1. Conf minimum cutoff
+    if conf < MIN_CONFIDENCE:
+        reason = f'CONF_TOO_LOW: conf={conf} < min={MIN_CONFIDENCE}'
+        _last_suppress_reason = reason
+        _last_suppress_ts = now_ts
+        return (False, reason)
+
+    # 2. Repeat signal cooldown
+    (in_cd, remaining) = _is_in_repeat_cooldown(cur, symbol, direction)
+    if in_cd:
+        reason = f'REPEAT_SIGNAL_SUPPRESSED: dir={direction} cooldown_remaining={remaining}sec'
+        _last_suppress_reason = reason
+        _last_suppress_ts = now_ts
+        return (False, reason)
+
+    # 3. Stop-loss cooldown
+    (sl_ok, sl_reason, sl_remaining) = _check_stop_loss_cooldown(cur, symbol)
+    if not sl_ok:
+        _last_suppress_reason = sl_reason
+        _last_suppress_ts = now_ts
+        return (False, sl_reason)
+
+    return (True, 'OK')
+
+
+def get_signal_policy_snapshot(cur):
+    """Return signal suppression policy state for /snapshot display."""
+    import regime_reader
+    snapshot = {
+        'start_stage_policy': 'FORCE_START_STAGE=1',
+        'conf_thresholds': f'min_enter={MIN_CONFIDENCE}, add_only_conf>={CONF_ADD_THRESHOLD}',
+        'repeat_cooldown_sec': REPEAT_SIGNAL_COOLDOWN_SEC,
+        'last_suppress_reason': _last_suppress_reason or 'none',
+        'last_suppress_ts': _last_suppress_ts,
+    }
+    # Per-direction cooldown remaining
+    for direction in ('LONG', 'SHORT'):
+        (in_cd, remaining) = _is_in_repeat_cooldown(cur, SYMBOL, direction)
+        snapshot[f'cooldown_{direction}_remaining'] = remaining if in_cd else 0
+
+    # Last signal info
+    for direction in ('LONG', 'SHORT'):
+        key = f'autopilot:signal:{SYMBOL}:{direction}'
+        try:
+            cur.execute("""
+                SELECT last_sent_ts FROM alert_dedup_state WHERE key = %s;
+            """, (key,))
+            row = cur.fetchone()
+            if row and row[0]:
+                snapshot[f'last_signal_{direction}_ts'] = str(row[0])
+        except Exception:
+            pass
+
+    # Stop-loss cooldown
+    (sl_ok, sl_reason, sl_remaining) = _check_stop_loss_cooldown(cur, SYMBOL)
+    snapshot['stop_cooldown_active'] = not sl_ok
+    snapshot['stop_cooldown_remaining'] = sl_remaining
+    if sl_reason:
+        snapshot['stop_cooldown_reason'] = sl_reason
+
+    # v14: Regime + ADD control info
+    try:
+        regime_ctx = regime_reader.get_current_regime(cur)
+        regime = regime_ctx.get('regime', 'UNKNOWN')
+        r_params = regime_reader.get_regime_params(regime, regime_ctx.get('shock_type'))
+        snapshot['regime'] = regime
+        snapshot['regime_confidence'] = regime_ctx.get('confidence', 0)
+        snapshot['regime_bbw_ratio'] = regime_ctx.get('bbw_ratio')
+        snapshot['regime_adx'] = regime_ctx.get('adx_14')
+        snapshot['max_stage'] = r_params.get('stage_max', 7)
+        snapshot['add_min_interval_sec'] = r_params.get('add_min_interval_sec', 300)
+        snapshot['max_adds_per_30m'] = r_params.get('max_adds_per_30m', 3)
+        snapshot['add_retest_required'] = r_params.get('add_retest_required', False)
+        snapshot['event_add_blocked'] = r_params.get('event_add_blocked', False)
+
+        # ADD interval remaining
+        (interval_ok, remaining) = _check_add_interval(cur, r_params)
+        snapshot['add_interval_remaining'] = remaining if not interval_ok else 0
+
+        # ADD count in 30m
+        (count_ok, add_count, add_limit) = _check_adds_per_30m(cur, r_params)
+        snapshot['adds_30m_count'] = add_count
+        snapshot['adds_30m_limit'] = add_limit
+
+        # Next entry/ADD earliest time
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        if not interval_ok:
+            snapshot['next_add_earliest'] = str(now + _dt.timedelta(seconds=remaining))
+        else:
+            snapshot['next_add_earliest'] = 'NOW'
+
+        # Regime transition
+        snapshot['in_transition'] = regime_ctx.get('in_transition', False)
+    except Exception as e:
+        snapshot['regime_error'] = str(e)
+
+    # Order throttle status
+    try:
+        import order_throttle
+        ts = order_throttle.get_throttle_status()
+        snapshot['throttle_hourly'] = f'{ts["hourly_count"]}/{ts["hourly_limit"]}'
+        snapshot['throttle_10min'] = f'{ts["10min_count"]}/{ts["10min_limit"]}'
+        snapshot['throttle_locked'] = ts.get('entry_locked', False)
+        snapshot['throttle_lock_reason'] = ts.get('lock_reason', '')
+    except Exception:
+        pass
+
+    return snapshot
 
 
 def _get_exchange():
@@ -238,6 +432,73 @@ def _risk_checks(cur=None):
     return (True, 'ok')
 
 
+def _get_rsi_5m(cur):
+    """Read latest RSI from indicators table (5m preferred, 1m fallback). Returns float or None."""
+    try:
+        for tf in ('5m', '1m'):
+            cur.execute("""
+                SELECT rsi_14 FROM indicators
+                WHERE symbol = %s AND tf = %s
+                ORDER BY ts DESC LIMIT 1;
+            """, (SYMBOL, tf))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        return None
+    except Exception:
+        return None
+
+
+def _get_recent_candles(cur, tf, count):
+    """Read recent candles from candles table (fallback to 1m if requested tf empty)."""
+    try:
+        for try_tf in (tf, '1m') if tf != '1m' else (tf,):
+            cur.execute("""
+                SELECT h, l, c FROM candles
+                WHERE symbol = %s AND tf = %s
+                ORDER BY ts DESC LIMIT %s;
+            """, (SYMBOL, try_tf, count))
+            rows = cur.fetchall()
+            result = [{'h': float(r[0]), 'l': float(r[1]), 'c': float(r[2])} for r in rows if r[0] is not None]
+            if result:
+                return result
+        return []
+    except Exception:
+        return []
+
+
+def _check_consec_loss_cooldown(cur, direction, regime_params):
+    """Block entry if 2+ consecutive same-direction losses in last 2 hours."""
+    cooldown_min = regime_params.get('consec_loss_cooldown_min', 45) if regime_params else 45
+    try:
+        cur.execute("""
+            SELECT direction, realized_pnl, last_fill_at
+            FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+              AND order_type IN ('CLOSE', 'FULL_CLOSE')
+              AND last_fill_at >= now() - interval '2 hours'
+            ORDER BY last_fill_at DESC LIMIT 3;
+        """, (SYMBOL,))
+        rows = cur.fetchall()
+        consec_losses = 0
+        for r in rows:
+            if r[0] == direction and r[1] is not None and float(r[1]) < 0:
+                consec_losses += 1
+            else:
+                break
+        if consec_losses >= 2:
+            from datetime import datetime, timezone
+            last_loss_ts = rows[0][2]
+            if last_loss_ts.tzinfo is None:
+                last_loss_ts = last_loss_ts.replace(tzinfo=timezone.utc)
+            elapsed_min = (datetime.now(timezone.utc) - last_loss_ts).total_seconds() / 60
+            if elapsed_min < cooldown_min:
+                return (False, f'연속 손절 쿨다운 ({consec_losses}회, {int(cooldown_min - elapsed_min)}분 남음)')
+    except Exception as e:
+        _log(f'consec_loss_cooldown check error (FAIL-OPEN): {e}')
+    return (True, '')
+
+
 def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
     """Check if entry is allowed based on regime's entry filter.
 
@@ -284,8 +545,18 @@ def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
         near_vah = abs(price - vah) / vah * 100 <= proximity if vah > 0 else False
 
         if dominant == 'LONG' and near_val:
+            # RSI filter: LONG entry needs RSI oversold
+            rsi_5m = _get_rsi_5m(cur)
+            rsi_oversold = params.get('rsi_oversold', 30)
+            if rsi_5m is not None and rsi_5m > rsi_oversold:
+                return (False, f'RANGE LONG: RSI 과매도 미달 (RSI={rsi_5m:.0f} > {rsi_oversold})')
             return (True, f'RANGE LONG: 가격 VAL 근접 ({price:.0f} ≈ {val:.0f})')
         if dominant == 'SHORT' and near_vah:
+            # RSI filter: SHORT entry needs RSI overbought
+            rsi_5m = _get_rsi_5m(cur)
+            rsi_overbought = params.get('rsi_overbought', 70)
+            if rsi_5m is not None and rsi_5m < rsi_overbought:
+                return (False, f'RANGE SHORT: RSI 과매수 미달 (RSI={rsi_5m:.0f} < {rsi_overbought})')
             return (True, f'RANGE SHORT: 가격 VAH 근접 ({price:.0f} ≈ {vah:.0f})')
         # Also allow if near opposite band (counter-trend at boundary)
         if near_val or near_vah:
@@ -294,21 +565,187 @@ def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
         return (False, f'RANGE 모드: 밴드 경계 대기 (VAL={val:.0f} VAH={vah:.0f} price={price:.0f})')
 
     if entry_filter == 'breakout_confirm':
-        if regime_ctx.get('breakout_confirmed'):
-            return (True, 'BREAKOUT 확인됨')
-        return (False, 'BREAKOUT 모드: VA 돌파 확인 대기')
+        if not regime_ctx.get('breakout_confirmed'):
+            return (False, 'BREAKOUT 모드: VA 돌파 확인 대기')
+
+        # Fake breakout filter — check for rapid retracement
+        retrace_pct = params.get('fake_breakout_retracement_pct', 60)
+        candles_5m = _get_recent_candles(cur, '5m', 3)
+        if len(candles_5m) >= 2:
+            prev_range = abs(candles_5m[1]['h'] - candles_5m[1]['l'])
+            if prev_range > 0:
+                latest = candles_5m[0]
+                if dominant == 'LONG':
+                    retrace = (candles_5m[1]['h'] - latest['c']) / prev_range * 100
+                else:
+                    retrace = (latest['c'] - candles_5m[1]['l']) / prev_range * 100
+                if retrace >= retrace_pct:
+                    return (False, f'BREAKOUT 가짜돌파 의심: 되돌림 {retrace:.0f}% >= {retrace_pct}%')
+
+        return (True, 'BREAKOUT 확인됨')
 
     return (True, f'unknown filter: {entry_filter}')
+
+
+def _check_add_interval(cur, regime_params):
+    """v14: Check minimum interval between ADD attempts.
+    Returns (ok, remaining_sec)."""
+    min_interval = regime_params.get('add_min_interval_sec', 300)
+    try:
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (now() - MAX(ts)))::int
+            FROM execution_queue
+            WHERE symbol = %s AND action_type = 'ADD'
+              AND status NOT IN ('FAILED', 'CANCELLED', 'EXPIRED')
+              AND ts >= now() - interval '1 hour';
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            elapsed = row[0]
+            if elapsed < min_interval:
+                return (False, min_interval - elapsed)
+    except Exception:
+        pass
+    return (True, 0)
+
+
+def _check_adds_per_30m(cur, regime_params):
+    """v14: Check max ADD count in last 30 minutes.
+    Returns (ok, count, limit)."""
+    max_adds = regime_params.get('max_adds_per_30m', 3)
+    try:
+        cur.execute("""
+            SELECT count(*) FROM execution_queue
+            WHERE symbol = %s AND action_type = 'ADD'
+              AND status NOT IN ('FAILED', 'CANCELLED', 'EXPIRED')
+              AND ts >= now() - interval '30 minutes';
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        count = int(row[0]) if row else 0
+        if count >= max_adds:
+            return (False, count, max_adds)
+        return (True, count, max_adds)
+    except Exception:
+        return (True, 0, max_adds)
+
+
+def _check_add_retest(cur, pos_side, regime_params):
+    """v14: Check retest/pullback condition for ADD.
+    LONG ADD: price <= VWAP or near BB_mid (pullback confirmed)
+    SHORT ADD: price >= VWAP or near BB_mid (pullback confirmed)
+    Returns (ok, reason)."""
+    if not regime_params.get('add_retest_required', False):
+        return (True, 'retest not required')
+    try:
+        # Read 15m indicators (VWAP, BB_mid)
+        cur.execute("""
+            SELECT vwap, bb_mid FROM indicators
+            WHERE symbol = %s AND tf = '15m'
+            ORDER BY ts DESC LIMIT 1;
+        """, (SYMBOL,))
+        ind_row = cur.fetchone()
+        if not ind_row or ind_row[0] is None:
+            return (True, 'FAIL-OPEN: no 15m indicators')
+
+        vwap = float(ind_row[0]) if ind_row[0] else None
+        bb_mid = float(ind_row[1]) if ind_row[1] else None
+
+        # Get current price
+        cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
+        price_row = cur.fetchone()
+        cur_price = float(price_row[0]) if price_row and price_row[0] else None
+
+        if not cur_price:
+            return (True, 'FAIL-OPEN: no price')
+
+        # Check retest condition
+        retest_ok = False
+        reason_parts = []
+        proximity_pct = 0.15  # 0.15% proximity to VWAP/BB_mid
+
+        if pos_side == 'long':
+            # LONG ADD: price should be at or below VWAP/BB_mid (pullback)
+            if vwap and vwap > 0:
+                diff_pct = (cur_price - vwap) / vwap * 100
+                if diff_pct <= proximity_pct:
+                    retest_ok = True
+                    reason_parts.append(f'price<=VWAP ({cur_price:.0f}<={vwap:.0f})')
+                else:
+                    reason_parts.append(f'price>VWAP+{proximity_pct}% ({diff_pct:.2f}%)')
+            if bb_mid and bb_mid > 0 and not retest_ok:
+                diff_pct = (cur_price - bb_mid) / bb_mid * 100
+                if diff_pct <= proximity_pct:
+                    retest_ok = True
+                    reason_parts.append(f'price<=BB_mid ({cur_price:.0f}<={bb_mid:.0f})')
+        else:
+            # SHORT ADD: price should be at or above VWAP/BB_mid (pullback up)
+            if vwap and vwap > 0:
+                diff_pct = (cur_price - vwap) / vwap * 100
+                if diff_pct >= -proximity_pct:
+                    retest_ok = True
+                    reason_parts.append(f'price near VWAP ({cur_price:.0f} vs {vwap:.0f}, diff={diff_pct:+.2f}%)')
+                else:
+                    reason_parts.append(f'price below VWAP ({diff_pct:+.2f}%)')
+            if bb_mid and bb_mid > 0 and not retest_ok:
+                diff_pct = (cur_price - bb_mid) / bb_mid * 100
+                if diff_pct >= -proximity_pct:
+                    retest_ok = True
+                    reason_parts.append(f'price near BB_mid ({cur_price:.0f} vs {bb_mid:.0f}, diff={diff_pct:+.2f}%)')
+
+        if retest_ok:
+            return (True, f'retest OK: {", ".join(reason_parts)}')
+        return (False, f'ADD_NO_RETEST: {", ".join(reason_parts)}')
+    except Exception as e:
+        return (True, f'FAIL-OPEN: retest check error ({e})')
 
 
 def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, regime_ctx=None):
     """Evaluate whether ADD is allowed for an existing position.
     Returns (decision, reason) -- 'ADD', 'HOLD', 'BLOCKED'."""
     import safety_manager
+    import regime_reader
     direction = 'LONG' if pos_side == 'long' else 'SHORT'
     dominant_side = scores.get('dominant_side', 'LONG')
     if dominant_side != direction:
         return ('HOLD', f'반대방향 신호 ({dominant_side} vs 현재 {direction})')
+
+    # ── Regime params ──
+    regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
+    r_params = regime_reader.get_regime_params(regime, regime_ctx.get('shock_type') if regime_ctx else None)
+
+    # ── v14: ADD interval check ──
+    (interval_ok, remaining) = _check_add_interval(cur, r_params)
+    if not interval_ok:
+        return ('HOLD', f'ADD_COOLDOWN: {remaining}s remaining (min={r_params.get("add_min_interval_sec")}s)')
+
+    # ── v14: ADD count per 30m ──
+    (count_ok, add_count, add_limit) = _check_adds_per_30m(cur, r_params)
+    if not count_ok:
+        return ('HOLD', f'ADD_MAX_30M: {add_count}/{add_limit} reached')
+
+    # ── v14: ADD retest/pullback condition ──
+    (retest_ok, retest_reason) = _check_add_retest(cur, pos_side, r_params)
+    if not retest_ok:
+        return ('HOLD', retest_reason)
+
+    # ── Profit-zone-only ADD (loss-zone averaging forbidden) ──
+    add_min_profit = r_params.get('add_min_profit_pct', 0.25)
+    try:
+        ex = _get_exchange()
+        ticker = ex.fetch_ticker(SYMBOL)
+        cur_price = float(ticker['last'])
+        cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+        entry_row = cur.fetchone()
+        avg_entry = float(entry_row[0]) if entry_row and entry_row[0] else None
+        if avg_entry and avg_entry > 0 and cur_price:
+            if pos_side == 'long':
+                upnl_pct = (cur_price - avg_entry) / avg_entry * 100
+            else:
+                upnl_pct = (avg_entry - cur_price) / avg_entry * 100
+            if upnl_pct < add_min_profit:
+                return ('HOLD', f'ADD 금지: 수익구간 아님 (uPnL={upnl_pct:.2f}% < {add_min_profit}%)')
+    except Exception as e:
+        _log(f'ADD profit-zone check error (FAIL-OPEN): {e}')
 
     relevant_score = scores.get('long_score', 50) if direction == 'LONG' else scores.get('short_score', 50)
     add_threshold = safety_manager.get_add_score_threshold(cur)
@@ -331,8 +768,6 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, 
     if not ok:
         return ('BLOCKED', reason)
 
-    # News does not block chart-based entry (NEWS_CAN_BLOCK_ENTRY = False)
-
     return ('ADD', '모든 조건 충족')
 
 
@@ -347,7 +782,8 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
     ts_text = now.strftime('%Y-%m-%d %H:%M:%S+00')
     now_unix = int(time.time())
     relevant_score = scores.get('long_score', 50) if side == 'LONG' else scores.get('short_score', 50)
-    start_stage = safety_manager.compute_start_stage(relevant_score)
+    # v3: FORCE start_stage=1 — 추격 시작 방지
+    start_stage = 1
     # Regime-based stage cap (reuse regime_ctx from caller)
     import regime_reader
     if regime_ctx is None:
@@ -504,7 +940,45 @@ def _cycle():
                     _log(f'REGIME_FILTER: {entry_reason}')
                     return
 
+                # RANGE hourly entry cap
+                r_params = regime_reader.get_regime_params(
+                    regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
+                if regime_ctx.get('regime') == 'RANGE':
+                    max_per_hour = r_params.get('max_entries_per_hour', 3)
+                    cur.execute("""
+                        SELECT count(*) FROM trade_process_log
+                        WHERE source = 'autopilot' AND ts >= now() - interval '1 hour';
+                    """)
+                    hourly_count = cur.fetchone()[0] or 0
+                    if hourly_count >= max_per_hour:
+                        _log(f'RANGE 시간당 진입 제한 ({hourly_count}/{max_per_hour})')
+                        return
+
+                # Consecutive same-direction loss cooldown
+                (cc_ok, cc_reason) = _check_consec_loss_cooldown(cur, dominant, r_params)
+                if not cc_ok:
+                    _log(f'CONSEC_LOSS: {cc_reason}')
+                    return
+
             if has_position:
+                # v3: conf < CONF_ADD_THRESHOLD → ADD 금지
+                if confidence < CONF_ADD_THRESHOLD:
+                    _log(f'ADD blocked: conf too low for ADD ({confidence} < {CONF_ADD_THRESHOLD})')
+                    return
+
+                # v14: order_throttle pre-gate — check BEFORE any ADD attempt
+                try:
+                    import order_throttle
+                    regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
+                    direction = 'LONG' if ps_row[0] == 'long' else 'SHORT'
+                    (throttle_ok, throttle_reason, throttle_meta) = order_throttle.check_all(
+                        cur, 'ADD', SYMBOL, direction, regime)
+                    if not throttle_ok:
+                        _log(f'ADD_THROTTLE_BLOCKED: {throttle_reason}')
+                        return
+                except Exception as e:
+                    _log(f'ADD throttle pre-gate error (FAIL-OPEN): {e}')
+
                 # Evaluate ADD
                 pos_side = ps_row[0]
                 pos_qty = float(ps_row[1])
@@ -553,33 +1027,38 @@ def _cycle():
                             """, (SYMBOL, direction, add_usdt, add_reason))
                             eq_row = cur.fetchone()
                             _log(f'ADD enqueued: eq_id={eq_row[0] if eq_row else None}')
-                            # Record price for dedup (reset if unavailable to avoid stale blocks)
                             _last_add_price = current_price if current_price > 0 else 0
                             _last_add_ts = time.time()
                 else:
                     _log(f'position exists, {decision}: {add_reason}')
                 return
 
-            if confidence < MIN_CONFIDENCE:
-                _log(f'confidence too low ({confidence} < {MIN_CONFIDENCE})')
+            # ── v3: Central signal emission gate ──
+            (emit_ok, emit_reason) = should_emit_signal(cur, SYMBOL, dominant, confidence)
+            if not emit_ok:
+                should_log, _ = _db_should_log_risk(cur, f'signal_suppress_{emit_reason[:30]}')
+                if should_log:
+                    _log(f'SIGNAL_SUPPRESSED: {emit_reason}')
                 return
 
             import safety_manager
             eq = safety_manager.get_equity_limits(cur)
-            start_stage = safety_manager.compute_start_stage(
-                scores.get('long_score', 50) if dominant == 'LONG' else scores.get('short_score', 50))
+            # v3: start_stage always 1
+            start_stage = 1
             entry_pct = safety_manager.get_stage_entry_pct(start_stage)
 
             signal_id = _create_autopilot_signal(cur, dominant, scores, equity_limits=eq, regime_ctx=regime_ctx)
             if signal_id:
+                # Record emission for cooldown tracking
+                _record_signal_emission(cur, SYMBOL, dominant)
                 _log_trade_process(cur, signal_id, scores, 'autopilot', start_stage, entry_pct,
                                     equity_limits=eq)
                 _notify_telegram(
                     f'[Autopilot] {dominant} 진입 신호 생성\n'
                     f'- L={scores.get("long_score")} S={scores.get("short_score")} conf={confidence}\n'
-                    f'- start_stage={start_stage} entry={entry_pct}%\n'
+                    f'- start_stage={start_stage} (FORCED=1) entry={entry_pct}%\n'
                     f'- signal_id={signal_id}')
-                _log(f'signal created: {dominant} id={signal_id} stage={start_stage}')
+                _log(f'signal created: {dominant} id={signal_id} stage={start_stage} (FORCED=1)')
     except Exception:
         traceback.print_exc()
     finally:

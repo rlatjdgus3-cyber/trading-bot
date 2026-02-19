@@ -54,6 +54,13 @@ _EMERGENCY_KEYWORDS = frozenset({
 # More specific routes first; general fact queries last → full snapshot
 # Priority: "왜" 질문 → 잔고 → 손익/리스크 → 주문 → 전략포지션 → 일반포지션(fact_snapshot)
 _FACT_ROUTES = [
+    # Combined status queries → regime + position + score + wait reason
+    (['상태', '어때', '어떄', '현황', '요약', '종합',
+      'status', 'summary', 'overview',
+      '모드', 'mode', '레짐', 'regime',
+      '왜 대기', '왜 홀드', 'why wait', 'why hold',
+      '다음 조건', '뭐가 부족', 'what missing',
+      '스코어', 'score', '점수'], 'combined_snapshot'),
     # "Why" / complaint queries → full snapshot (must be before simple '주문')
     (['왜 주문', '왜 안', '안 나가', '안나가', '왜 안사', '왜 안팔아'], 'fact_snapshot'),
     # Balance queries

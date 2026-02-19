@@ -29,7 +29,7 @@ NETWORK_BACKOFF_BASE = 5            # 5->10->20->40->300 max
 NETWORK_BACKOFF_MAX = 300
 ENTERING_TTL_SEC = 180
 SIGNAL_DEDUP_SEC = 60              # same direction+action_type blocked for 60s
-REJECTION_COOLDOWN_SEC = 180       # 3min cooldown after rejection
+REJECTION_COOLDOWN_SEC = 900       # 15min cooldown after rejection (was 3min)
 
 EXIT_ACTIONS = frozenset({'CLOSE', 'REDUCE', 'REVERSE_CLOSE', 'FULL_CLOSE'})
 
@@ -262,7 +262,7 @@ def check_entry_lock():
     return (True, '', 0)
 
 
-def check_all(cur, action_type, symbol='BTC/USDT:USDT', direction=None):
+def check_all(cur, action_type, symbol='BTC/USDT:USDT', direction=None, regime=None):
     """Unified throttle check. Combines entry_lock + signal_dedup + rate_limit + cooldown.
     EXIT actions (CLOSE, REDUCE, REVERSE_CLOSE, FULL_CLOSE) always bypass.
     Returns (ok, reason, meta_dict).
@@ -285,6 +285,14 @@ def check_all(cur, action_type, symbol='BTC/USDT:USDT', direction=None):
     ok, reason, ts = check_rate_limit(cur, symbol)
     if not ok:
         return (False, reason, {'next_allowed_ts': ts, 'lock_type': 'rate_limit'})
+
+    # 2.5 RANGE mode stricter hourly rate limit
+    if regime == 'RANGE':
+        now = time.time()
+        with _lock:
+            attempts_1h = len([t for t in _state.get('recent_attempts', []) if now - t < 3600])
+        if attempts_1h >= 3:
+            return (False, f'RANGE 시간당 제한 ({attempts_1h}/3)', {'lock_type': 'range_rate_limit'})
 
     # 3. Cooldown (action-type specific)
     ok, reason, remaining = check_cooldown(action_type)
@@ -493,3 +501,89 @@ def _auto_halt_trading(reason):
             urllib.request.urlopen(req, timeout=5)
     except Exception:
         pass
+
+
+def get_next_try_ts():
+    """v14: Compute the earliest timestamp when a new entry/ADD order can be attempted.
+    Returns (next_ts_float, reason_str). If no block, returns (0, 'READY').
+    """
+    now = time.time()
+    blockers = []
+
+    with _lock:
+        _prune_old_attempts(now)
+        hourly = _count_recent(3600, now)
+        ten_min = _count_recent(600, now)
+        attempts_snapshot = list(_state['recent_attempts'])
+
+        # Entry lock
+        if _state['entry_lock_until'] > now:
+            blockers.append((_state['entry_lock_until'], _state['entry_lock_reason']))
+
+        # Rejection cooldown
+        if _state['last_reject_ts'] > 0:
+            reject_until = _state['last_reject_ts'] + REJECTION_COOLDOWN_SEC
+            if reject_until > now:
+                blockers.append((reject_until, 'rejection_cooldown'))
+
+        # Base cooldown
+        if _state['last_order_ts'] > 0:
+            base_until = _state['last_order_ts'] + COOLDOWN_AFTER_ANY_ORDER_SEC
+            if base_until > now:
+                blockers.append((base_until, 'base_cooldown'))
+
+        # ADD specific cooldown
+        add_ts = _state['last_action_ts'].get('ADD', 0)
+        if add_ts > 0:
+            add_until = add_ts + COOLDOWN_AFTER_ADD_SEC
+            if add_until > now:
+                blockers.append((add_until, 'add_cooldown'))
+
+    # Rate limit
+    if hourly >= MAX_ATTEMPTS_PER_HOUR:
+        cutoff = now - 3600
+        oldest = min((ts for ts in attempts_snapshot if ts > cutoff), default=now)
+        blockers.append((oldest + 3600, f'hourly_limit ({hourly}/{MAX_ATTEMPTS_PER_HOUR})'))
+
+    if ten_min >= MAX_ATTEMPTS_PER_10MIN:
+        cutoff = now - 600
+        oldest = min((ts for ts in attempts_snapshot if ts > cutoff), default=now)
+        blockers.append((oldest + 600, f'10min_limit ({ten_min}/{MAX_ATTEMPTS_PER_10MIN})'))
+
+    if not blockers:
+        return (0, 'READY')
+
+    # Return the latest blocker (all must clear)
+    max_ts, max_reason = max(blockers, key=lambda x: x[0])
+    return (max_ts, max_reason)
+
+
+def get_state_snapshot():
+    """Return throttle state snapshot for debug display."""
+    now = time.time()
+    with _lock:
+        attempts = _state.get('recent_attempts', [])
+        attempts_1h = len([t for t in attempts if now - t < 3600])
+        entry_locked = _state.get('entry_lock_until', 0) > now
+        cooldown_remaining = max(0, _state.get('entry_lock_until', 0) - now)
+        last_reject_reason = _state.get('last_reject_reason', '')
+        last_reject_ts = _state.get('last_reject_ts', 0)
+        rejection_cooldown_remaining = max(0, (last_reject_ts + REJECTION_COOLDOWN_SEC) - now) if last_reject_ts else 0
+    # v14: next_try_ts
+    next_ts, next_reason = get_next_try_ts()
+    next_try_str = ''
+    if next_ts > 0:
+        try:
+            next_try_str = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime('%H:%M:%S UTC')
+        except Exception:
+            next_try_str = '?'
+    return {
+        'attempts_1h': attempts_1h,
+        'entry_locked': entry_locked,
+        'cooldown_remaining': cooldown_remaining,
+        'last_reject_reason': last_reject_reason,
+        'rejection_cooldown_remaining': rejection_cooldown_remaining,
+        'next_try_ts': next_ts,
+        'next_try_str': next_try_str,
+        'next_try_reason': next_reason,
+    }
