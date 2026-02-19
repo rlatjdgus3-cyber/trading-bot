@@ -374,6 +374,23 @@ def compute_wait_reason(cur=None, gate_status=None):
         except Exception:
             pass
 
+        # Regime-specific wait detail
+        try:
+            import regime_reader
+            _rctx = regime_reader.get_current_regime(cur)
+            if _rctx.get('available'):
+                _regime = _rctx.get('regime', 'UNKNOWN')
+                if _rctx.get('in_transition'):
+                    return ('WAIT_SIGNAL', '레짐 전환 쿨다운 중')
+                if _regime == 'RANGE':
+                    return ('WAIT_SIGNAL', 'RANGE 모드: 밴드 경계 대기 (BB/VA 0.3% 이내 필요)')
+                if _regime == 'BREAKOUT':
+                    return ('WAIT_SIGNAL', 'BREAKOUT 모드: VA 돌파 확인 대기')
+                if _regime == 'SHOCK':
+                    return ('WAIT_SIGNAL', 'SHOCK 모드: 진입 차단')
+        except Exception:
+            pass  # FAIL-OPEN: default message
+
         return ('WAIT_SIGNAL', '모든 조건 통과, 신호 대기 중')
     except Exception as e:
         _log(f'compute_wait_reason error: {e}')

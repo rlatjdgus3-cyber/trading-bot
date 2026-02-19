@@ -23,7 +23,8 @@ def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
 
 
-def compute_leverage(atr_pct, regime_score, news_shock, confidence, stage, daily_loss=False):
+def compute_leverage(atr_pct, regime_score, news_shock, confidence, stage,
+                     daily_loss=False, regime=None, shock_type=None):
     """Compute recommended leverage (3-8x), score-based (v2.1).
 
     Args:
@@ -33,6 +34,8 @@ def compute_leverage(atr_pct, regime_score, news_shock, confidence, stage, daily
         confidence: abs(total_score) from score_engine
         stage: current pyramid stage (0-7)
         daily_loss: True if daily loss limit approached
+        regime: MCTX regime string (optional, for clamping)
+        shock_type: MCTX shock sub-type (optional)
 
     Returns:
         int: recommended leverage (3-8)
@@ -62,6 +65,15 @@ def compute_leverage(atr_pct, regime_score, news_shock, confidence, stage, daily
         base = min(base, 5)
     elif stage >= 3:
         base = min(base, 6)
+
+    # Regime-based clamping (MCTX Phase 2)
+    if regime:
+        try:
+            import regime_reader
+            params = regime_reader.get_regime_params(regime, shock_type)
+            base = max(params['leverage_min'], min(params['leverage_max'], base))
+        except Exception:
+            pass  # FAIL-OPEN: skip clamping on error
 
     return max(3, min(8, base))
 

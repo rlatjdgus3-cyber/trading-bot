@@ -346,6 +346,12 @@ def compute_total(cur=None, exchange=None):
         dominant_side = 'LONG' if total >= 0 else 'SHORT'
         stage = score_to_stage(abs_score)
 
+        # NEWS explicit guard: ensure NEWS alone cannot trigger entry (stage > 0)
+        # If TECH and POSITION are both neutral, news_event_score is already zeroed,
+        # but as defense-in-depth, explicitly cap stage to 0.
+        if news_event_guarded and stage > 0:
+            stage = 0
+
         # Dynamic stop-loss
         sl_base = 2.0
         try:

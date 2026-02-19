@@ -234,7 +234,70 @@ def _risk_checks(cur=None):
     return (True, 'ok')
 
 
-def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None):
+def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
+    """Check if entry is allowed based on regime's entry filter.
+
+    Returns (ok, reason).
+    FAIL-OPEN: if regime_ctx not available, always allow.
+    """
+    if not regime_ctx or not regime_ctx.get('available'):
+        return (True, 'MCTX unavailable — FAIL-OPEN')
+
+    import regime_reader
+    params = regime_reader.get_regime_params(
+        regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
+    entry_filter = params.get('entry_filter', 'none')
+
+    if entry_filter == 'none':
+        return (True, 'no filter')
+
+    if entry_filter == 'blocked':
+        return (False, f'SHOCK 모드: 진입 차단 ({regime_ctx.get("shock_type", "")})')
+
+    if regime_ctx.get('in_transition'):
+        return (False, '레짐 전환 쿨다운 중')
+
+    dominant = scores.get('dominant_side', 'LONG')
+
+    if entry_filter == 'band_edge':
+        # RANGE mode: price must be near VAL/VAH or BB boundary
+        proximity = params.get('entry_proximity_pct', 0.3)
+        vah = regime_ctx.get('vah')
+        val = regime_ctx.get('val')
+
+        if not price:
+            try:
+                ex = _get_exchange()
+                ticker = ex.fetch_ticker(SYMBOL)
+                price = float(ticker['last'])
+            except Exception:
+                return (True, 'price fetch failed — FAIL-OPEN')
+
+        if not vah or not val:
+            return (True, 'VAH/VAL unavailable — FAIL-OPEN')
+
+        near_val = abs(price - val) / val * 100 <= proximity if val > 0 else False
+        near_vah = abs(price - vah) / vah * 100 <= proximity if vah > 0 else False
+
+        if dominant == 'LONG' and near_val:
+            return (True, f'RANGE LONG: 가격 VAL 근접 ({price:.0f} ≈ {val:.0f})')
+        if dominant == 'SHORT' and near_vah:
+            return (True, f'RANGE SHORT: 가격 VAH 근접 ({price:.0f} ≈ {vah:.0f})')
+        # Also allow if near opposite band (counter-trend at boundary)
+        if near_val or near_vah:
+            return (True, f'RANGE: 밴드 경계 근접')
+
+        return (False, f'RANGE 모드: 밴드 경계 대기 (VAL={val:.0f} VAH={vah:.0f} price={price:.0f})')
+
+    if entry_filter == 'breakout_confirm':
+        if regime_ctx.get('breakout_confirmed'):
+            return (True, 'BREAKOUT 확인됨')
+        return (False, 'BREAKOUT 모드: VA 돌파 확인 대기')
+
+    return (True, f'unknown filter: {entry_filter}')
+
+
+def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, regime_ctx=None):
     """Evaluate whether ADD is allowed for an existing position.
     Returns (decision, reason) -- 'ADD', 'HOLD', 'BLOCKED'."""
     import safety_manager
@@ -251,9 +314,7 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None):
     cur.execute('SELECT stage FROM position_state WHERE symbol = %s;', (SYMBOL,))
     ps_row = cur.fetchone()
     pyramid_stage = int(ps_row[0]) if ps_row else 0
-    import regime_reader
-    _regime_ctx = regime_reader.get_current_regime(cur)
-    (ok, reason) = safety_manager.check_pyramid_allowed(cur, pyramid_stage, regime_ctx=_regime_ctx)
+    (ok, reason) = safety_manager.check_pyramid_allowed(cur, pyramid_stage, regime_ctx=regime_ctx)
     if not ok:
         return ('BLOCKED', reason)
 
@@ -271,7 +332,7 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None):
     return ('ADD', '모든 조건 충족')
 
 
-def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=None):
+def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=None, regime_ctx=None):
     '''Create OPEN signal for autopilot. Returns signal_id.'''
     if SYMBOL not in ALLOWED_SYMBOLS:
         _log(f'SYMBOL_NOT_ALLOWED: {SYMBOL} — signal skipped')
@@ -283,13 +344,14 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
     now_unix = int(time.time())
     relevant_score = scores.get('long_score', 50) if side == 'LONG' else scores.get('short_score', 50)
     start_stage = safety_manager.compute_start_stage(relevant_score)
-    # Regime-based stage cap
+    # Regime-based stage cap (reuse regime_ctx from caller)
     import regime_reader
-    _regime_ctx = regime_reader.get_current_regime(cur)
-    regime_stage_max = regime_reader.get_stage_limit(_regime_ctx['regime'], _regime_ctx.get('shock_type'))
+    if regime_ctx is None:
+        regime_ctx = regime_reader.get_current_regime(cur)
+    regime_stage_max = regime_reader.get_stage_limit(regime_ctx['regime'], regime_ctx.get('shock_type'))
     start_stage = min(start_stage, regime_stage_max)
     if start_stage <= 0:
-        _log(f'REGIME 차단: stage_limit=0 ({_regime_ctx["regime"]}/{_regime_ctx.get("shock_type")})')
+        _log(f'REGIME 차단: stage_limit=0 ({regime_ctx["regime"]}/{regime_ctx.get("shock_type")})')
         return 0
     entry_pct = safety_manager.get_stage_entry_pct(start_stage)
     eq = equity_limits or safety_manager.get_equity_limits(cur)
@@ -405,16 +467,34 @@ def _cycle():
                 _log(f'REGIME VETO: 진입 차단 (flow_bias={regime_ctx.get("flow_bias")})')
                 return
 
+            # RECONCILE MISMATCH: block new entries when exchange/strategy disagree
+            try:
+                import exchange_reader
+                exch_data = exchange_reader.fetch_position()
+                strat_data = exchange_reader.fetch_position_strat()
+                if exchange_reader.reconcile(exch_data, strat_data) == 'MISMATCH':
+                    _log('RECONCILE MISMATCH: entries blocked')
+                    return
+            except Exception:
+                pass  # FAIL-OPEN: reconcile failure does not block
+
             # Check existing position
             cur.execute('SELECT side, total_qty FROM position_state WHERE symbol = %s;', (SYMBOL,))
             ps_row = cur.fetchone()
             has_position = ps_row and ps_row[0] and float(ps_row[1] or 0) > 0
 
+            # Regime entry filter (new entries only)
+            if not has_position:
+                entry_ok, entry_reason = _check_regime_entry_filter(cur, regime_ctx, scores)
+                if not entry_ok:
+                    _log(f'REGIME_FILTER: {entry_reason}')
+                    return
+
             if has_position:
                 # Evaluate ADD
                 pos_side = ps_row[0]
                 pos_qty = float(ps_row[1])
-                (decision, add_reason) = _check_position_for_add(cur, pos_side, pos_qty, scores)
+                (decision, add_reason) = _check_position_for_add(cur, pos_side, pos_qty, scores, regime_ctx=regime_ctx)
                 if decision == 'ADD':
                     _log(f'ADD decision: {add_reason}')
                     import safety_manager
@@ -458,7 +538,7 @@ def _cycle():
                 scores.get('long_score', 50) if dominant == 'LONG' else scores.get('short_score', 50))
             entry_pct = safety_manager.get_stage_entry_pct(start_stage)
 
-            signal_id = _create_autopilot_signal(cur, dominant, scores, equity_limits=eq)
+            signal_id = _create_autopilot_signal(cur, dominant, scores, equity_limits=eq, regime_ctx=regime_ctx)
             if signal_id:
                 _log_trade_process(cur, signal_id, scores, 'autopilot', start_stage, entry_pct,
                                     equity_limits=eq)

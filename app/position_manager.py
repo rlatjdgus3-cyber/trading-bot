@@ -286,7 +286,8 @@ def _build_context(cur=None, pos=None, snapshot=None):
     # Position state
     cur.execute("""
             SELECT side, total_qty, avg_entry_price, stage,
-                   trade_budget_used_pct, next_stage_available
+                   trade_budget_used_pct, next_stage_available,
+                   peak_upnl_pct
             FROM position_state WHERE symbol = %s;
         """, (SYMBOL,))
     ps_row = cur.fetchone()
@@ -298,6 +299,7 @@ def _build_context(cur=None, pos=None, snapshot=None):
             'stage': int(ps_row[3]) if ps_row[3] else 0,
             'budget_used_pct': float(ps_row[4]) if ps_row[4] else 0,
             'next_stage': int(ps_row[5]) if ps_row[5] else 0,
+            'peak_upnl_pct': float(ps_row[6]) if ps_row[6] is not None else 0,
         }
     else:
         ctx['pos_state'] = {}
@@ -1332,6 +1334,57 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     return 'HOLD'
 
 
+def _check_take_profit(ctx, regime_params, regime_ctx):
+    """Check regime-based take-profit conditions.
+
+    Returns (action, reason) or None if no TP triggered.
+
+    tp_mode='fixed': close when uPnL% >= tp_pct_max
+    tp_mode='trailing': track peak uPnL, close when drawdown from peak >= trail_pct
+    """
+    if not regime_params or not regime_ctx or not regime_ctx.get('available'):
+        return None
+
+    pos = ctx.get('position', {})
+    side = pos.get('side', '')
+    entry = pos.get('entry_price', 0)
+    price = ctx.get('price', 0)
+    if not side or not entry or entry <= 0 or not price:
+        return None
+
+    # Calculate uPnL%
+    if side == 'long':
+        upnl_pct = (price - entry) / entry * 100
+    else:
+        upnl_pct = (entry - price) / entry * 100
+
+    tp_mode = regime_params.get('tp_mode', 'fixed')
+
+    if tp_mode == 'fixed':
+        tp_max = regime_params.get('tp_pct_max', 1.5)
+        if tp_max > 0 and upnl_pct >= tp_max:
+            return ('CLOSE', f'REGIME TP (fixed): uPnL {upnl_pct:.2f}% >= {tp_max}%')
+        return None
+
+    if tp_mode == 'trailing':
+        trail_activate = regime_params.get('trail_activate_pct', 0.5)
+        trail_pct = regime_params.get('trail_pct', 0.8)
+        peak = ctx.get('pos_state', {}).get('peak_upnl_pct', 0) or 0
+
+        # Update peak if current is higher
+        if upnl_pct > peak:
+            peak = upnl_pct
+
+        if peak >= trail_activate:
+            drawdown = peak - upnl_pct
+            if drawdown >= trail_pct:
+                return ('CLOSE',
+                        f'REGIME TP (trailing): peak={peak:.2f}% drawdown={drawdown:.2f}% >= {trail_pct}%')
+        return None
+
+    return None
+
+
 def _decide(ctx=None):
     '''Run decision engine. Returns (action, reason).'''
     pos = ctx.get('position', {})
@@ -1363,6 +1416,21 @@ def _decide(ctx=None):
 
     dominant = scores.get('dominant_side', 'LONG')
 
+    # ── Regime-based TP check (before SL) ──
+    regime_ctx = ctx.get('regime_ctx', {})
+    regime_params = None
+    if regime_ctx.get('available'):
+        try:
+            import regime_reader
+            regime_params = regime_reader.get_regime_params(
+                regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
+        except Exception:
+            pass
+    if regime_params:
+        tp_result = _check_take_profit(ctx, regime_params, regime_ctx)
+        if tp_result:
+            return tp_result
+
     # Stop-loss check
     if atr and atr > 0 and entry and entry > 0:
         if side == 'long':
@@ -1372,12 +1440,16 @@ def _decide(ctx=None):
 
         # Stage-based stop-loss tightening (v2.1)
         sl_base = scores.get('dynamic_stop_loss_pct', 2.0)
+        # Regime SL clamping: use the tighter of dynamic SL and regime SL
+        if regime_params:
+            regime_sl = regime_params.get('sl_pct', 2.0)
+            sl_base = min(sl_base, regime_sl)
         if stage >= 3:
             sl_pct = min(sl_base, 1.6)
         elif stage >= 2:
             sl_pct = min(sl_base, 1.8)
         else:
-            sl_pct = sl_base  # 2.0% (default)
+            sl_pct = sl_base
         if sl_dist <= -sl_pct:
             return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%)')
 
@@ -1467,12 +1539,15 @@ def _build_leverage_context(ctx):
     price = ctx.get('price', 0)
     atr = ind.get('atr', 0)
     atr_pct = (atr / price * 100) if price and atr else 1.0
+    regime_ctx = ctx.get('regime_ctx', {})
     return {
         'atr_pct': round(atr_pct, 3),
         'regime_score': scores.get('regime_score', 0),
         'news_event_score': scores.get('news_event_score', 0),
         'confidence': scores.get('confidence', 0),
         'stage': ctx.get('pos_state', {}).get('stage', 0),
+        'regime': regime_ctx.get('regime'),
+        'shock_type': regime_ctx.get('shock_type'),
     }
 
 
@@ -1545,13 +1620,14 @@ def _enqueue_reverse(cur=None, pos=None, **kwargs):
     return close_id
 
 
-def _sync_position_state(cur=None, pos=None):
+def _sync_position_state(cur=None, pos=None, upnl_pct=None):
     '''Sync position_state with Bybit reality.'''
     if pos is None:
         cur.execute("""
             UPDATE position_state SET
                 side = NULL, total_qty = 0, stage = 0,
                 capital_used_usdt = 0, trade_budget_used_pct = 0,
+                peak_upnl_pct = 0,
                 updated_at = now()
             WHERE symbol = %s;
         """, (SYMBOL,))
@@ -1562,6 +1638,16 @@ def _sync_position_state(cur=None, pos=None):
                 updated_at = now()
             WHERE symbol = %s;
         """, (pos.get('side'), pos.get('qty'), pos.get('entry_price'), SYMBOL))
+        # Track peak uPnL% for trailing TP
+        if upnl_pct is not None:
+            try:
+                cur.execute("""
+                    UPDATE position_state
+                    SET peak_upnl_pct = GREATEST(COALESCE(peak_upnl_pct, 0), %s)
+                    WHERE symbol = %s;
+                """, (upnl_pct, SYMBOL))
+            except Exception:
+                pass  # column may not exist yet
 
 
 def _log_decision(cur=None, ctx=None, action=None, reason=None,
@@ -2125,8 +2211,17 @@ def _cycle():
                     pm_decision_id=dec_id,
                     priority=2)
 
-            # Sync position state
-            _sync_position_state(cur, pos)
+            # Sync position state (with peak uPnL tracking)
+            _upnl_pct = None
+            if pos and pos.get('side') and pos.get('entry_price') and ctx.get('price'):
+                _entry = pos.get('entry_price', 0)
+                _price = ctx.get('price', 0)
+                if _entry > 0:
+                    if pos['side'] == 'long':
+                        _upnl_pct = (_price - _entry) / _entry * 100
+                    else:
+                        _upnl_pct = (_entry - _price) / _entry * 100
+            _sync_position_state(cur, pos, upnl_pct=_upnl_pct)
 
             # RECONCILE auto-recovery (every 5th cycle ≈ 50-75s)
             global _reconcile_cycle_count

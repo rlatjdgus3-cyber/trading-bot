@@ -869,6 +869,8 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
                 news_shock=abs(lev_ctx.get('news_event_score', 0)) >= 60,
                 confidence=lev_ctx.get('confidence', 0),
                 stage=lev_ctx.get('stage', 0),
+                regime=lev_ctx.get('regime'),
+                shock_type=lev_ctx.get('shock_type'),
             )
             leverage_manager.set_exchange_leverage(ex, SYMBOL, lev)
     except Exception as e:
@@ -892,7 +894,9 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
             raise ValueError(
                 f"min_qty adjusted amount still below minNotional "
                 f"({adjusted_usdt:.2f} < {min_notional})")
-        log(f"MIN_QTY ADJUST: {raw_amount:.6f} -> {amount} (min_qty={min_qty})")
+        ratio = amount / raw_amount if raw_amount > 0 else 0
+        log(f"MIN_QTY ADJUST: {raw_amount:.6f} -> {amount} (min_qty={min_qty}, "
+            f"ratio={ratio:.1f}x, stage_usdt={usdt_size:.0f})")
 
     # ── Pre-order detail log ──
     try:

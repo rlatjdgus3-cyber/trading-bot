@@ -107,7 +107,9 @@ def execute(query_type=None, original_text=None):
         'debug_backfill_ack': _debug_backfill_ack,
         'debug_gate_details': _debug_gate_details,
         'debug_order_throttle': _debug_order_throttle,
-        'reconcile': _reconcile}
+        'reconcile': _reconcile,
+        'mctx_status': _mctx_status,
+        'mode_params': _mode_params}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -4389,3 +4391,99 @@ def _reconcile(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'⚠ reconcile 오류: {e}'
+
+
+def _mctx_status(_text=None):
+    """MCTX status: regime, confidence, ADX, flow, price_vs_va, shock, breakout, transition."""
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            import regime_reader
+            ctx = regime_reader.get_current_regime(cur)
+
+        if not ctx.get('available'):
+            return '[MCTX] 데이터 없음 (FAIL-OPEN: UNKNOWN 모드)'
+
+        regime = ctx.get('regime', 'UNKNOWN')
+        conf = ctx.get('confidence', 0)
+        adx = ctx.get('adx_14')
+        flow = ctx.get('flow_bias', 0)
+        pvs = ctx.get('price_vs_va', '?')
+        shock = ctx.get('shock_type')
+        bo = ctx.get('breakout_confirmed', False)
+        trans = ctx.get('in_transition', False)
+        stale = ctx.get('stale', False)
+
+        lines = ['[MCTX] 시장 환경 상태']
+        lines.append('━━━━━━━━━━━━━━━━━━━━━━━━')
+        lines.append(f'  레짐: {regime} (confidence={conf})')
+        lines.append(f'  ADX: {adx:.1f}' if adx is not None else '  ADX: N/A')
+        lines.append(f'  flow_bias: {flow:+.1f}')
+        lines.append(f'  price_vs_VA: {pvs}')
+        if shock:
+            lines.append(f'  shock: {shock}')
+        lines.append(f'  breakout_confirmed: {"YES" if bo else "NO"}')
+        if trans:
+            lines.append(f'  전환 상태: 쿨다운 중')
+        if stale:
+            lines.append(f'  ⚠ 데이터 stale (>5분)')
+
+        # Show VAH/VAL/POC
+        vah = ctx.get('vah')
+        val = ctx.get('val')
+        poc = ctx.get('poc')
+        if vah and val:
+            lines.append(f'  VAH: ${vah:,.0f} / VAL: ${val:,.0f} / POC: ${poc:,.0f}' if poc else
+                         f'  VAH: ${vah:,.0f} / VAL: ${val:,.0f}')
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ MCTX 오류: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _mode_params(_text=None):
+    """Current regime mode parameters: TP/SL/leverage/stage/entry filter."""
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            import regime_reader
+            ctx = regime_reader.get_current_regime(cur)
+
+        regime = ctx.get('regime', 'UNKNOWN')
+        shock_type = ctx.get('shock_type')
+        params = regime_reader.get_regime_params(regime, shock_type)
+
+        lines = [f'[MODE] {regime} 모드 파라미터']
+        lines.append('━━━━━━━━━━━━━━━━━━━━━━━━')
+        tp_mode = params.get('tp_mode', 'fixed')
+        if tp_mode == 'fixed':
+            lines.append(f'  TP: fixed {params.get("tp_pct_min", 0)}-{params.get("tp_pct_max", 0)}%')
+        elif tp_mode == 'trailing':
+            lines.append(f'  TP: trailing (activate={params.get("trail_activate_pct", 0)}%, '
+                         f'trail={params.get("trail_pct", 0)}%)')
+        lines.append(f'  SL: {params.get("sl_pct", 2.0)}%')
+        lines.append(f'  레버리지: {params.get("leverage_min", 3)}-{params.get("leverage_max", 8)}x')
+        lines.append(f'  최대 스테이지: {params.get("stage_max", 7)}')
+        lines.append(f'  진입 필터: {params.get("entry_filter", "none")}')
+        lines.append(f'  ADD 점수 기준: {params.get("add_score_threshold", 45)}')
+
+        if not ctx.get('available'):
+            lines.append('\n  ※ MCTX 미가용 — UNKNOWN(FAIL-OPEN) 적용 중')
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ MODE 오류: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass

@@ -36,6 +36,10 @@ WAIT_REASON_KR = {
     'WAIT_RATE_LIMIT': '주문 속도 제한 — 시간당/10분 주문 한도 도달',
     'WAIT_MIN_QTY': '최소 주문 수량 미달 — 자본 부족',
     'WAIT_DB_ERROR': 'DB 오류 백오프 — 자동 복구 대기 중',
+    'WAIT_REGIME_RANGE': 'RANGE 모드 — 밴드 경계 대기',
+    'WAIT_REGIME_BREAKOUT': 'BREAKOUT 모드 — VA 돌파 확인 대기',
+    'WAIT_REGIME_SHOCK': 'SHOCK 모드 — 진입 차단',
+    'WAIT_REGIME_TRANSITION': '레짐 전환 쿨다운 중',
 }
 
 
@@ -504,6 +508,33 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
             sections.append('   ※ 전략 내부 기록일 뿐 — 실제 체결/보유 아님')
 
     sections.append('')
+
+    # ── 5) 시장 환경(MCTX) ──
+    try:
+        from db_config import get_conn as _get_conn
+        _mctx_conn = _get_conn(autocommit=True)
+        with _mctx_conn.cursor() as _mctx_cur:
+            import regime_reader
+            _rctx = regime_reader.get_current_regime(_mctx_cur)
+        _mctx_conn.close()
+        if _rctx.get('available'):
+            _regime = _rctx.get('regime', 'UNKNOWN')
+            _rparams = regime_reader.get_regime_params(_regime, _rctx.get('shock_type'))
+            _tp_mode = _rparams.get('tp_mode', 'fixed')
+            _sl = _rparams.get('sl_pct', 2.0)
+            _lmin = _rparams.get('leverage_min', 3)
+            _lmax = _rparams.get('leverage_max', 8)
+            sections.append('5) 시장 환경(MCTX)')
+            sections.append(f'   - 레짐: {_regime} (confidence={_rctx.get("confidence", 0)})')
+            sections.append(f'   - flow: {_rctx.get("flow_bias", 0):+.1f} | '
+                           f'ADX: {_rctx["adx_14"]:.1f}' if _rctx.get("adx_14") is not None
+                           else f'   - flow: {_rctx.get("flow_bias", 0):+.1f} | ADX: N/A')
+            sections.append(f'   - 모드: {_tp_mode} TP / {_sl}% SL / {_lmin}-{_lmax}x')
+            if _rctx.get('in_transition'):
+                sections.append('   - ⚠ 레짐 전환 쿨다운 중')
+            sections.append('')
+    except Exception:
+        pass  # MCTX section is optional
 
     # ── 4) 실행상태(GATE/WAIT) ──
     sections.append('4) 실행상태(GATE/WAIT)')

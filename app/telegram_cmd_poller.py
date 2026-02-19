@@ -139,6 +139,8 @@ HELP_TEXT = (
     "  /risk_config — 안전장치 설정 조회\n"
     "  /snapshot — 종합 현황 카드\n"
     "  /fact — 4섹션 팩트 요약 (거래소+주문+전략+실행상태)\n"
+    "  /mctx — 시장 환경(MCTX) 레짐/flow/ADX 상태\n"
+    "  /mode — 현재 모드 파라미터 (TP/SL/레버리지/필터)\n"
     "  /debug — 디버그 서브커맨드 메뉴\n"
     "    /debug version — 빌드/버전/환경\n"
     "    /debug router — 라우팅 디버그\n"
@@ -2091,7 +2093,7 @@ _KNOWN_SLASH_COMMANDS = [
     '/position', '/position_exch', '/orders', '/orders_exch',
     '/account', '/account_exch', '/position_strat', '/risk_config',
     '/snapshot', '/snap', '/fact', '/now', '/close_all', '/force',
-    '/detail', '/trade', '/reconcile',
+    '/detail', '/trade', '/reconcile', '/mctx', '/mode',
     # Korean aliases
     '/포지션', '/주문', '/잔고', '/자산', '/전략포지션', '/리스크', '/risk',
     '/스냅샷', '/팩트', '/전청산', '/서비스', '/상태', '/스코어', '/테스트', '/감사',
@@ -3038,6 +3040,16 @@ def handle_command(text: str, chat_id: int = 0) -> str:
     if t in ('/reconcile', '/대조'):
         return local_query_executor.execute('reconcile') + \
             _footer('reconcile', 'local', 'local')
+
+    # /mctx — 시장 환경(MCTX) 상태
+    if t in ('/mctx', '/시장환경'):
+        return local_query_executor.execute('mctx_status') + \
+            _footer('mctx_status', 'local', 'local')
+
+    # /mode — 현재 레짐 모드 파라미터
+    if t in ('/mode', '/모드'):
+        return local_query_executor.execute('mode_params') + \
+            _footer('mode_params', 'local', 'local')
 
     # /close_all — 전포지션 수동 청산
     if t in ('/close_all', '/전청산'):
