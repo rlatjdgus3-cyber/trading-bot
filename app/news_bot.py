@@ -522,9 +522,11 @@ def main():
                         _shadow = _ncc.preview_classify(
                             title, source, impact,
                             summary=summary or '', title_ko=title_ko or '')
-                        # If GPT returned noise/empty topic, use shadow
-                        if topic_class in ('noise', '', None) and _shadow.get('topic_class_preview', 'unclassified') != 'unclassified':
-                            topic_class = _shadow['topic_class_preview']
+                        # If GPT returned generic/noise topic, use shadow's detailed classification
+                        _shadow_topic_preview = _shadow.get('topic_class_preview', 'unclassified')
+                        if _shadow_topic_preview not in ('unclassified', '', None):
+                            if topic_class in ('noise', 'macro', '', None):
+                                topic_class = _shadow_topic_preview
                         # If GPT didn't assign tier, use shadow
                         if tier in ('UNKNOWN', None) and _shadow.get('tier_preview'):
                             tier = _shadow['tier_preview']
