@@ -384,7 +384,11 @@ def compute_total(cur=None, exchange=None):
                 base_news_w = weights['news_event_w']
                 boosted_w = min(0.15, base_news_w * 3)
 
-                # QQQ 30min corroboration: if |QQQ change| > $1.50 → boost further
+                # News direction sign for corroboration alignment
+                _news_bearish = news_event_score < 0
+
+                # QQQ 30min corroboration: boost only if QQQ move aligns with news direction
+                # QQQ drop corroborates bearish news; QQQ rise corroborates bullish news
                 try:
                     cur.execute("""
                         WITH latest AS (SELECT price FROM macro_data WHERE source='QQQ' ORDER BY ts DESC LIMIT 1),
@@ -393,12 +397,15 @@ def compute_total(cur=None, exchange=None):
                         SELECT (SELECT price FROM latest) - (SELECT price FROM past);
                     """)
                     qqq_row = cur.fetchone()
-                    if qqq_row and qqq_row[0] and abs(float(qqq_row[0])) > 1.50:
-                        boosted_w = min(0.18, boosted_w + 0.03)
+                    if qqq_row and qqq_row[0]:
+                        qqq_change = float(qqq_row[0])
+                        qqq_aligned = (qqq_change < 0 and _news_bearish) or (qqq_change > 0 and not _news_bearish)
+                        if abs(qqq_change) > 1.50 and qqq_aligned:
+                            boosted_w = min(0.18, boosted_w + 0.03)
                 except Exception:
                     pass
 
-                # VIX spike corroboration: if VIX up >10% in 30min → boost further
+                # VIX spike corroboration: VIX rise corroborates bearish news only
                 try:
                     cur.execute("""
                         WITH latest AS (SELECT price FROM macro_data WHERE source='VIX' ORDER BY ts DESC LIMIT 1),
@@ -409,7 +416,7 @@ def compute_total(cur=None, exchange=None):
                     vix_row = cur.fetchone()
                     if vix_row and vix_row[0] and vix_row[1] and float(vix_row[1]) > 0:
                         vix_change_pct = (float(vix_row[0]) - float(vix_row[1])) / float(vix_row[1])
-                        if vix_change_pct > 0.10:
+                        if vix_change_pct > 0.10 and _news_bearish:
                             boosted_w = min(0.20, boosted_w + 0.02)
                 except Exception:
                     pass
@@ -433,6 +440,12 @@ def compute_total(cur=None, exchange=None):
         if abs(tech_score) < 10 and abs(position_score) < 10:
             news_event_score = 0
             news_event_guarded = True
+
+        # Normalize weights to sum to 1.0 after all adjustments
+        _w_sum = sum(weights.values())
+        if _w_sum > 0 and abs(_w_sum - 1.0) > 0.001:
+            for _wk in weights:
+                weights[_wk] /= _w_sum
 
         # Weighted total (4-axis)
         total = (

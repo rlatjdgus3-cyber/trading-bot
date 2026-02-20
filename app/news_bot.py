@@ -62,6 +62,28 @@ GOSSIP_BLOCKLIST = {
 
 LOW_VALUE_SOURCES = {'yahoo_finance'}  # insert에 impact_score >= 6 조건 적용
 
+
+# ── Word-boundary keyword matching ──
+# Short keywords (≤4 chars) that need \b to avoid substring false positives
+_SHORT_KW_THRESHOLD = 4
+
+def _build_kw_regex(keywords):
+    """Build a single compiled regex from a keyword set/list for word-boundary matching.
+    ASCII keywords use \\b word boundaries to prevent substring false positives.
+    Korean/CJK keywords use simple alternation (\\b doesn't work with CJK).
+    """
+    parts = []
+    for kw in sorted(keywords, key=len, reverse=True):  # longer first for greedy match
+        if kw.isascii():
+            parts.append(r'\b' + re.escape(kw) + r'\b')
+        else:
+            parts.append(re.escape(kw))
+    return re.compile('|'.join(parts), re.IGNORECASE) if parts else re.compile(r'(?!)')
+
+def _kw_match(text, compiled_re):
+    """Return True if any keyword matches in text."""
+    return bool(compiled_re.search(text))
+
 # ── 소스 티어 분류 (v2: bbc/investing → TIER2로 승격) ──
 SOURCE_TIERS = {
     'TIER1_SOURCE': {'reuters', 'bloomberg', 'wsj', 'ft', 'ap'},
@@ -150,15 +172,33 @@ MACRO_STANDALONE_KEYWORDS = {
     'treasury yield', 'credit spread', 'bond auction', 'term premium', 'tlt',
 }
 
+# Pre-compiled regexes for word-boundary safe matching
+_RE_KEYWORDS = _build_kw_regex(KEYWORDS)
+_RE_CRYPTO_CORE = _build_kw_regex(CRYPTO_CORE_KEYWORDS)
+_RE_IMPACT = _build_kw_regex(IMPACT_KEYWORDS)
+_RE_MACRO_STANDALONE = _build_kw_regex(MACRO_STANDALONE_KEYWORDS)
+_RE_GOSSIP = _build_kw_regex(GOSSIP_BLOCKLIST)
+
 
 def _is_gossip(title: str) -> bool:
     """가십/노이즈 키워드 매칭 시 True → GPT 호출 없이 스킵."""
     t = (title or '').lower()
-    return any(kw in t for kw in GOSSIP_BLOCKLIST)
+    return _kw_match(t, _RE_GOSSIP)
 
 # ── DB 에러 알림 ──
 _error_alert_cache = {}  # {dedup_key: (last_ts, count)}
 _ERROR_ALERT_COOLDOWN_SEC = 1800  # 30분
+_ERROR_CACHE_MAX_SIZE = 200  # max entries before pruning
+
+def _prune_error_cache():
+    """Remove expired entries from _error_alert_cache to prevent unbounded growth."""
+    if len(_error_alert_cache) <= _ERROR_CACHE_MAX_SIZE:
+        return
+    now = time.time()
+    expired = [k for k, (ts, _) in _error_alert_cache.items()
+               if now - ts > _ERROR_ALERT_COOLDOWN_SEC * 2]
+    for k in expired:
+        del _error_alert_cache[k]
 
 def _send_error_alert(source, title, exception, dedup_key=None):
     """DB 에러 발생 시 Telegram 알림. 30분 쿨다운으로 스팸 방지."""
@@ -166,6 +206,9 @@ def _send_error_alert(source, title, exception, dedup_key=None):
     now = time.time()
     if dedup_key is None:
         dedup_key = f"{type(exception).__name__}:{source}"
+
+    # Prune old entries periodically
+    _prune_error_cache()
 
     cached = _error_alert_cache.get(dedup_key)
     if cached:
@@ -235,21 +278,25 @@ def worth_llm(title: str, active_keywords=None, source: str = '') -> bool:
     if (source or '').lower() in CRYPTO_FEEDS:
         return True
     # 매크로 스탠드얼론: 단독 통과
-    if any(k in t for k in MACRO_STANDALONE_KEYWORDS):
+    if _kw_match(t, _RE_MACRO_STANDALONE):
         return True
     # AND 조건: crypto + impact 동시
-    has_crypto = any(k in t for k in CRYPTO_CORE_KEYWORDS)
-    has_impact = any(k in t for k in IMPACT_KEYWORDS)
+    has_crypto = _kw_match(t, _RE_CRYPTO_CORE)
+    has_impact = _kw_match(t, _RE_IMPACT)
     if has_crypto and has_impact:
         return True
     # 기존 KEYWORDS fallback (하위호환)
-    kw_list = active_keywords if active_keywords is not None else KEYWORDS
-    return any(k in t for k in kw_list)
+    if active_keywords is not None:
+        _re_active = _build_kw_regex(active_keywords)
+        return _kw_match(t, _re_active)
+    return _kw_match(t, _RE_KEYWORDS)
 
 def extract_keywords(title: str, active_keywords=None):
     t = (title or "").lower()
     kw_list = active_keywords if active_keywords is not None else KEYWORDS
-    hits = [k for k in kw_list if k in t]
+    hits = [k for k in kw_list if re.search(
+        r'\b' + re.escape(k) + r'\b' if len(k) <= _SHORT_KW_THRESHOLD and k.isascii()
+        else re.escape(k), t, re.IGNORECASE)]
     return hits
 
 def get_openai():
@@ -442,18 +489,28 @@ def main():
                 log(traceback.format_exc())
                 continue
 
+            # Batch URL dedup: collect all URLs first, then check DB in one query
+            _feed_entries = []
             for e in entries[:20]:
                 title = getattr(e, "title", "") or ""
                 link = getattr(e, "link", "") or ""
-                if not title or not link:
+                if title and link:
+                    _feed_entries.append((title, link))
+            _existing_urls = set()
+            if _feed_entries:
+                try:
+                    _all_urls = [link for _, link in _feed_entries]
+                    with db.cursor() as cur:
+                        cur.execute("SELECT url FROM public.news WHERE url = ANY(%s)", (_all_urls,))
+                        _existing_urls = {r[0] for r in cur.fetchall()}
+                except Exception:
+                    pass  # fallback: treat all as new
+
+            for title, link in _feed_entries:
+                if link in _existing_urls:
                     continue
 
                 try:
-                    # 1) URL 중복체크
-                    with db.cursor() as cur:
-                        cur.execute("SELECT 1 FROM public.news WHERE url=%s", (link,))
-                        if cur.fetchone():
-                            continue
 
                     # 2) 하드 제외 패턴 (GPT 호출 전)
                     if _is_hard_excluded(title):
