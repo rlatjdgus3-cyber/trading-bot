@@ -218,6 +218,31 @@ _error_alert_cache = {}  # {dedup_key: (last_ts, count)}
 _ERROR_ALERT_COOLDOWN_SEC = 1800  # 30분
 _ERROR_CACHE_MAX_SIZE = 200  # max entries before pruning
 
+# Telegram config cache (avoid disk read on every alert)
+_tg_config_cache = None
+
+def _load_tg_config():
+    """Load Telegram token/chat_id from env file (cached)."""
+    global _tg_config_cache
+    if _tg_config_cache is not None:
+        return _tg_config_cache
+    token, chat_id = '', ''
+    try:
+        with open('/root/trading-bot/app/telegram_cmd.env', 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                if k.strip() == 'TELEGRAM_BOT_TOKEN':
+                    token = v.strip()
+                elif k.strip() == 'TELEGRAM_ALLOWED_CHAT_ID':
+                    chat_id = v.strip()
+    except Exception:
+        pass
+    _tg_config_cache = (token, chat_id)
+    return _tg_config_cache
+
 def _prune_error_cache():
     """Remove expired entries from _error_alert_cache to prevent unbounded growth."""
     if len(_error_alert_cache) <= _ERROR_CACHE_MAX_SIZE:
@@ -260,18 +285,7 @@ def _send_error_alert(source, title, exception, dedup_key=None):
     )
 
     try:
-        env_path = '/root/trading-bot/app/telegram_cmd.env'
-        token, chat_id = '', ''
-        with open(env_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                k, v = line.split('=', 1)
-                if k.strip() == 'TELEGRAM_BOT_TOKEN':
-                    token = v.strip()
-                elif k.strip() == 'TELEGRAM_ALLOWED_CHAT_ID':
-                    chat_id = v.strip()
+        token, chat_id = _load_tg_config()
         if token and chat_id:
             url = f'https://api.telegram.org/bot{token}/sendMessage'
             data = urllib.parse.urlencode({'chat_id': chat_id, 'text': text}).encode('utf-8')
@@ -696,8 +710,10 @@ def main():
                                 allow_storage = EXCLUDED.allow_storage,
                                 allow_trading = EXCLUDED.allow_trading,
                                 trading_impact_weight = EXCLUDED.trading_impact_weight
-                            WHERE EXCLUDED.impact_score > COALESCE(news.impact_score, 0)
+                            WHERE EXCLUDED.impact_score >= COALESCE(news.impact_score, 0)
                                OR news.tier IS NULL
+                               OR news.topic_class IS NULL
+                               OR news.topic_class IN ('macro', 'crypto', 'noise', 'unclassified')
                         """, (
                             source,
                             title,

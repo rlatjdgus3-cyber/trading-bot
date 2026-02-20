@@ -1774,9 +1774,10 @@ def _cycle():
                 if regime_ctx.get('regime') == 'RANGE':
                     max_per_hour = r_params.get('max_entries_per_hour', 3)
                     cur.execute("""
-                        SELECT count(*) FROM trade_process_log
-                        WHERE source = 'autopilot' AND ts >= now() - interval '1 hour';
-                    """)
+                        SELECT count(*) FROM execution_log
+                        WHERE symbol = %s AND order_type = 'OPEN' AND status = 'FILLED'
+                          AND last_fill_at >= now() - interval '1 hour';
+                    """, (SYMBOL,))
                     hourly_count = cur.fetchone()[0] or 0
                     if hourly_count >= max_per_hour:
                         _log(f'RANGE 시간당 진입 제한 ({hourly_count}/{max_per_hour})')

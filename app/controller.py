@@ -40,10 +40,10 @@ def fetch_indicator_for_decision():
         FROM indicators
         WHERE symbol=:s AND tf=:t
         ORDER BY ts DESC
-        LIMIT :n
+        LIMIT 1
     '''
     with engine.connect() as conn:
-        row = conn.execute(text(sql), {'s': SYMBOL, 't': TF, 'n': VOL_SPIKE_LOOKBACK}).fetchone()
+        row = conn.execute(text(sql), {'s': SYMBOL, 't': TF}).fetchone()
         if row:
             return {'ts': row[0], 'vol_spike': row[1]}
     return None

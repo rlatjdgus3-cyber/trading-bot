@@ -367,7 +367,7 @@ def compute_total(cur=None, exchange=None):
                             delta = 0  # Don't increase news weight with bad liquidity
                             _log('BREAKOUT news_w override blocked: spread/liquidity not OK')
                     except Exception:
-                        pass  # FAIL-OPEN: proceed with override
+                        delta = 0  # FAIL-CLOSED: don't boost without liquidity data
                     if delta > 0:
                         weights['news_event_w'] = new_news_w
                         # Reduce tech_w proportionally, with floor at 0.30
@@ -450,6 +450,16 @@ def compute_total(cur=None, exchange=None):
         if _w_sum > 0 and abs(_w_sum - 1.0) > 0.001:
             for _wk in weights:
                 weights[_wk] /= _w_sum
+        # Post-normalization floor: tech_w must remain dominant (>= 0.30)
+        if weights['tech_w'] < 0.30:
+            _deficit = 0.30 - weights['tech_w']
+            weights['tech_w'] = 0.30
+            # Redistribute deficit proportionally from other weights
+            _other_sum = sum(v for k, v in weights.items() if k != 'tech_w')
+            if _other_sum > 0:
+                for _wk in weights:
+                    if _wk != 'tech_w':
+                        weights[_wk] -= _deficit * (weights[_wk] / _other_sum)
 
         # Weighted total (4-axis)
         total = (

@@ -181,14 +181,22 @@ def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
 
 
+_DB_WEIGHTS_TTL_SEC = 300  # reload from DB every 5 minutes
+_db_weights_last_load = 0
+
 def _load_db_category_weights(cur):
     """Load category weights from news_impact_stats (avg_abs_ret_2h based).
 
     Maps avg_abs_ret_2h to 0-25 score: higher abs return = higher weight.
     Falls back to hardcoded CATEGORY_WEIGHT_DEFAULT if DB unavailable.
+    Caches for 5 minutes to avoid per-cycle DB queries.
     Returns (weights_dict, stats_version, total_samples).
     """
-    global _db_weights_loaded, _db_weights_version, CATEGORY_WEIGHT
+    global _db_weights_loaded, _db_weights_version, CATEGORY_WEIGHT, _db_weights_last_load
+    import time as _time
+    now = _time.time()
+    if _db_weights_loaded and (now - _db_weights_last_load) < _DB_WEIGHTS_TTL_SEC:
+        return (dict(CATEGORY_WEIGHT), _db_weights_version, 0)
     try:
         cur.execute("""
             SELECT event_type, avg_abs_ret_2h, sample_count, stats_version
@@ -232,6 +240,7 @@ def _load_db_category_weights(cur):
         CATEGORY_WEIGHT = merged
         _db_weights_loaded = True
         _db_weights_version = version
+        _db_weights_last_load = now
 
         _log(f'DB weights loaded: {len(db_weights)} categories, '
              f'version={version}, total_samples={total_samples}')
@@ -337,7 +346,11 @@ def _majority_direction(gpt_dir, trace_ret_2h, kw_sentiment):
     votes.append(kw_sentiment)
 
     total = sum(votes)
-    return 1 if total >= 0 else -1
+    if total > 0:
+        return 1
+    elif total < 0:
+        return -1
+    return 0  # neutral on tie — no directional bias
 
 
 MACRO_CATEGORIES = {
@@ -502,7 +515,12 @@ def _score_group(items, traces, watch_kw, row_tiers=None, row_rel_scores=None,
     magnitude = round(comp_source + comp_category + comp_recency +
                       comp_reaction + comp_watchlist)
     magnitude = max(0, min(100, magnitude))
-    direction_sign = 1 if direction_votes_sum >= 0 else -1
+    if direction_votes_sum > 0:
+        direction_sign = 1
+    elif direction_votes_sum < 0:
+        direction_sign = -1
+    else:
+        direction_sign = 0  # neutral on tie
 
     components = {
         'source_quality': comp_source,
@@ -689,7 +707,7 @@ def compute(cur):
             blended_score = 0
 
         # 6-3: macro_data corroboration
-        direction_sign = 1 if blended_score >= 0 else -1
+        direction_sign = 1 if blended_score > 0 else (-1 if blended_score < 0 else 0)
         macro_bonus = _macro_corroboration(cur, direction_sign)
         blended_score = max(-100, min(100, blended_score + macro_bonus))
 

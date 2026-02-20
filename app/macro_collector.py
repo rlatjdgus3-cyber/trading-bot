@@ -37,8 +37,18 @@ SYMBOLS = {
 
 POLL_INTERVAL_MARKET = 300   # 5 min during market hours
 POLL_INTERVAL_OFF = 900      # 15 min outside market hours
-US_MARKET_OPEN_UTC = 14      # 09:30 ET ≈ 14:30 UTC
-US_MARKET_CLOSE_UTC = 21     # 16:00 ET ≈ 21:00 UTC
+
+# Dynamic market hours using US/Eastern timezone (handles DST automatically)
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo('America/New_York')
+except ImportError:
+    from datetime import tzinfo
+    _ET = None  # fallback: use fixed UTC offsets
+
+_MARKET_OPEN_HOUR = 9    # 09:30 ET
+_MARKET_OPEN_MIN = 30
+_MARKET_CLOSE_HOUR = 16  # 16:00 ET
 
 
 def _log(msg):
@@ -51,12 +61,19 @@ def _db_conn():
 
 
 def _is_market_hours():
-    """Check if US equity market is roughly open (UTC)."""
+    """Check if US equity market is open (DST-aware via America/New_York)."""
+    if _ET is not None:
+        now_et = datetime.now(_ET)
+        weekday = now_et.weekday()
+        if weekday >= 5:
+            return False
+        t = now_et.hour * 60 + now_et.minute
+        return (_MARKET_OPEN_HOUR * 60 + _MARKET_OPEN_MIN) <= t < (_MARKET_CLOSE_HOUR * 60)
+    # Fallback: fixed UTC (EST, conservative)
     now = datetime.now(timezone.utc)
-    weekday = now.weekday()  # 0=Mon, 6=Sun
-    if weekday >= 5:
+    if now.weekday() >= 5:
         return False
-    return US_MARKET_OPEN_UTC <= now.hour < US_MARKET_CLOSE_UTC
+    return 14 <= now.hour < 21
 
 
 def _fetch_prices():
