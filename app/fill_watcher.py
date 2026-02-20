@@ -129,6 +129,9 @@ def _poll_cycle(ex):
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
+            # Reconcile + auto-heal every 5th cycle
+            _reconcile_and_heal(ex, cur)
+
             cur.execute("""
                 SELECT id, order_id, order_type, direction, signal_id, decision_id,
                        close_reason, requested_qty, ticker_price, status,
@@ -338,6 +341,11 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
     _update_position_order_state(cur, 'FILLED',
                                   filled_qty=filled_qty,
                                   filled_usdt=avg_price * filled_qty)
+    # PLAN state: ENTERING → OPEN
+    try:
+        cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s;", (SYMBOL,))
+    except Exception as e:
+        log(f'plan_state PLAN.OPEN update error: {e}')
 
     msg = report_formatter.format_fill_notify('entry',
         direction=direction, avg_price=avg_price, filled_qty=filled_qty,
@@ -396,6 +404,11 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
     if position_verified:
         _sync_position_state(cur, None, 0)
         _update_position_order_state(cur, 'NONE')
+        # PLAN state: EXITING → NONE
+        try:
+            cur.execute("UPDATE position_state SET plan_state = 'PLAN.NONE' WHERE symbol = %s;", (SYMBOL,))
+        except Exception as e:
+            log(f'plan_state PLAN.NONE update error: {e}')
 
     # Backfill pnl_after_trade in trade_process_log for the originating signal
     if realized_pnl is not None and signal_id:
@@ -418,6 +431,16 @@ def _handle_timeout(cur, eid, order_id, order_type, direction, signal_id):
     """, (eid,))
     _update_stage(cur, signal_id, 'ORDER_TIMEOUT')
     _update_position_order_state(cur, 'TIMEOUT')
+    # Reset plan_state based on whether position still exists
+    try:
+        cur.execute("SELECT side, total_qty FROM position_state WHERE symbol = %s;", (SYMBOL,))
+        ps_row = cur.fetchone()
+        if ps_row and ps_row[0] and float(ps_row[1] or 0) > 0:
+            cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s;", (SYMBOL,))
+        else:
+            cur.execute("UPDATE position_state SET plan_state = 'PLAN.NONE' WHERE symbol = %s;", (SYMBOL,))
+    except Exception as e:
+        log(f'plan_state timeout reset error: {e}')
     msg = report_formatter.format_fill_notify('timeout',
         order_type=order_type, direction=direction, order_id=order_id,
         timeout_sec=ORDER_TIMEOUT_SEC)
@@ -433,10 +456,116 @@ def _handle_canceled(cur, eid, order_id, order_type, direction, signal_id):
     """, (eid,))
     _update_stage(cur, signal_id, 'ORDER_CANCELED')
     _update_position_order_state(cur, 'CANCELED')
+    # Reset plan_state based on whether position still exists
+    try:
+        cur.execute("SELECT side, total_qty FROM position_state WHERE symbol = %s;", (SYMBOL,))
+        ps_row = cur.fetchone()
+        if ps_row and ps_row[0] and float(ps_row[1] or 0) > 0:
+            cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s;", (SYMBOL,))
+        else:
+            cur.execute("UPDATE position_state SET plan_state = 'PLAN.NONE' WHERE symbol = %s;", (SYMBOL,))
+    except Exception as e:
+        log(f'plan_state cancel reset error: {e}')
     msg = report_formatter.format_fill_notify('canceled',
         order_type=order_type, direction=direction, order_id=order_id)
     _send_telegram(msg)
     log(f'CANCELED: {order_type} {direction} order_id={order_id}')
+
+
+_reconcile_cycle_count = 0
+
+
+def _reconcile_and_heal(ex, cur):
+    """Called every 5th poll cycle (~25 seconds). Check exchange vs DB and auto-heal."""
+    global _reconcile_cycle_count
+    _reconcile_cycle_count += 1
+    if _reconcile_cycle_count % 5 != 0:
+        return
+
+    try:
+        import exchange_reader
+        exch_data = exchange_reader.fetch_position()
+        strat_data = exchange_reader.fetch_position_strat()
+        recon_result = exchange_reader.reconcile(exch_data, strat_data)
+
+        if recon_result['status'] != 'RECONCILE.MISMATCH' or not recon_result['needs_healing']:
+            return
+
+        exch_pos = exch_data.get('exchange_position', 'UNKNOWN')
+        detail = recon_result['detail']
+
+        # Case A: Exchange=NONE, DB thinks position → reset DB to PLAN.NONE
+        if exch_pos == 'NONE' and 'exch_none' in detail:
+            # Check if this has persisted (wait at least 60s before healing)
+            cur.execute("SELECT state_changed_at FROM position_state WHERE symbol = %s;", (SYMBOL,))
+            row = cur.fetchone()
+            if row and row[0]:
+                from datetime import datetime, timezone
+                age_sec = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)
+                           if row[0].tzinfo is None
+                           else datetime.now(timezone.utc) - row[0]).total_seconds()
+                if age_sec < 60:
+                    return  # too fresh, wait
+            cur.execute("""
+                UPDATE position_state SET
+                    side = NULL, total_qty = 0, avg_entry_price = 0,
+                    stage = 0, capital_used_usdt = 0, trade_budget_used_pct = 0,
+                    order_state = 'NONE', planned_qty = 0, filled_qty = 0,
+                    planned_usdt = 0, sent_usdt = 0, filled_usdt = 0,
+                    plan_state = 'PLAN.NONE',
+                    state_changed_at = now(), updated_at = now()
+                WHERE symbol = %s;
+            """, (SYMBOL,))
+            log(f'RECONCILE HEAL: DB reset to PLAN.NONE (exchange=NONE, {detail})')
+            _send_telegram(f'⚠ RECONCILE 자동복구: DB→PLAN.NONE (거래소=NONE, {detail})')
+            # Audit
+            try:
+                cur.execute("""
+                    INSERT INTO live_executor_log (event, symbol, detail)
+                    VALUES ('RECONCILE_HEAL', %s, %s::jsonb);
+                """, (SYMBOL, json.dumps({'action': 'RESET_TO_FLAT', 'detail': detail})))
+            except Exception:
+                pass
+
+        # Case B: Exchange has position, DB=FLAT → sync DB from exchange
+        elif exch_pos in ('LONG', 'SHORT') and 'db_flat' in detail:
+            exch_qty = exch_data.get('exch_pos_qty', 0)
+            exch_entry = exch_data.get('exch_entry_price', 0)
+            cur.execute("""
+                UPDATE position_state SET
+                    side = %s, total_qty = %s, avg_entry_price = %s,
+                    stage = 1, order_state = 'FILLED',
+                    filled_qty = %s, filled_usdt = %s,
+                    plan_state = 'PLAN.OPEN',
+                    state_changed_at = now(), updated_at = now()
+                WHERE symbol = %s;
+            """, (exch_pos.lower(), exch_qty, exch_entry,
+                  exch_qty, exch_qty * exch_entry, SYMBOL))
+            log(f'RECONCILE HEAL: DB synced to {exch_pos} qty={exch_qty} ({detail})')
+            _send_telegram(f'⚠ RECONCILE 자동복구: DB→{exch_pos} qty={exch_qty} (거래소 동기화)')
+            try:
+                cur.execute("""
+                    INSERT INTO live_executor_log (event, symbol, detail)
+                    VALUES ('RECONCILE_HEAL', %s, %s::jsonb);
+                """, (SYMBOL, json.dumps({
+                    'action': 'SYNC_TO_EXCHANGE', 'side': exch_pos,
+                    'qty': exch_qty, 'entry': exch_entry, 'detail': detail})))
+            except Exception:
+                pass
+
+        # Case C: Qty mismatch → update DB qty to match exchange
+        elif 'qty_diff' in detail:
+            exch_qty = exch_data.get('exch_pos_qty', 0)
+            cur.execute("""
+                UPDATE position_state SET
+                    total_qty = %s, filled_qty = %s,
+                    updated_at = now()
+                WHERE symbol = %s;
+            """, (exch_qty, exch_qty, SYMBOL))
+            log(f'RECONCILE HEAL: qty synced to {exch_qty} ({detail})')
+
+    except Exception as e:
+        log(f'_reconcile_and_heal error: {e}')
 
 
 def _update_eq_status(cur, eq_id, status):
@@ -555,6 +684,11 @@ def _handle_add_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
         pos_side=pos_side, pos_qty=pos_qty, budget_used_pct=budget_used_pct,
         budget_remaining=budget_remaining)
     _send_telegram(msg)
+    # PLAN state: stays OPEN after ADD
+    try:
+        cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s;", (SYMBOL,))
+    except Exception as e:
+        log(f'plan_state ADD update error: {e}')
     log(f'ADD VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={new_stage} budget={budget_used_pct:.0f}%')
 
 
@@ -641,6 +775,11 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
     """, (pos_side, pos_qty, position_verified, realized_pnl, eid))
 
     _sync_position_state(cur, None, 0)
+    # PLAN state: NONE after reverse_close
+    try:
+        cur.execute("UPDATE position_state SET plan_state = 'PLAN.NONE' WHERE symbol = %s;", (SYMBOL,))
+    except Exception as e:
+        log(f'plan_state REVERSE_CLOSE update error: {e}')
 
     msg = report_formatter.format_fill_notify('reverse_close',
         direction=direction, avg_price=avg_price, filled_qty=filled_qty,
@@ -701,6 +840,11 @@ def _handle_reverse_open_filled(ex, cur, eid, order_id, direction, filled_qty, a
         from_side=from_side, pos_side=pos_side, pos_qty=pos_qty,
         entry_pct=entry_pct, start_stage=start_stage)
     _send_telegram(msg)
+    # PLAN state: OPEN after reverse_open
+    try:
+        cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s;", (SYMBOL,))
+    except Exception as e:
+        log(f'plan_state REVERSE_OPEN update error: {e}')
     log(f'REVERSE_OPEN VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={start_stage}')
 
 

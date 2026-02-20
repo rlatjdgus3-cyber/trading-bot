@@ -34,6 +34,7 @@ class StaticRangeStrategy(ModeStrategy):
         rp = features.get('range_position')
         impulse = features.get('impulse')
         candles = ctx.get('candles', [])
+        drift_dir = features.get('drift_direction', 'NONE')
 
         if price is None or vah is None or val is None:
             return self._hold('MODE_A: missing price/vah/val data')
@@ -41,6 +42,8 @@ class StaticRangeStrategy(ModeStrategy):
         rp_long = config.get('range_position_long', 0.15)
         rp_short = config.get('range_position_short', 0.85)
         anti_chase_max = config.get('anti_chase_impulse_max', 0.6)
+        edge_buffer_pct = config.get('edge_buffer_pct', 0.001)
+        order_ttl_sec = config.get('order_ttl_sec', 300)
 
         # ── If position exists: evaluate ADD or EXIT ──
         if position and position.get('side'):
@@ -52,22 +55,42 @@ class StaticRangeStrategy(ModeStrategy):
 
         side = None
         reason_parts = []
+        signal_level = 0  # S0=observe, S1=entry, S2=conviction
 
         # LONG: near VAL
         if rp <= rp_long:
             side = 'LONG'
             reason_parts.append(f'range_pos={rp:.3f} <= {rp_long} (near VAL)')
+            signal_level = 2 if rp <= rp_long * 0.5 else 1
         # SHORT: near VAH
         elif rp >= rp_short:
             side = 'SHORT'
             reason_parts.append(f'range_pos={rp:.3f} >= {rp_short} (near VAH)')
+            signal_level = 2 if rp >= 1.0 - (1.0 - rp_short) * 0.5 else 1
         else:
             return self._hold(f'MODE_A: mid-range (rp={rp:.3f}), no edge entry')
 
+        # Drift handling: favor drift direction
+        if drift_dir == 'UP' and side == 'SHORT':
+            signal_level = max(0, signal_level - 1)
+            reason_parts.append('drift=UP, SHORT demoted')
+        elif drift_dir == 'DOWN' and side == 'LONG':
+            signal_level = max(0, signal_level - 1)
+            reason_parts.append('drift=DOWN, LONG demoted')
+        elif drift_dir == 'UP' and side == 'LONG':
+            reason_parts.append('drift=UP, LONG favored')
+        elif drift_dir == 'DOWN' and side == 'SHORT':
+            reason_parts.append('drift=DOWN, SHORT favored')
+
+        # S0 = observe only, no entry
+        if signal_level == 0:
+            return self._hold(
+                f'MODE_A: signal_level=S0 (observe) for {side}',
+                meta={'signal_level': 'S0', 'near_edge': True}
+            )
+
         # Anti-chase: block if prior candle impulse > threshold in entry direction
-        chase_entry = False
         if impulse is not None and impulse > anti_chase_max:
-            # Check if impulse is in entry direction
             if len(candles) >= 1:
                 last = candles[0] if isinstance(candles[0], dict) else {}
                 c_open = last.get('o') or last.get('open')
@@ -75,7 +98,6 @@ class StaticRangeStrategy(ModeStrategy):
                 if c_open is not None and c_close is not None:
                     candle_dir = 'LONG' if float(c_close) > float(c_open) else 'SHORT'
                     if candle_dir == side:
-                        chase_entry = True
                         return self._hold(
                             f'MODE_A: ANTI_CHASE — impulse={impulse:.2f} > {anti_chase_max} '
                             f'in {side} direction',
@@ -87,11 +109,12 @@ class StaticRangeStrategy(ModeStrategy):
         if not confirmed:
             return self._hold(
                 f'MODE_A: waiting confirmation for {side} (rp={rp:.3f})',
-                meta={'near_edge': True}
+                meta={'near_edge': True, 'signal_level': f'S{signal_level}'}
             )
 
-        # Compute TP/SL
+        # Compute TP/SL with edge buffer
         level_price = val if side == 'LONG' else vah
+        limit_price = level_price * (1 + edge_buffer_pct) if side == 'LONG' else level_price * (1 - edge_buffer_pct)
         atr_val = self._get_atr_from_ctx(ctx)
         tp = risk.compute_tp('A', price, side, poc, config)
         sl = risk.compute_sl('A', price, side, atr_val, level_price, config)
@@ -100,11 +123,11 @@ class StaticRangeStrategy(ModeStrategy):
         signal_key = dedupe.make_signal_key(
             features.get('symbol', 'BTC/USDT:USDT'), 'A', side, stage=1)
 
-        reason_parts.append('edge confirmed')
+        reason_parts.append(f'edge confirmed (S{signal_level})')
         return {
             'action': 'ENTER',
             'side': side,
-            'qty': None,  # qty computed by caller based on capital
+            'qty': None,
             'tp': tp,
             'sl': sl,
             'reason': f'MODE_A ENTER: {"; ".join(reason_parts)}',
@@ -115,6 +138,10 @@ class StaticRangeStrategy(ModeStrategy):
                 'leverage': leverage,
                 'range_position': rp,
                 'mode': 'A',
+                'signal_level': f'S{signal_level}',
+                'limit_price': round(limit_price, 2),
+                'order_ttl_sec': order_ttl_sec,
+                'drift_direction': drift_dir,
             },
         }
 

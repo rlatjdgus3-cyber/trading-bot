@@ -176,6 +176,14 @@ def enforce_exposure_cap(ex, requested_usdt, cur=None):
 # ============================================================
 # DB utilities
 # ============================================================
+def _generate_client_order_id(action_type, direction):
+    """Generate unique client order ID for Bybit orderLinkId."""
+    import uuid
+    action = (action_type or 'UNK')[:6].upper()
+    dirn = (direction or 'UNK')[:1].upper()
+    return f"OC_{action}_{dirn}_{uuid.uuid4().hex[:8]}_{int(time.time())}"
+
+
 def ensure_log_table(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.live_executor_log (
@@ -198,7 +206,9 @@ def audit(cur, event: str, symbol: str = None, detail: dict = None):
 def trade_switch_on(cur) -> bool:
     cur.execute("SELECT enabled FROM trade_switch ORDER BY id DESC LIMIT 1;")
     row = cur.fetchone()
-    return bool(row and row[0])
+    if row is None:
+        return True  # default ON when no row exists
+    return bool(row[0])
 
 
 ONCE_LOCK_TTL_MIN = 60  # was 1440 (24h→1h) — scalp re-entry
@@ -339,19 +349,21 @@ def _update_eq_status(cur, eq_id, status):
 
 
 def _insert_exec_log(cur, order, order_type, direction, qty, reason,
-                     eq_id, pos_side=None, pos_qty=None, usdt=None, price=None):
+                     eq_id, pos_side=None, pos_qty=None, usdt=None, price=None,
+                     client_order_id=None):
     """Insert into execution_log so fill_watcher can track this order."""
     cur.execute("""
         INSERT INTO execution_log
-            (order_id, symbol, order_type, direction,
+            (order_id, client_order_id, symbol, order_type, direction,
              close_reason, requested_qty, requested_usdt, ticker_price,
              status, raw_order_response,
              source_queue, execution_queue_id,
              position_before_side, position_before_qty)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'SENT', %s::jsonb, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'SENT', %s::jsonb, %s, %s, %s, %s)
         RETURNING id;
     """, (
         order.get("id", ""),
+        client_order_id,
         SYMBOL,
         order_type,
         direction,
@@ -385,28 +397,34 @@ def _process_execution_queue(ex, cur, pos_side, pos_qty, entry_enabled=True):
 
 
 def _update_position_order_state(cur, eq_id, action_type, direction, target_usdt):
-    """Update position_state.order_state to SENT when EQ item is picked.
+    """Update position_state.order_state + plan_state when EQ item is picked.
     Records planned_qty/planned_usdt for entry actions."""
+    import plan_state as ps
     try:
-        if action_type in ('ADD', 'REVERSE_OPEN'):
+        if action_type in ('ADD', 'REVERSE_OPEN', 'OPEN'):
+            # Entry actions → PLAN.ENTERING
             usdt = float(target_usdt or 0)
             cur.execute("""
                 UPDATE position_state SET
                     order_state = 'SENT',
+                    plan_state = %s,
                     planned_usdt = %s,
                     sent_usdt = %s,
                     last_order_ts = now(),
                     state_changed_at = now()
                 WHERE symbol = %s;
-            """, (usdt, usdt, SYMBOL))
-        elif action_type in ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE'):
+            """, (ps.PLAN_ENTERING, usdt, usdt, SYMBOL))
+        elif action_type in ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE',
+                             'STOP_LOSS', 'EMERGENCY_CLOSE', 'SCHEDULED_CLOSE'):
+            # Exit actions → PLAN.EXITING
             cur.execute("""
                 UPDATE position_state SET
                     order_state = 'SENT',
+                    plan_state = %s,
                     last_order_ts = now(),
                     state_changed_at = now()
                 WHERE symbol = %s;
-            """, (SYMBOL,))
+            """, (ps.PLAN_EXITING, SYMBOL))
     except Exception as e:
         log(f"_update_position_order_state error (eq_id={eq_id}): {e}")
 
@@ -517,7 +535,8 @@ def _eq_handle_close(ex, cur, eq_id, direction, pos_side, pos_qty, reason):
         return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "CLOSE", pos_side.upper(), pos_qty, reason,
-                     eq_id, pos_side, pos_qty)
+                     eq_id, pos_side, pos_qty,
+                     client_order_id=order.get('_client_order_id'))
     audit(cur, "EQ_CLOSE_SENT", SYMBOL, {
         "eq_id": eq_id, "side": pos_side, "qty": float(pos_qty),
         "order_id": order.get("id"), "reason": reason,
@@ -576,7 +595,8 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
         return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REDUCE", pos_side.upper(), qty, reason,
-                     eq_id, pos_side, pos_qty)
+                     eq_id, pos_side, pos_qty,
+                     client_order_id=order.get('_client_order_id'))
     audit(cur, "EQ_REDUCE_SENT", SYMBOL, {
         "eq_id": eq_id, "side": pos_side, "qty": float(qty),
         "order_id": order.get("id"), "reason": reason,
@@ -636,7 +656,8 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
         return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "ADD", dir_upper, amount, reason,
-                     eq_id, usdt=usdt, price=exec_price)
+                     eq_id, usdt=usdt, price=exec_price,
+                     client_order_id=order.get('_client_order_id'))
     # Record last_order_id in position_state
     try:
         cur.execute("UPDATE position_state SET last_order_id = %s WHERE symbol = %s;",
@@ -679,7 +700,8 @@ def _eq_handle_reverse_close(ex, cur, eq_id, direction, pos_side, pos_qty, reaso
         return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REVERSE_CLOSE", pos_side.upper(), pos_qty, reason,
-                     eq_id, pos_side, pos_qty)
+                     eq_id, pos_side, pos_qty,
+                     client_order_id=order.get('_client_order_id'))
     audit(cur, "EQ_REVERSE_CLOSE_SENT", SYMBOL, {
         "eq_id": eq_id, "side": pos_side, "qty": float(pos_qty),
         "order_id": order.get("id"), "reason": reason,
@@ -739,7 +761,8 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason, meta
         return
     _update_eq_status(cur, eq_id, "SENT")
     _insert_exec_log(cur, order, "REVERSE_OPEN", dir_upper, amount, reason,
-                     eq_id, usdt=usdt, price=exec_price)
+                     eq_id, usdt=usdt, price=exec_price,
+                     client_order_id=order.get('_client_order_id'))
     # Record last_order_id in position_state
     try:
         cur.execute("UPDATE position_state SET last_order_id = %s WHERE symbol = %s;",
@@ -821,12 +844,14 @@ def place_close_order(ex, side: str, qty: float, cur=None):
 
     final_qty = comp.corrected_qty if comp.corrected_qty is not None else qty
 
-    params = {"reduceOnly": True}
+    coid = _generate_client_order_id('CLOSE', side)
+    params = {"reduceOnly": True, "orderLinkId": coid}
     try:
         if side == "long":
             order = ex.create_market_sell_order(SYMBOL, final_qty, params)
         else:
             order = ex.create_market_buy_order(SYMBOL, final_qty, params)
+        order['_client_order_id'] = coid
         ecl.record_order_sent(SYMBOL, side=side)
         ecl.record_success(SYMBOL)
         if cur:
@@ -965,18 +990,22 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
 
     final_amount = comp.corrected_qty if comp.corrected_qty is not None else amount
 
+    coid = _generate_client_order_id('OPEN', direction)
+    open_params = {'orderLinkId': coid}
     try:
         if direction == "LONG":
-            order = ex.create_market_buy_order(SYMBOL, final_amount)
+            order = ex.create_market_buy_order(SYMBOL, final_amount, params=open_params)
         else:
-            order = ex.create_market_sell_order(SYMBOL, final_amount)
+            order = ex.create_market_sell_order(SYMBOL, final_amount, params=open_params)
+        order['_client_order_id'] = coid
         ecl.record_order_sent(SYMBOL, price=price, side=direction.lower())
         ecl.record_success(SYMBOL)
         if cur:
             ecl.log_compliance_event(
                 cur, 'ORDER_SENT', SYMBOL, order_params,
                 compliance_passed=True,
-                detail={'corrected': comp.was_corrected, 'final_amount': final_amount})
+                detail={'corrected': comp.was_corrected, 'final_amount': final_amount,
+                        'client_order_id': coid})
             order_throttle.record_attempt(cur, 'OPEN', direction, 'SUCCESS')
         order_throttle.handle_success('OPEN')
         return order, price, final_amount

@@ -103,17 +103,33 @@ class VolatileRangeStrategy(ModeStrategy):
         if effective_drift == 'DOWN' and side == 'LONG':
             return self._hold(f'MODE_B: drift=DOWN, blocking LONG entry')
 
+        # ── Require spread_ok + liquidity_ok if configured ──
+        if config.get('require_spread_ok', True) and not features.get('spread_ok', True):
+            return self._hold('MODE_B: spread too wide, entry blocked')
+        if config.get('require_liquidity_ok', True) and not features.get('liquidity_ok', True):
+            return self._hold('MODE_B: liquidity too low, entry blocked')
+
         # ── Require retest (not first touch) ──
         is_retest = self._check_retest(candles, side, poc)
         if not is_retest:
             return self._hold(
                 f'MODE_B: first touch at trade zone for {side}, waiting retest')
 
-        # Compute TP/SL
+        # Compute TP/SL — shorter TP target (box midpoint instead of opposite edge)
         atr_val = self._get_atr_from_ctx(ctx)
-        tp = risk.compute_tp('B', price, side, poc, config)
+        # Use midpoint between POC and edge as TP target
+        if side == 'LONG' and vah is not None:
+            mid_tp_target = (poc + vah) / 2
+        elif side == 'SHORT' and val is not None:
+            mid_tp_target = (poc + val) / 2
+        else:
+            mid_tp_target = poc
+        tp = risk.compute_tp('B', price, side, mid_tp_target, config)
         sl = risk.compute_sl('B', price, side, atr_val, None, config)
         leverage = risk.clamp_leverage('B', 3, config)
+
+        # Apply size_multiplier (70% of normal sizing)
+        size_multiplier = config.get('size_multiplier', 0.7)
 
         signal_key = dedupe.make_signal_key(
             features.get('symbol', 'BTC/USDT:USDT'), 'B', side, stage=1)
@@ -133,6 +149,7 @@ class VolatileRangeStrategy(ModeStrategy):
                 'leverage': leverage,
                 'drift_submode': effective_drift,
                 'mode': 'B',
+                'size_multiplier': size_multiplier,
             },
         }
 

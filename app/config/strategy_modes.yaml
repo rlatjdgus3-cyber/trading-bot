@@ -16,6 +16,13 @@ mode_a_static_range:
   range_position_long: 0.15
   range_position_short: 0.85
   anti_chase_impulse_max: 0.6
+  # Step 10: new config keys
+  edge_buffer_pct: 0.001
+  order_ttl_sec: 300
+  signal_levels:
+    S0_observe: 0
+    S1_entry: 1
+    S2_conviction: 2
 
 mode_b_volatile_range:
   adx_max: 25
@@ -27,6 +34,10 @@ mode_b_volatile_range:
   max_add_stages: 2
   rebuild_cooldown_candles: 10
   leverage: [3, 5]
+  # Step 10: new config keys
+  size_multiplier: 0.7
+  require_spread_ok: true
+  require_liquidity_ok: true
 
 mode_c_shock_breakout:
   volume_z_min: 2.0
@@ -38,3 +49,7 @@ mode_c_shock_breakout:
   sl_atr_multiplier: 1.5
   max_add_stages: 2
   leverage: [3, 8]
+  # Step 10: new config keys
+  news_override_min_score: 60
+  news_override_confirmation_candles: 1
+  trailing_stop_enabled: true

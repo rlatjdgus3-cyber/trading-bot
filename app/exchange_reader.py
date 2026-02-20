@@ -163,34 +163,52 @@ def fetch_position_strat(symbol=None):
     try:
         conn = _db()
         with conn.cursor() as cur:
-            # Try v2 query with new columns
+            # Try v3 query with plan_state column
             try:
                 cur.execute("""
                     SELECT side, total_qty, avg_entry_price, stage,
                            capital_used_usdt, trade_budget_used_pct,
                            order_state, planned_qty, filled_qty,
-                           planned_usdt, filled_usdt, last_order_id
+                           planned_usdt, filled_usdt, last_order_id,
+                           plan_state
                     FROM position_state WHERE symbol = %s;
                 """, (sym,))
                 row = cur.fetchone()
                 has_v2 = True
+                has_v3 = True if row and len(row) > 12 else False
             except Exception:
-                # v2 columns not present, fallback to v1
+                # v3 plan_state not present, try v2
                 conn.rollback() if hasattr(conn, 'rollback') else None
-                cur.execute("""
-                    SELECT side, total_qty, avg_entry_price, stage,
-                           capital_used_usdt, trade_budget_used_pct
-                    FROM position_state WHERE symbol = %s;
-                """, (sym,))
-                row = cur.fetchone()
-                has_v2 = False
+                try:
+                    cur.execute("""
+                        SELECT side, total_qty, avg_entry_price, stage,
+                               capital_used_usdt, trade_budget_used_pct,
+                               order_state, planned_qty, filled_qty,
+                               planned_usdt, filled_usdt, last_order_id
+                        FROM position_state WHERE symbol = %s;
+                    """, (sym,))
+                    row = cur.fetchone()
+                    has_v2 = True
+                    has_v3 = False
+                except Exception:
+                    # v2 columns not present, fallback to v1
+                    conn.rollback() if hasattr(conn, 'rollback') else None
+                    cur.execute("""
+                        SELECT side, total_qty, avg_entry_price, stage,
+                               capital_used_usdt, trade_budget_used_pct
+                        FROM position_state WHERE symbol = %s;
+                    """, (sym,))
+                    row = cur.fetchone()
+                    has_v2 = False
+                    has_v3 = False
 
         if row and row[0]:
             order_state = row[6] if has_v2 and len(row) > 6 else None
+            plan_state_col = row[12] if has_v3 and len(row) > 12 else None
             result = {
                 'source': 'STRATEGY_DB',
                 'data_status': 'OK',
-                'strategy_state': _map_strategy_state(row[0], row[3], order_state),
+                'strategy_state': _map_strategy_state(row[0], row[3], order_state, plan_state_col),
                 'side': row[0],
                 'planned_stage_qty': float(row[1] or 0),
                 'avg_entry_price': float(row[2] or 0),
@@ -205,6 +223,8 @@ def fetch_position_strat(symbol=None):
                 result['planned_usdt'] = float(row[9] or 0)
                 result['filled_usdt'] = float(row[10] or 0)
                 result['last_order_id'] = row[11]
+            if has_v3 and len(row) > 12:
+                result['plan_state'] = row[12] or 'PLAN.NONE'
             return result
         return {
             'source': 'STRATEGY_DB',
@@ -239,65 +259,108 @@ def fetch_position_strat(symbol=None):
                 pass
 
 
-def _map_strategy_state(side, stage, order_state=None):
-    """Map DB side+stage+order_state into human-readable strategy state.
-    If order_state column exists, use 9-stage mapping; otherwise fallback to 3-stage.
+def _map_strategy_state(side, stage, order_state=None, plan_state_col=None):
+    """Map DB side+stage+order_state into PLAN.* state using plan_state module.
+    Falls back to legacy strings for callers not yet migrated.
     """
-    if not side:
-        return 'FLAT'
-    # 9-stage mapping when order_state is available
-    if order_state is not None:
-        os_upper = (order_state or 'NONE').upper()
-        mapping = {
-            'NONE': 'FLAT',
-            'PENDING': 'INTENT_ENTER',
-            'SENT': 'ORDER_SENT',
-            'ACKED': 'ORDER_ACKED',
-            'PARTIAL': 'PARTIAL_FILLED',
-            'FILLED': 'IN_POSITION',
-            'CANCELED': 'CANCELED',
-            'REJECTED': 'REJECTED',
-            'TIMEOUT': 'WAIT_EXCHANGE_SYNC',
-        }
-        mapped = mapping.get(os_upper)
-        if mapped:
-            # FILLED with stage > 0 → IN_POSITION
-            if os_upper == 'FILLED' and int(stage or 0) > 0:
-                return 'IN_POSITION'
-            return mapped
-    # Fallback: 3-stage mapping (backward compat)
-    stage = int(stage or 0)
-    if stage == 0:
-        return 'INTENT_ENTER'
-    return 'IN_POSITION'
+    import plan_state as ps
+    return ps.map_db_to_plan(side, stage, order_state, plan_state_col)
+
+
+def _map_strategy_state_legacy(side, stage, order_state=None):
+    """Legacy wrapper returning old-style strings for gradual migration.
+    Returns: FLAT, INTENT_ENTER, IN_POSITION, ORDER_SENT, etc."""
+    import plan_state as ps
+    return ps.map_legacy(side, stage, order_state)
 
 
 # ── Reconcile ────────────────────────────────────────────
 
 
 def reconcile(exch, strat):
-    """Compare exchange position vs strategy DB. Returns MATCH/MISMATCH/UNKNOWN."""
+    """Compare exchange position vs strategy DB.
+
+    Returns structured dict:
+        {
+            'status': 'RECONCILE.OK' | 'RECONCILE.MISMATCH' | 'RECONCILE.UNKNOWN',
+            'detail': str,
+            'needs_healing': bool,
+            'legacy': 'MATCH' | 'MISMATCH' | 'UNKNOWN',  # backward compat
+        }
+    """
     if exch.get('data_status') == 'ERROR' or strat.get('data_status') == 'ERROR':
-        return 'UNKNOWN'
+        return {
+            'status': 'RECONCILE.UNKNOWN',
+            'detail': 'data_status ERROR',
+            'needs_healing': False,
+            'legacy': 'UNKNOWN',
+        }
     exch_pos = exch.get('exchange_position', 'UNKNOWN')
     strat_side = (strat.get('side') or '').upper()
     strat_state = strat.get('strategy_state', 'FLAT')
+    plan_state = strat.get('plan_state', '')
+
     # Both flat
-    if exch_pos == 'NONE' and strat_state == 'FLAT':
-        return 'MATCH'
+    if exch_pos == 'NONE' and strat_state in ('FLAT', 'PLAN.NONE'):
+        return {
+            'status': 'RECONCILE.OK',
+            'detail': 'both_flat',
+            'needs_healing': False,
+            'legacy': 'MATCH',
+        }
+
     # Both have position — compare side and rough qty
     if exch_pos in ('LONG', 'SHORT') and strat_side == exch_pos:
         exch_qty = exch.get('exch_pos_qty', 0)
         strat_qty = strat.get('planned_stage_qty', 0)
         if strat_qty > 0 and abs(exch_qty - strat_qty) / strat_qty < 0.05:
-            return 'MATCH'
-        return 'MISMATCH'
-    # One has position, other doesn't
-    if exch_pos == 'NONE' and strat_state != 'FLAT':
-        return 'MISMATCH'
-    if exch_pos != 'NONE' and strat_state == 'FLAT':
-        return 'MISMATCH'
-    return 'MISMATCH'
+            return {
+                'status': 'RECONCILE.OK',
+                'detail': f'side_match qty_match: exch={exch_qty} strat={strat_qty}',
+                'needs_healing': False,
+                'legacy': 'MATCH',
+            }
+        return {
+            'status': 'RECONCILE.MISMATCH',
+            'detail': f'qty_diff: exch={exch_qty} strat={strat_qty}',
+            'needs_healing': True,
+            'legacy': 'MISMATCH',
+        }
+
+    # Exchange NONE but DB thinks position exists
+    if exch_pos == 'NONE' and strat_state not in ('FLAT', 'PLAN.NONE'):
+        # Check if it's an intent state — may not need healing yet
+        import plan_state as ps
+        is_intent = ps.is_intent_state(plan_state) if plan_state else False
+        return {
+            'status': 'RECONCILE.MISMATCH',
+            'detail': f'exch_none_plan_{plan_state or strat_state}',
+            'needs_healing': not is_intent,  # intent states might resolve naturally
+            'legacy': 'MISMATCH',
+        }
+
+    # Exchange has position but DB says flat
+    if exch_pos != 'NONE' and strat_state in ('FLAT', 'PLAN.NONE'):
+        return {
+            'status': 'RECONCILE.MISMATCH',
+            'detail': f'exch_{exch_pos}_db_flat',
+            'needs_healing': True,
+            'legacy': 'MISMATCH',
+        }
+
+    # Side mismatch
+    return {
+        'status': 'RECONCILE.MISMATCH',
+        'detail': f'side_mismatch: exch={exch_pos} strat={strat_side}',
+        'needs_healing': True,
+        'legacy': 'MISMATCH',
+    }
+
+
+def reconcile_status_str(exch, strat):
+    """Legacy wrapper returning 'MATCH'/'MISMATCH'/'UNKNOWN' string."""
+    result = reconcile(exch, strat)
+    return result['legacy']
 
 
 # ── Wait Reason ──────────────────────────────────────────
@@ -390,6 +453,17 @@ def compute_wait_reason(cur=None, gate_status=None):
                     return ('WAIT_SIGNAL', 'SHOCK 모드: 진입 차단')
         except Exception:
             pass  # FAIL-OPEN: default message
+
+        # 5. Liquidity/spread check
+        try:
+            from strategy.common.features import build_feature_snapshot
+            feat = build_feature_snapshot(cur)
+            if feat.get('spread_ok') is False:
+                return ('WAIT_LIQUIDITY', '슬리피지/스프레드 불량 — 주문 보류')
+            if feat.get('liquidity_ok') is False:
+                return ('WAIT_LIQUIDITY', '유동성 부족 — 주문 보류')
+        except Exception:
+            pass  # FAIL-OPEN: feature check failure does not block
 
         return ('WAIT_SIGNAL', '모든 조건 통과, 신호 대기 중')
     except Exception as e:
@@ -614,7 +688,8 @@ def build_report_exchange_block():
     exch = fetch_position()
     strat = fetch_position_strat()
     orders_data = fetch_open_orders()
-    recon = reconcile(exch, strat)
+    recon_result = reconcile(exch, strat)
+    recon = recon_result['legacy']  # backward compat for report block
     switch = fetch_trade_switch_status()
 
     conn = None
@@ -711,8 +786,8 @@ def check_and_recover_mismatch(cur, exch_pos, strat_pos, ttl_minutes=10):
     if exch_position == 'UNKNOWN' or strat_state == 'UNKNOWN':
         return (False, 'SKIP', 'data incomplete')
 
-    recon = reconcile(exch_pos, strat_pos)
-    if recon != 'MISMATCH':
+    recon_result = reconcile(exch_pos, strat_pos)
+    if recon_result['legacy'] != 'MISMATCH':
         return (False, 'OK', 'no mismatch')
 
     # Case A: Exchange=NONE but DB thinks we have a position intent
@@ -734,7 +809,7 @@ def check_and_recover_mismatch(cur, exch_pos, strat_pos, ttl_minutes=10):
                 if age_min < ttl_minutes:
                     return (False, 'WAIT', f'mismatch age={age_min:.0f}m < ttl={ttl_minutes}m')
 
-                # TTL exceeded → reset to FLAT (including v2 columns)
+                # TTL exceeded → reset to FLAT (including v2/v3 columns)
                 cur.execute("""
                     UPDATE position_state
                     SET side = NULL, total_qty = 0, avg_entry_price = 0,
@@ -742,6 +817,7 @@ def check_and_recover_mismatch(cur, exch_pos, strat_pos, ttl_minutes=10):
                         order_state = 'NONE', planned_qty = 0, filled_qty = 0,
                         planned_usdt = 0, sent_usdt = 0, filled_usdt = 0,
                         last_order_id = NULL, last_order_ts = NULL,
+                        plan_state = 'PLAN.NONE',
                         state_changed_at = now(),
                         updated_at = now()
                     WHERE symbol = %s;
@@ -764,6 +840,7 @@ def check_and_recover_mismatch(cur, exch_pos, strat_pos, ttl_minutes=10):
                 SET side = %s, total_qty = %s, avg_entry_price = %s,
                     stage = 1, order_state = 'FILLED',
                     filled_qty = %s, filled_usdt = %s,
+                    plan_state = 'PLAN.OPEN',
                     state_changed_at = now(), updated_at = now()
                 WHERE symbol = %s;
             """, (exch_position.lower(), exch_qty, exch_entry,

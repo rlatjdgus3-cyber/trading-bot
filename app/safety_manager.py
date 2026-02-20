@@ -176,11 +176,23 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
         limits = _load_safety_limits(cur)
 
     # Service health check (신규 포지션 차단)
+    # Uses health scorer for degraded-mode sizing; critical errors still fully block.
     if not emergency and not manual_override:
         svc_ok, svc_reason = check_service_health()
         if not svc_ok:
-            _log(f'Service health block: {svc_reason}')
-            return (False, f'서비스 상태 이상: {svc_reason}')
+            # Check if health score is low enough for full block (<25)
+            try:
+                import health_scorer
+                h_score, h_components = health_scorer.compute_health_score(cur)
+                if h_score < 25:
+                    _log(f'Service health block (score={h_score}): {svc_reason}')
+                    return (False, f'서비스 상태 이상: {svc_reason}')
+                else:
+                    # Degraded but not critical — allow with reduced sizing
+                    _log(f'Service health degraded (score={h_score}): {svc_reason} — proceeding with reduced sizing')
+            except Exception:
+                _log(f'Service health block: {svc_reason}')
+                return (False, f'서비스 상태 이상: {svc_reason}')
 
     if emergency or manual_override:
         bypass_reason = 'MANUAL OVERRIDE' if manual_override else 'EMERGENCY'
@@ -250,6 +262,24 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
         return (False, f"consecutive stop-loss auto-halt ({consec_stops} stops)")
 
     return (True, 'all checks passed')
+
+
+def get_health_risk_multiplier(cur):
+    """Get health-based risk multiplier for position sizing.
+
+    Degraded state → reduce sizing instead of full block.
+    Exception: exchange/order/reconcile critical errors still fully block.
+
+    Returns: (multiplier: float, mode: str, score: int, components: dict)
+    """
+    try:
+        import health_scorer
+        score, components = health_scorer.compute_health_score(cur)
+        multiplier, mode = health_scorer.get_risk_multiplier(score)
+        return (multiplier, mode, score, components)
+    except Exception as e:
+        _log(f'health_risk_multiplier error: {e}')
+        return (1.0, 'FULL', 100, {})  # FAIL-OPEN
 
 
 def is_gate_pass(cur):

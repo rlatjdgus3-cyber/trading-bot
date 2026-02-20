@@ -43,6 +43,9 @@ WAIT_REASON_KR = {
     'WAIT_COOLDOWN': '포지션 종료 후 쿨다운 대기 (TP/SL)',
     'WAIT_DEDUPED': '동일 존/방향 신호 중복 차단 (5분 버킷)',
     'WAIT_DAILY_LIMIT': '일일 체결 한도 도달',
+    'WAIT_LIQUIDITY': '슬리피지/스프레드 불량 — 주문 보류',
+    'WAIT_RETRY': 'API 오류 후 재시도 대기',
+    'WAIT_COOLDOWN': '최근 손절/청산 이후 쿨다운',
 }
 
 
@@ -348,8 +351,10 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
 
     import exchange_reader
     recon = 'UNKNOWN'
+    recon_result = None
     if exch_pos and strat_pos:
-        recon = exchange_reader.reconcile(exch_pos, strat_pos)
+        recon_result = exchange_reader.reconcile(exch_pos, strat_pos)
+        recon = recon_result['legacy'] if isinstance(recon_result, dict) else recon_result
 
     exch_ok = exch_pos and exch_pos.get('data_status') == 'OK'
     exch_position = exch_pos.get('exchange_position', 'UNKNOWN') if exch_ok else 'UNKNOWN'
@@ -368,7 +373,7 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
     gate_ok_val = exec_ctx.get('gate_ok')
     wait_reason_val = exec_ctx.get('wait_reason', '')
     if entry_enabled is False:
-        sections.append('🔴 ENTRY OFF')
+        sections.append('🔴 EXECUTION DISABLED (trade_switch OFF) — 권고는 참고용, 실행 안 함')
     elif gate_ok_val is False:
         sections.append('🟡 GATE BLOCKED')
     elif wait_reason_val and wait_reason_val not in ('', 'N/A'):
@@ -478,13 +483,13 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
 
     sections.append('')
 
-    # ── 3) 전략(DB, 내부 기록) ──
-    sections.append('3) 전략(DB, 내부 기록 — 체결 확정 아님)')
+    # ── 3) PLAN(DB, 내부 기록) ──
+    sections.append('3) PLAN(DB, 내부 기록 — 체결 확정 아님)')
     if not strat_ok:
         error = (strat_pos or {}).get('error', 'db_error')
         sections.append(f'   - 상태: UNKNOWN ({error})')
-    elif strat_state == 'FLAT':
-        sections.append('   - 상태: FLAT (전략 포지션 없음)')
+    elif strat_state in ('FLAT', 'PLAN.NONE'):
+        sections.append('   - 상태: PLAN.NONE (전략 포지션 없음)')
     else:
         side = strat_pos.get('side', '?')
         qty = strat_pos.get('planned_stage_qty', 0)
@@ -492,7 +497,12 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
         stage = strat_pos.get('stage', 0)
         cap_used = strat_pos.get('capital_used_usdt', 0)
         budget_pct = strat_pos.get('trade_budget_used_pct', 0)
-        sections.append(f'   - 상태: {strat_state}')
+        # Show PLAN.* state with intent hint
+        display_state = strat_state
+        intent_hint = ''
+        if strat_state.startswith('PLAN.INTENT_') and exch_position == 'NONE':
+            intent_hint = ' (아직 주문/체결 아님)'
+        sections.append(f'   - 상태: {display_state}{intent_hint}')
         sections.append(f'   - 방향: {side.upper() if side else "?"}')
         sections.append(f'   - 수량: {qty}')
         sections.append(f'   - 기준가(DB): ${avg:,.2f}')
@@ -511,33 +521,6 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
             sections.append('   ※ 전략 내부 기록일 뿐 — 실제 체결/보유 아님')
 
     sections.append('')
-
-    # ── 5) 시장 환경(MCTX) ──
-    try:
-        from db_config import get_conn as _get_conn
-        _mctx_conn = _get_conn(autocommit=True)
-        with _mctx_conn.cursor() as _mctx_cur:
-            import regime_reader
-            _rctx = regime_reader.get_current_regime(_mctx_cur)
-        _mctx_conn.close()
-        if _rctx.get('available'):
-            _regime = _rctx.get('regime', 'UNKNOWN')
-            _rparams = regime_reader.get_regime_params(_regime, _rctx.get('shock_type'))
-            _tp_mode = _rparams.get('tp_mode', 'fixed')
-            _sl = _rparams.get('sl_pct', 2.0)
-            _lmin = _rparams.get('leverage_min', 3)
-            _lmax = _rparams.get('leverage_max', 8)
-            sections.append('5) 시장 환경(MCTX)')
-            sections.append(f'   - 레짐: {_regime} (confidence={_rctx.get("confidence", 0)})')
-            sections.append(f'   - flow: {_rctx.get("flow_bias", 0):+.1f} | '
-                           f'ADX: {_rctx["adx_14"]:.1f}' if _rctx.get("adx_14") is not None
-                           else f'   - flow: {_rctx.get("flow_bias", 0):+.1f} | ADX: N/A')
-            sections.append(f'   - 모드: {_tp_mode} TP / {_sl}% SL / {_lmin}-{_lmax}x')
-            if _rctx.get('in_transition'):
-                sections.append('   - ⚠ 레짐 전환 쿨다운 중')
-            sections.append('')
-    except Exception:
-        pass  # MCTX section is optional
 
     # ── 4) 실행상태(GATE/WAIT) ──
     sections.append('4) 실행상태(GATE/WAIT)')
@@ -606,6 +589,35 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
             f"qty={last_fill.get('qty',0)} ({last_fill.get('ts','')})"
         )
 
+    sections.append('')
+
+    # ── 5) 시장 환경(MCTX) ──
+    try:
+        from db_config import get_conn as _get_conn
+        _mctx_conn = _get_conn(autocommit=True)
+        with _mctx_conn.cursor() as _mctx_cur:
+            import regime_reader
+            _rctx = regime_reader.get_current_regime(_mctx_cur)
+        _mctx_conn.close()
+        if _rctx.get('available'):
+            _regime = _rctx.get('regime', 'UNKNOWN')
+            _rparams = regime_reader.get_regime_params(_regime, _rctx.get('shock_type'))
+            _tp_mode = _rparams.get('tp_mode', 'fixed')
+            _sl = _rparams.get('sl_pct', 2.0)
+            _lmin = _rparams.get('leverage_min', 3)
+            _lmax = _rparams.get('leverage_max', 8)
+            sections.append('5) 시장 환경(MCTX)')
+            sections.append(f'   - 레짐: {_regime} (confidence={_rctx.get("confidence", 0)})')
+            sections.append(f'   - flow: {_rctx.get("flow_bias", 0):+.1f} | '
+                           f'ADX: {_rctx["adx_14"]:.1f}' if _rctx.get("adx_14") is not None
+                           else f'   - flow: {_rctx.get("flow_bias", 0):+.1f} | ADX: N/A')
+            sections.append(f'   - 모드: {_tp_mode} TP / {_sl}% SL / {_lmin}-{_lmax}x')
+            if _rctx.get('in_transition'):
+                sections.append('   - ⚠ 레짐 전환 쿨다운 중')
+            sections.append('')
+    except Exception:
+        pass  # MCTX section is optional
+
     # ── Conclusion with BLOCK_REASON_CODE ──
     sections.append('')
     entry_enabled = exec_ctx.get('entry_enabled')
@@ -634,15 +646,18 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
                     capital_info=None, zone_check=None):
     """Format composite snapshot card with optional capital/leverage/zone info."""
     recon = None
+    recon_legacy = None
     if exch_pos and strat_pos:
         import exchange_reader
-        recon = exchange_reader.reconcile(exch_pos, strat_pos)
+        recon_result = exchange_reader.reconcile(exch_pos, strat_pos)
+        recon = recon_result['legacy'] if isinstance(recon_result, dict) else recon_result
+        recon_legacy = recon
 
     sections = []
 
     # ── Top badge: ENTRY/GATE/WAIT status ──
     if switch_status is False:
-        sections.append('🔴 ENTRY OFF')
+        sections.append('🔴 EXECUTION DISABLED (trade_switch OFF) — 권고는 참고용, 실행 안 함')
     elif gate_status and not gate_status[0]:
         sections.append('🟡 GATE BLOCKED')
     elif wait_reason and wait_reason not in ('', 'N/A'):

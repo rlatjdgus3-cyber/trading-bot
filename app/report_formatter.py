@@ -1483,7 +1483,7 @@ def format_report_position_block(exchange_block):
 
     # Trade switch OFF banner
     if entry_on is False:
-        lines.append('⚠ 매매 중지 상태: trade_switch OFF → 신규 진입/추가매수 불가')
+        lines.append('🔴 EXECUTION DISABLED (trade_switch OFF) — 권고는 참고용, 실행 안 함')
         lines.append('')
 
     # EXCHANGE position (the only "현재포지션")
@@ -1614,7 +1614,7 @@ def format_news_strategy_report(data, detail=False):
 
     # Trade switch OFF banner
     if entry_on is False:
-        lines.append('⚠ 매매 중지 상태: trade_switch OFF → 신규 진입/추가매수 불가')
+        lines.append('🔴 EXECUTION DISABLED (trade_switch OFF) — 권고는 참고용, 실행 안 함')
         lines.append('')
 
     # Engine recommendation

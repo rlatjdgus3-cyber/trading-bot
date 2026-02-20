@@ -337,6 +337,42 @@ def compute_total(cur=None, exchange=None):
         except Exception as e:
             _log(f'regime_correlation skip: {e}')
 
+        # ── BREAKOUT regime: dynamically increase news_event_w ──
+        breakout_news_override = False
+        try:
+            import regime_reader
+            current_regime = regime_reader.get_current_regime(cur)
+            if current_regime.get('available') and current_regime.get('regime') == 'BREAKOUT':
+                # Increase news weight to 0.10-0.20 based on news strength
+                base_news_w = weights['news_event_w']
+                news_abs = abs(news_event_score)
+                if news_abs >= 60:
+                    new_news_w = 0.20
+                elif news_abs >= 30:
+                    new_news_w = 0.15
+                else:
+                    new_news_w = 0.10
+                delta = new_news_w - base_news_w
+                if delta > 0:
+                    # Guard: if spread/liquidity bad, don't increase news weight
+                    try:
+                        from strategy.common.features import compute_spread_ok, compute_liquidity_ok
+                        spread_ok = compute_spread_ok(cur)
+                        liquidity_ok = compute_liquidity_ok(cur)
+                        if not spread_ok or not liquidity_ok:
+                            delta = 0  # Don't increase news weight with bad liquidity
+                            _log('BREAKOUT news_w override blocked: spread/liquidity not OK')
+                    except Exception:
+                        pass  # FAIL-OPEN: proceed with override
+                    if delta > 0:
+                        weights['news_event_w'] = new_news_w
+                        # Reduce tech_w proportionally
+                        weights['tech_w'] -= delta
+                        breakout_news_override = True
+                        _log(f'BREAKOUT news_w override: {base_news_w:.2f} -> {new_news_w:.2f}')
+        except Exception as e:
+            _log(f'BREAKOUT news override skip: {e}')
+
         # GUARD: NEWS_EVENT cannot trigger trades alone.
         # If both TECH and POSITION are neutral (abs < 10), zero out NEWS_EVENT.
         news_event_guarded = False
@@ -392,6 +428,7 @@ def compute_total(cur=None, exchange=None):
             'regime_score': regime_score,
             'news_event_score': news_event_score,
             'news_event_guarded': news_event_guarded,
+            'breakout_news_override': breakout_news_override,
             # Legacy compat
             'macro_score': macro_score,
             'liquidity_score': 0,

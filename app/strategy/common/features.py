@@ -227,6 +227,121 @@ def _get_vol_profile(cur, symbol='BTC/USDT:USDT'):
     return {'poc': None, 'vah': None, 'val': None}
 
 
+def compute_vol_pct(cur, symbol='BTC/USDT:USDT', window=20):
+    """Realized volatility: std of log-returns over `window` 5m candles.
+    Returns float (as percentage) or None."""
+    try:
+        cur.execute("""
+            SELECT c FROM candles
+            WHERE symbol = %s AND tf = '5m'
+            ORDER BY ts DESC LIMIT %s
+        """, (symbol, window + 1))
+        rows = cur.fetchall()
+        if not rows or len(rows) < 5:
+            return None
+        closes = [float(r[0]) for r in rows if r[0] is not None]
+        if len(closes) < 5:
+            return None
+        returns = []
+        for i in range(len(closes) - 1):
+            if closes[i + 1] > 0:
+                returns.append(math.log(closes[i] / closes[i + 1]))
+        if len(returns) < 3:
+            return None
+        mean_r = sum(returns) / len(returns)
+        variance = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+        return math.sqrt(variance) * 100  # as percentage
+    except Exception as e:
+        _log(f'compute_vol_pct error: {e}')
+        return None
+
+
+def compute_trend_strength(adx):
+    """ADX normalized to 0-1 (ADX/50 capped at 1.0). Returns float or None."""
+    if adx is None:
+        return None
+    return min(adx / 50.0, 1.0)
+
+
+def compute_range_quality(cur, symbol='BTC/USDT:USDT', lookback=10):
+    """VA width consistency score 0-1.
+    Measures how stable the VA range has been over recent entries.
+    Returns float or None."""
+    try:
+        cur.execute("""
+            SELECT vah, val FROM vol_profile
+            WHERE symbol = %s
+            ORDER BY ts DESC LIMIT %s
+        """, (symbol, lookback))
+        rows = cur.fetchall()
+        if not rows or len(rows) < 3:
+            return None
+        widths = []
+        for r in rows:
+            if r[0] is not None and r[1] is not None:
+                vah, val = float(r[0]), float(r[1])
+                if val > 0:
+                    widths.append((vah - val) / val)
+        if len(widths) < 3:
+            return None
+        mean_w = sum(widths) / len(widths)
+        if mean_w == 0:
+            return 1.0
+        variance = sum((w - mean_w) ** 2 for w in widths) / len(widths)
+        cv = math.sqrt(variance) / mean_w if mean_w > 0 else 0
+        # Lower CV = more consistent = higher quality
+        return max(0.0, min(1.0, 1.0 - cv))
+    except Exception as e:
+        _log(f'compute_range_quality error: {e}')
+        return None
+
+
+def compute_spread_ok(cur, symbol='BTC/USDT:USDT', max_spread_pct=0.05):
+    """Check if bid-ask spread < max_spread_pct%.
+    FAIL-OPEN: returns True if data unavailable."""
+    try:
+        cur.execute("""
+            SELECT bid, ask FROM market_data_cache
+            WHERE symbol = %s
+            ORDER BY ts DESC LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return True  # FAIL-OPEN
+        bid, ask = float(row[0]), float(row[1])
+        if bid <= 0:
+            return True
+        spread_pct = ((ask - bid) / bid) * 100
+        return spread_pct < max_spread_pct
+    except Exception:
+        return True  # FAIL-OPEN
+
+
+def compute_liquidity_ok(cur, symbol='BTC/USDT:USDT', window=50, min_ratio=0.5):
+    """Check if current volume >= min_ratio of median last `window` bars.
+    FAIL-OPEN: returns True if data unavailable."""
+    try:
+        cur.execute("""
+            SELECT v FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT %s
+        """, (symbol, window + 1))
+        rows = cur.fetchall()
+        if not rows or len(rows) < 10:
+            return True  # FAIL-OPEN
+        volumes = [float(r[0]) for r in rows if r[0] is not None]
+        if len(volumes) < 10:
+            return True
+        current = volumes[0]
+        hist = sorted(volumes[1:])
+        median = hist[len(hist) // 2]
+        if median <= 0:
+            return True
+        return current >= median * min_ratio
+    except Exception:
+        return True  # FAIL-OPEN
+
+
 def build_feature_snapshot(cur, symbol='BTC/USDT:USDT'):
     """Build complete feature snapshot for regime routing.
 
@@ -236,6 +351,7 @@ def build_feature_snapshot(cur, symbol='BTC/USDT:USDT'):
     vp = _get_vol_profile(cur, symbol)
     price = _get_current_price(cur, symbol)
     drift_score, drift_dir = compute_drift_score(cur, symbol)
+    adx = _get_adx(cur, symbol)
 
     return {
         'symbol': symbol,
@@ -244,7 +360,7 @@ def build_feature_snapshot(cur, symbol='BTC/USDT:USDT'):
         'bb_width': compute_bb_width(cur, symbol),
         'volume_z': compute_volume_z(cur, symbol),
         'impulse': compute_impulse(cur, symbol),
-        'adx': _get_adx(cur, symbol),
+        'adx': adx,
         'poc': vp['poc'],
         'vah': vp['vah'],
         'val': vp['val'],
@@ -252,4 +368,10 @@ def build_feature_snapshot(cur, symbol='BTC/USDT:USDT'):
         'drift_score': drift_score,
         'drift_direction': drift_dir,
         'poc_slope': compute_poc_slope(cur, symbol),
+        # New mctx fields (Step 9)
+        'vol_pct': compute_vol_pct(cur, symbol),
+        'trend_strength': compute_trend_strength(adx),
+        'range_quality': compute_range_quality(cur, symbol),
+        'spread_ok': compute_spread_ok(cur, symbol),
+        'liquidity_ok': compute_liquidity_ok(cur, symbol),
     }

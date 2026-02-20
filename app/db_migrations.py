@@ -1648,6 +1648,9 @@ def run_all():
             ensure_peak_upnl_column(cur)
             # Daily trade limit 20→60
             update_daily_trade_limit(cur)
+            # PLAN state machine column + trade_switch default ON
+            ensure_plan_state_column(cur)
+            ensure_trade_switch_default_on(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -1981,6 +1984,39 @@ def ensure_market_context_table(cur):
             ORDER BY symbol, ts DESC;
         """)
         _log('ensure_market_context_table done (inline fallback)')
+
+
+def ensure_plan_state_column(cur):
+    """Add plan_state column to position_state for PLAN state machine.
+    Backfill existing rows from side/stage/order_state."""
+    cur.execute("""
+        ALTER TABLE position_state
+            ADD COLUMN IF NOT EXISTS plan_state TEXT DEFAULT 'PLAN.NONE';
+    """)
+    # Backfill: infer plan_state from existing data
+    try:
+        import plan_state as ps
+        cur.execute("SELECT symbol, side, stage, order_state, plan_state FROM position_state;")
+        for row in cur.fetchall():
+            sym, side, stage, os_val, existing_ps = row
+            if existing_ps and existing_ps != 'PLAN.NONE' and existing_ps in ps.PLAN_STATES:
+                continue  # already set
+            new_ps = ps.map_db_to_plan(side, stage, os_val)
+            cur.execute("UPDATE position_state SET plan_state = %s WHERE symbol = %s;", (new_ps, sym))
+    except Exception as e:
+        _log(f'plan_state backfill warning (non-fatal): {e}')
+    _log('ensure_plan_state_column done')
+
+
+def ensure_trade_switch_default_on(cur):
+    """Insert default enabled=true row if trade_switch table is empty.
+    Prevents fresh-deploy → OFF problem."""
+    cur.execute("SELECT count(*) FROM trade_switch;")
+    cnt = cur.fetchone()[0]
+    if cnt == 0:
+        cur.execute("INSERT INTO trade_switch (enabled, updated_at) VALUES (true, now());")
+        _log('ensure_trade_switch_default_on: inserted default ON row')
+    _log('ensure_trade_switch_default_on done')
 
 
 if __name__ == '__main__':

@@ -27,6 +27,7 @@ class ShockBreakoutStrategy(ModeStrategy):
         features = ctx.get('features', {})
         position = ctx.get('position')
         config = ctx.get('config', {})
+        regime_ctx = ctx.get('regime_ctx', {})
         price = features.get('price')
         vah = features.get('vah')
         val = features.get('val')
@@ -39,6 +40,8 @@ class ShockBreakoutStrategy(ModeStrategy):
             return self._hold('MODE_C: missing price/vah/val data')
 
         buffer_pct = config.get('breakout_buffer_pct', 0.002)
+        news_override_min = config.get('news_override_min_score', 60)
+        trailing_enabled = config.get('trailing_stop_enabled', True)
 
         # ── If position exists: evaluate ADD, EXIT, or transition ──
         if position and position.get('side'):
@@ -58,9 +61,17 @@ class ShockBreakoutStrategy(ModeStrategy):
         else:
             return self._hold(f'MODE_C: price inside VA, no breakout signal')
 
+        # News override: check if news aligns with breakout direction
+        news_score = regime_ctx.get('news_score', 0) if regime_ctx else 0
+        news_aligns = False
+        if abs(news_score) >= news_override_min:
+            news_dir = 'LONG' if news_score > 0 else 'SHORT'
+            news_aligns = (news_dir == breakout_side)
+
         # ABSOLUTE RULE: No entry on first breakout candle
+        # News override: relax confirmation from 2→1 candles when aligned
         is_first_candle = self._is_first_breakout_candle(candles, vah, val, buffer_pct)
-        if is_first_candle:
+        if is_first_candle and not news_aligns:
             return self._hold(
                 f'MODE_C: FIRST BREAKOUT CANDLE — no entry (side={breakout_side})',
                 meta={'first_breakout_candle': True, 'chase_entry': True}
@@ -71,12 +82,14 @@ class ShockBreakoutStrategy(ModeStrategy):
         # Check for hold entry (2+ candles outside VA with volume)
         is_hold_entry = self._check_hold_entry(candles, vah, val, volume_z, config)
 
-        if not is_retest and not is_hold_entry:
+        if not is_retest and not is_hold_entry and not news_aligns:
             return self._hold(
                 f'MODE_C: waiting for retest or sustained hold outside VA (side={breakout_side})')
 
-        entry_type = 'retest' if is_retest else 'hold'
+        entry_type = 'retest' if is_retest else ('hold' if is_hold_entry else 'news_override')
         reason_parts = [f'breakout_{breakout_side}', f'entry_type={entry_type}']
+        if news_aligns:
+            reason_parts.append(f'news_override(score={news_score})')
 
         # Compute TP/SL
         atr_val = self._get_atr_from_ctx(ctx)
@@ -87,6 +100,20 @@ class ShockBreakoutStrategy(ModeStrategy):
         signal_key = dedupe.make_signal_key(
             features.get('symbol', 'BTC/USDT:USDT'), 'C', breakout_side, stage=1)
 
+        # Use stop order for retest entries
+        order_type = 'stop' if entry_type == 'retest' else 'market'
+
+        meta = {
+            'leverage': leverage,
+            'old_level': old_level,
+            'entry_type': entry_type,
+            'mode': 'C',
+        }
+        # Trailing stop config
+        if trailing_enabled:
+            meta['trailing_activate_pct'] = config.get('trailing_activate_pct', 0.008)
+            meta['trailing_pct'] = config.get('trailing_pct', 0.005)
+
         return {
             'action': 'ENTER',
             'side': breakout_side,
@@ -96,13 +123,8 @@ class ShockBreakoutStrategy(ModeStrategy):
             'reason': f'MODE_C ENTER: {"; ".join(reason_parts)}',
             'signal_key': signal_key,
             'chase_entry': False,
-            'order_type': 'market',
-            'meta': {
-                'leverage': leverage,
-                'old_level': old_level,
-                'entry_type': entry_type,
-                'mode': 'C',
-            },
+            'order_type': order_type,
+            'meta': meta,
         }
 
     def _evaluate_position(self, ctx, features, position, config):

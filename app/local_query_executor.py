@@ -4798,7 +4798,7 @@ def _reconcile(_text=None):
 
 
 def _mctx_status(_text=None):
-    """MCTX status: regime, confidence, ADX, flow, price_vs_va, shock, breakout, transition."""
+    """MCTX status: regime, features, vol_pct, spread_ok, liquidity_ok, drift."""
     conn = None
     try:
         conn = _db()
@@ -4806,44 +4806,16 @@ def _mctx_status(_text=None):
             import regime_reader
             ctx = regime_reader.get_current_regime(cur)
 
+            from strategy.common.features import build_feature_snapshot
+            features = build_feature_snapshot(cur, SYMBOL)
+
         if not ctx.get('available'):
             return '[MCTX] 데이터 없음 (FAIL-OPEN: UNKNOWN 모드)'
 
-        regime = ctx.get('regime', 'UNKNOWN')
-        conf = ctx.get('confidence', 0)
-        adx = ctx.get('adx_14')
-        flow = ctx.get('flow_bias', 0)
-        pvs = ctx.get('price_vs_va', '?')
-        shock = ctx.get('shock_type')
-        bo = ctx.get('breakout_confirmed', False)
-        trans = ctx.get('in_transition', False)
-        stale = ctx.get('stale', False)
-
-        lines = ['[MCTX] 시장 환경 상태']
-        lines.append('━━━━━━━━━━━━━━━━━━━━━━━━')
-        lines.append(f'  레짐: {regime} (confidence={conf})')
-        lines.append(f'  ADX: {adx:.1f}' if adx is not None else '  ADX: N/A')
-        lines.append(f'  flow_bias: {flow:+.1f}')
-        lines.append(f'  price_vs_VA: {pvs}')
-        if shock:
-            lines.append(f'  shock: {shock}')
-        lines.append(f'  breakout_confirmed: {"YES" if bo else "NO"}')
-        if trans:
-            lines.append(f'  전환 상태: 쿨다운 중')
-        if stale:
-            lines.append(f'  ⚠ 데이터 stale (>5분)')
-
-        # Show VAH/VAL/POC
-        vah = ctx.get('vah')
-        val = ctx.get('val')
-        poc = ctx.get('poc')
-        if vah and val:
-            lines.append(f'  VAH: ${vah:,.0f} / VAL: ${val:,.0f} / POC: ${poc:,.0f}' if poc else
-                         f'  VAH: ${vah:,.0f} / VAL: ${val:,.0f}')
-
-        return '\n'.join(lines)
+        import mctx_formatter
+        return mctx_formatter.format_mctx(features, ctx)
     except Exception as e:
-        return f'⚠ MCTX 오류: {e}'
+        return f'MCTX error: {e}'
     finally:
         if conn:
             try:

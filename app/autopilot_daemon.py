@@ -1271,9 +1271,19 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
     """, (ts_text, SYMBOL, 'auto', 'AUTOPILOT', 'AUTO_ENTRY', 'OPEN',
           json.dumps(meta, ensure_ascii=False, default=str), now_unix))
     row = cur.fetchone()
-    if row:
-        return row[0]
-    return 0
+    signal_id = row[0] if row else 0
+    # Set plan_state to PLAN.INTENT_ENTER
+    if signal_id:
+        try:
+            cur.execute("""
+                UPDATE position_state SET
+                    plan_state = 'PLAN.INTENT_ENTER',
+                    state_changed_at = now()
+                WHERE symbol = %s;
+            """, (SYMBOL,))
+        except Exception as e:
+            _log(f'plan_state INTENT_ENTER error: {e}')
+    return signal_id
 
 
 def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
@@ -1562,6 +1572,17 @@ def _run_strategy_v2(cur, scores, regime_ctx):
               json.dumps(entry_meta, ensure_ascii=False, default=str), now_unix))
         row = cur.fetchone()
         signal_id = row[0] if row else None
+        # Set plan_state to PLAN.INTENT_ENTER
+        if signal_id:
+            try:
+                cur.execute("""
+                    UPDATE position_state SET
+                        plan_state = 'PLAN.INTENT_ENTER',
+                        state_changed_at = now()
+                    WHERE symbol = %s;
+                """, (SYMBOL,))
+            except Exception as e:
+                _log(f'plan_state INTENT_ENTER error: {e}')
         _log(f'v2 ENTER signal: {side} signal_id={signal_id} usdt={usdt_amount}')
         _notify_telegram(
             f'🟢 V2 ENTER: {side}\n'
@@ -1701,8 +1722,10 @@ def _cycle():
                 import exchange_reader
                 exch_data = exchange_reader.fetch_position()
                 strat_data = exchange_reader.fetch_position_strat()
-                if exchange_reader.reconcile(exch_data, strat_data) == 'MISMATCH':
-                    _log('RECONCILE MISMATCH: entries blocked')
+                recon_result = exchange_reader.reconcile(exch_data, strat_data)
+                recon_status = recon_result['legacy'] if isinstance(recon_result, dict) else recon_result
+                if recon_status == 'MISMATCH':
+                    _log(f'RECONCILE MISMATCH: entries blocked — {recon_result.get("detail", "") if isinstance(recon_result, dict) else ""}')
                     return
             except Exception:
                 pass  # FAIL-OPEN: reconcile failure does not block
