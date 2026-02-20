@@ -2288,9 +2288,8 @@ def _dispatch_debug(text: str) -> str:
 # ── REPORT_ONLY keyword pre-routing (NARROWED) ────────────
 # Only match explicit report/brief requests, NOT generic queries.
 REPORT_ONLY_KEYWORDS = frozenset({
-    '리포트 보여', '리포트 줘', '전체 리포트', '종합 리포트',
-    '전략 리포트', '뉴스 리포트', '브리핑 해줘', '총정리 해줘',
-    '일간 리포트', '일일 리포트',
+    '리포트', '보고', '요약', '현황', '점검', '분석',
+    '브리핑', '총정리', '알려줘', '보여줘', '설명해',
 })
 # 이 키워드가 있으면 REPORT가 아니라 DIRECTIVE로 취급해야 하는 예외
 DIRECTIVE_OVERRIDE_KEYWORDS = frozenset({

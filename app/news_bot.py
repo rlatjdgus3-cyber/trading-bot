@@ -3,6 +3,7 @@ import feedparser
 import psycopg2
 from openai import OpenAI
 from db_config import get_conn
+import news_classifier_config as _ncc
 NEWS_POLL_SEC = int(os.getenv("NEWS_POLL_SEC", "300"))
 FEED_AGENT = os.getenv("NEWS_FEED_AGENT", "Mozilla/5.0 trading-bot-news/1.0")
 
@@ -93,6 +94,20 @@ SOURCE_TIERS = {
 }
 
 CRYPTO_FEEDS = {'coindesk', 'cointelegraph'}
+
+# ── Shadow → GPT category normalization ──
+# Shadow classifier enum names differ from GPT enum; normalize to GPT names
+# so topic_class column consistently uses the GPT enum (which the scorer reads).
+_SHADOW_TO_GPT_CATEGORY = {
+    'FED_FOMC': 'FED_RATES',
+    'MACRO_INDICATORS': 'CPI_JOBS',
+    'ETF_FLOWS': 'CRYPTO_SPECIFIC',
+    'SEC_REGULATION': 'REGULATION_SEC_ETF',
+    'EQUITY_MOVES': 'NASDAQ_EQUITIES',
+    'INSTITUTIONAL_BTC': 'CRYPTO_SPECIFIC',
+    'GEOPOLITICAL': 'WAR',
+    'US_FISCAL_DEBT': 'US_FISCAL',
+}
 
 
 def _get_source_tier(source: str) -> str:
@@ -312,7 +327,7 @@ def llm_analyze(client, title):
         "schema": {
             "impact_score": "0~10 (0=무관, 5=보통, 8+=높음)",
             "direction": "up/down/neutral",
-            "category": "WAR/US_POLITICS/US_POLITICS_ELECTION/US_FISCAL/US_SCANDAL_LEGAL/FED_RATES/CPI_JOBS/NASDAQ_EQUITIES/TECH_NASDAQ/REGULATION_SEC_ETF/JAPAN_BOJ/CHINA/FIN_STRESS/WALLSTREET_SIGNAL/IMMIGRATION_POLICY/MACRO_RATES/CRYPTO_SPECIFIC/OTHER",
+            "category": "WAR/US_POLITICS/US_POLITICS_ELECTION/US_FISCAL/US_SCANDAL_LEGAL/FED_RATES/CPI_JOBS/NASDAQ_EQUITIES/TECH_NASDAQ/REGULATION_SEC_ETF/JAPAN_BOJ/CHINA/EUROPE_ECB/FIN_STRESS/WALLSTREET_SIGNAL/IMMIGRATION_POLICY/MACRO_RATES/CRYPTO_SPECIFIC/OTHER",
             "relevance": "HIGH/MED/LOW/GOSSIP — 암호화폐/거시경제 무관이면 GOSSIP",
             "impact_path": "예: 금리인상→달러강세→BTC하락",
             "summary_kr": "한국어 1~2문장",
@@ -543,9 +558,8 @@ def main():
                     # 7) 소스 가중치 기반 티어 캡 (weight < 0.6 → TIER3)
                     _DENY_THRESHOLD = 0.60
                     try:
-                        from news_classifier_config import get_source_weight, DENY_SOURCE_WEIGHT_THRESHOLD
-                        _sw = get_source_weight(source)
-                        _DENY_THRESHOLD = DENY_SOURCE_WEIGHT_THRESHOLD
+                        _sw = _ncc.get_source_weight(source)
+                        _DENY_THRESHOLD = _ncc.DENY_SOURCE_WEIGHT_THRESHOLD
                     except Exception:
                         _sw = 0.55 if source_tier == 'REFERENCE_ONLY' else 0.70
                     if _sw < _DENY_THRESHOLD and tier in ('TIER1', 'TIER2'):
@@ -578,7 +592,6 @@ def main():
                     allow_trading = False
                     _shadow = {}
                     try:
-                        import news_classifier_config as _ncc
                         _shadow = _ncc.preview_classify(
                             title, source, impact,
                             summary=summary or '', title_ko=title_ko or '')
@@ -586,7 +599,9 @@ def main():
                         _shadow_topic_preview = _shadow.get('topic_class_preview', 'unclassified')
                         if _shadow_topic_preview not in ('unclassified', '', None):
                             if topic_class in ('noise', 'macro', '', None):
-                                topic_class = _shadow_topic_preview
+                                # Normalize shadow enum → GPT enum for consistency
+                                topic_class = _SHADOW_TO_GPT_CATEGORY.get(
+                                    _shadow_topic_preview, _shadow_topic_preview)
                         # If GPT didn't assign tier, use shadow
                         if tier in ('UNKNOWN', None) and _shadow.get('tier_preview'):
                             tier = _shadow['tier_preview']
@@ -606,12 +621,11 @@ def main():
                     if _scandal_topic == 'US_SCANDAL_LEGAL':
                         _scandal_cur = None
                         try:
-                            from news_classifier_config import scandal_confirmation_check
                             try:
                                 _scandal_cur = db.cursor()
                             except Exception:
                                 pass
-                            _scandal = scandal_confirmation_check(
+                            _scandal = _ncc.scandal_confirmation_check(
                                 'US_SCANDAL_LEGAL', title, source, impact,
                                 db_cursor=_scandal_cur)
                             if not _scandal['confirmed']:
@@ -640,8 +654,7 @@ def main():
 
                     # 10) Compute trading_impact_weight = source_weight * relevance_score
                     try:
-                        from news_classifier_config import get_source_weight
-                        _src_w = get_source_weight(source)
+                        _src_w = _ncc.get_source_weight(source)
                         _trading_impact_weight = round(_src_w * (rel_score or 0), 4)
                     except Exception:
                         _trading_impact_weight = 0

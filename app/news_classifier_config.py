@@ -279,6 +279,18 @@ RELEVANCE_BOOST_KEYWORDS = {
 }
 RELEVANCE_BOOST_AMOUNT = 0.15
 
+# Pre-compile regex for RELEVANCE_BOOST_KEYWORDS (word-boundary safe)
+def _build_boost_regex(keywords):
+    parts = []
+    for kw in sorted(keywords, key=len, reverse=True):
+        if kw.isascii():
+            parts.append(r'\b' + re.escape(kw) + r'\b')
+        else:
+            parts.append(re.escape(kw))
+    return re.compile('|'.join(parts), re.IGNORECASE) if parts else re.compile(r'(?!)')
+
+_RE_RELEVANCE_BOOST = _build_boost_regex(RELEVANCE_BOOST_KEYWORDS)
+
 # ── Personal story / gossip exclusion patterns ───────────
 PERSONAL_STORY_EXCLUDE_PATTERNS = [
     re.compile(r'(?i)\bgossip\b'),
@@ -400,8 +412,8 @@ def _compute_source_quality(source: str) -> float:
 
 def _has_relevance_boost(title: str, summary: str = '') -> bool:
     """Check if title/summary contains macro/Nasdaq boost keywords."""
-    text = ((title or '') + ' ' + (summary or '')).lower()
-    return any(kw in text for kw in RELEVANCE_BOOST_KEYWORDS)
+    text = (title or '') + ' ' + (summary or '')
+    return bool(_RE_RELEVANCE_BOOST.search(text))
 
 
 def _compute_relevance_preview(title: str, source: str, impact_score,

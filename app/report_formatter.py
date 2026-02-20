@@ -718,6 +718,7 @@ CATEGORY_KR = {
     'CHINA': '중국',
     'FIN_STRESS': '금융 스트레스',
     'CRYPTO_SPECIFIC': '크립토',
+    'EUROPE_ECB': '유럽/ECB',
     'OTHER': '기타',
     # P1: US politics / macro expansion
     'US_POLITICS_ELECTION': '미국 선거/입법',
@@ -731,7 +732,7 @@ CATEGORY_KR = {
 
 MACRO_CATEGORIES = {
     'FED_RATES', 'CPI_JOBS', 'NASDAQ_EQUITIES', 'US_POLITICS',
-    'WAR', 'JAPAN_BOJ', 'CHINA', 'FIN_STRESS',
+    'WAR', 'JAPAN_BOJ', 'CHINA', 'FIN_STRESS', 'EUROPE_ECB',
     # P1: US politics / macro expansion
     'US_POLITICS_ELECTION', 'US_FISCAL', 'US_SCANDAL_LEGAL',
     'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY', 'TECH_NASDAQ', 'MACRO_RATES',

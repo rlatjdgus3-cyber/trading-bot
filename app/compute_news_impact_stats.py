@@ -34,7 +34,7 @@ def _parse_category(summary):
     known_categories = {
         'FED_RATES', 'CPI_JOBS', 'REGULATION_SEC_ETF', 'WAR',
         'US_POLITICS', 'NASDAQ_EQUITIES', 'JAPAN_BOJ', 'CHINA',
-        'FIN_STRESS', 'CRYPTO_SPECIFIC', 'OTHER',
+        'FIN_STRESS', 'CRYPTO_SPECIFIC', 'EUROPE_ECB', 'OTHER',
         # P1: US politics / macro expansion
         'US_POLITICS_ELECTION', 'US_FISCAL', 'US_SCANDAL_LEGAL',
         'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY', 'TECH_NASDAQ', 'MACRO_RATES',

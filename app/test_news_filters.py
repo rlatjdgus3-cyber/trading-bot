@@ -117,11 +117,11 @@ class TestWorthLlm(unittest.TestCase):
         assert self.func("Bitcoin mentioned in lifestyle article") == True
 
     def test_crypto_without_impact_strict(self):
-        """active_keywords=[] is falsy → falls back to default KEYWORDS which contains 'bitcoin' → True."""
-        # 'bitcoin' is in default KEYWORDS list, active_keywords=[] is falsy so default is used
+        """active_keywords=[] means explicitly empty → no keywords to match → False."""
+        # active_keywords=[] is not None, so code uses empty list → no match → False
         result = self.func("Bitcoin mentioned in lifestyle article",
                           active_keywords=[])
-        assert result == True
+        assert result == False
 
 
 class TestGetSourceTier(unittest.TestCase):
@@ -146,9 +146,12 @@ class TestGetSourceTier(unittest.TestCase):
 
     def test_reference_only(self):
         assert self.func("yahoo_finance") == "REFERENCE_ONLY"
-        assert self.func("investing") == "REFERENCE_ONLY"
-        assert self.func("bbc_business") == "REFERENCE_ONLY"
-        assert self.func("bbc_world") == "REFERENCE_ONLY"
+
+    def test_tier2_promoted(self):
+        """bbc/investing promoted to TIER2_SOURCE."""
+        assert self.func("investing") == "TIER2_SOURCE"
+        assert self.func("bbc_business") == "TIER2_SOURCE"
+        assert self.func("bbc_world") == "TIER2_SOURCE"
 
     def test_unknown_source(self):
         assert self.func("unknown_source") == "REFERENCE_ONLY"
