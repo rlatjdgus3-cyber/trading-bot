@@ -151,23 +151,33 @@ SYSTEM_PROMPT = """You are a trading bot NL parser. Parse the user's Korean/Engl
 """
 
 
+_in_memory_state = None
+
+
 def _load_state() -> dict:
+    global _in_memory_state
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            state = json.load(f)
+            _in_memory_state = state
+            return state
     except Exception:
+        if _in_memory_state is not None:
+            return _in_memory_state
         return {"version": 1, "daily_calls": {}, "cooldowns": {}}
 
 
 def _save_state(state: dict):
+    global _in_memory_state
     state["last_updated"] = time.time()
+    _in_memory_state = state
     tmp = STATE_FILE + ".tmp"
     try:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[gpt_router] _save_state error (in-memory fallback active): {e}", flush=True)
 
 
 def _check_cooldown(cooldown_key: str, state: dict, gear2: bool = False,

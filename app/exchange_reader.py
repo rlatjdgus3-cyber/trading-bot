@@ -19,8 +19,14 @@ def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
 
 
+def _invalidate_exchange():
+    """Reset exchange cache to force reconnection on next call."""
+    global _exchange_cache
+    _exchange_cache = None
+
+
 def _get_exchange():
-    """Cached ccxt.bybit read-only singleton."""
+    """Cached ccxt.bybit read-only singleton. Auto-invalidated on API errors."""
     global _exchange_cache
     if _exchange_cache is not None:
         return _exchange_cache
@@ -83,6 +89,7 @@ def fetch_position(symbol=None):
             'liq_price': 0.0,
         }
     except Exception as e:
+        _invalidate_exchange()
         _log(f'fetch_position error: {e}')
         return {
             'source': 'EXCHANGE',
@@ -116,6 +123,7 @@ def fetch_open_orders(symbol=None):
             'orders': orders,
         }
     except Exception as e:
+        _invalidate_exchange()
         _log(f'fetch_open_orders error: {e}')
         return {
             'source': 'EXCHANGE',
@@ -139,6 +147,7 @@ def fetch_balance():
             'used': float(usdt.get('used') or 0),
         }
     except Exception as e:
+        _invalidate_exchange()
         _log(f'fetch_balance error: {e}')
         return {
             'source': 'EXCHANGE',

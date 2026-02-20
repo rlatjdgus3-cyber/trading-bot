@@ -20,19 +20,28 @@ PNL_LOWER_USD = -50    # -50 USD 이하
 CHECK_INTERVAL = 30    # seconds
 
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise SystemExit("❌ BYBIT_API_KEY / BYBIT_SECRET 환경변수가 설정되지 않음")
+    raise SystemExit("BYBIT_API_KEY / BYBIT_SECRET 환경변수가 설정되지 않음")
 
 # =========================
-# BYBIT
+# BYBIT (lazy init with retry)
 # =========================
-exchange = ccxt.bybit({
-    "apiKey": BYBIT_API_KEY,
-    "secret": BYBIT_API_SECRET,
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
-})
+_exchange = None
 
-exchange.load_markets()
+
+def _get_exchange():
+    global _exchange
+    if _exchange is not None:
+        return _exchange
+    _exchange = ccxt.bybit({
+        "apiKey": BYBIT_API_KEY,
+        "secret": BYBIT_API_SECRET,
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {"defaultType": "swap"},
+    })
+    _exchange.load_markets()
+    return _exchange
+
 
 def pos_key(p: dict) -> str:
     return f"{p.get('symbol')}:{p.get('side')}"
@@ -42,7 +51,8 @@ print(f"[CONFIG] SYMBOL={SYMBOL} upper={PNL_UPPER_USD} lower={PNL_LOWER_USD}")
 
 while True:
     try:
-        positions = exchange.fetch_positions([SYMBOL])
+        ex = _get_exchange()
+        positions = ex.fetch_positions([SYMBOL])
 
         has_position = False
         for p in positions:
@@ -69,6 +79,7 @@ while True:
         time.sleep(CHECK_INTERVAL)
 
     except Exception:
+        _exchange = None  # Reset for reconnection on next cycle
         print("[PNL WATCHER ERROR]")
         print(traceback.format_exc())
-        time.sleep(10)
+        time.sleep(30)

@@ -15,13 +15,18 @@ POLL_SEC = 5
 
 def load_env(path=None):
     env = {}
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            k, v = line.split('=', 1)
-            env[k.strip()] = v.strip()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                env[k.strip()] = v.strip()
+    except FileNotFoundError:
+        print(f'[position_watcher] env file not found: {path}', flush=True)
+    except Exception as e:
+        print(f'[position_watcher] load_env error: {e}', flush=True)
     return env
 
 
@@ -120,7 +125,10 @@ def main():
     if not token or chat_id == 0:
         raise SystemExit('ENV missing: TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_CHAT_ID')
     if not os.path.exists(DB_PATH):
+        print(f'[position_watcher] WARNING: SQLite DB not found: {DB_PATH}', flush=True)
+        print('[position_watcher] NOTE: This module uses legacy SQLite. Production uses PostgreSQL position_state.', flush=True)
         raise SystemExit(f'DB not found: {DB_PATH}')
+    print('[position_watcher] NOTE: Using legacy SQLite DB — production position tracking uses PostgreSQL.', flush=True)
     state = read_state()
     known = state.get('known', {})
     print('=== POSITION WATCHER STARTED ===', flush=True)

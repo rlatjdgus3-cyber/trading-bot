@@ -46,6 +46,7 @@ def _exchange():
         'apiKey': os.getenv('BYBIT_API_KEY'),
         'secret': os.getenv('BYBIT_SECRET'),
         'enableRateLimit': True,
+        'timeout': 20000,
         'options': {'defaultType': 'swap'}})
     ex.load_markets()
     return ex
@@ -127,10 +128,15 @@ def _update_trade_process_log(cur, sig_id, **kwargs):
 def _poll_cycle(ex):
     conn = db_conn()
     try:
-        conn.autocommit = True
+        conn.autocommit = False
         with conn.cursor() as cur:
-            # Reconcile + auto-heal every 5th cycle
-            _reconcile_and_heal(ex, cur)
+            # Reconcile + auto-heal every 5th cycle (own transaction)
+            try:
+                _reconcile_and_heal(ex, cur)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                traceback.print_exc()
 
             cur.execute("""
                 SELECT id, order_id, order_type, direction, signal_id, decision_id,
@@ -141,14 +147,24 @@ def _poll_cycle(ex):
                 ORDER BY id ASC;
             """)
             rows = cur.fetchall()
+            conn.commit()
             if not rows:
                 return
             for row in rows:
                 try:
                     _process_order(ex, cur, row)
+                    conn.commit()
                 except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     traceback.print_exc()
     except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         traceback.print_exc()
     finally:
         try:
@@ -387,7 +403,7 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
         row = cur.fetchone()
         acc_entry_fee = float(row[0]) if row and row[0] else 0.0
 
-    if entry_price and entry_price > 0:
+    if entry_price is not None and entry_price > 0:
         dir_sign = 1 if direction in ('LONG', 'long') else -1
         gross_pnl = (avg_price - entry_price) * filled_qty * dir_sign
         realized_pnl = gross_pnl - abs(fee_cost) - acc_entry_fee
@@ -706,7 +722,7 @@ def _handle_reduce_filled(ex, cur, eid, order_id, direction, filled_qty, avg_pri
     acc_entry_fee = float(row[2]) if row and row[2] else 0.0
 
     proportional_entry_fee = 0.0
-    if entry_price and total_qty_before > 0:
+    if entry_price is not None and entry_price > 0 and total_qty_before > 0:
         dir_sign = 1 if direction in ('LONG', 'long') else -1
         gross_pnl = (avg_price - entry_price) * filled_qty * dir_sign
         proportional_entry_fee = acc_entry_fee * (filled_qty / total_qty_before)
@@ -751,7 +767,7 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
     entry_price = float(row[0]) if row and row[0] else None
     acc_entry_fee = float(row[1]) if row and row[1] else 0.0
 
-    if not entry_price and signal_id:
+    if entry_price is None and signal_id:
         cur.execute("""
                 SELECT fill_price FROM trade_process_log
                 WHERE signal_id = %s AND fill_price IS NOT NULL
@@ -761,7 +777,7 @@ def _handle_reverse_close_filled(ex, cur, eid, order_id, direction, filled_qty, 
         if row and row[0]:
             entry_price = float(row[0])
 
-    if entry_price and entry_price > 0:
+    if entry_price is not None and entry_price > 0:
         dir_sign = 1 if direction in ('LONG', 'long') else -1
         gross_pnl = (avg_price - entry_price) * filled_qty * dir_sign
         realized_pnl = gross_pnl - abs(fee_cost) - acc_entry_fee
