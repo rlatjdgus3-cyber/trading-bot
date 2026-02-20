@@ -321,11 +321,13 @@ def _build_context(cur=None, pos=None, snapshot=None):
     except Exception:
         ctx['position_entry_ts'] = None
 
-    # News
+    # News (filter out noise/TIERX/excluded items for cleaner AI context)
     cur.execute("""
             SELECT title, summary, impact_score, ts, title_ko FROM news
             WHERE ts >= now() - interval '2 hours'
-            ORDER BY ts DESC LIMIT 10;
+              AND (tier IS NULL OR tier NOT IN ('TIERX'))
+              AND exclusion_reason IS NULL
+            ORDER BY impact_score DESC, ts DESC LIMIT 10;
         """)
     ctx['news'] = [
         {'title': r[0], 'summary': r[1], 'impact_score': r[2], 'ts': str(r[3]),
@@ -1386,6 +1388,7 @@ def _check_range_split_tp(ctx, regime_params, regime_ctx, upnl_pct, side, price)
 
         # Check if TP1 already taken: any FILLED REDUCE since last OPEN
         tp1_taken = False
+        conn_tp = None
         try:
             conn_tp = get_conn()
             with conn_tp.cursor() as cur_tp:
@@ -1404,9 +1407,14 @@ def _check_range_split_tp(ctx, regime_params, regime_ctx, upnl_pct, side, price)
                         LIMIT 1;
                     """, (SYMBOL, open_row[0]))
                     tp1_taken = cur_tp.fetchone() is not None
-            conn_tp.close()
         except Exception:
             pass
+        finally:
+            if conn_tp:
+                try:
+                    conn_tp.close()
+                except Exception:
+                    pass
 
         if not tp1_taken:
             # TP1: price reaches POC or BB_mid

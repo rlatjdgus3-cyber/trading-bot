@@ -85,6 +85,19 @@ def _kw_match(text, compiled_re):
     """Return True if any keyword matches in text."""
     return bool(compiled_re.search(text))
 
+# Cache for active_keywords regex (avoids recompiling 180 times per tick)
+_active_kw_cache = (None, None)  # (tuple_key, compiled_regex)
+
+def _get_active_kw_regex(active_keywords):
+    """Return cached compiled regex for active_keywords list."""
+    global _active_kw_cache
+    key = tuple(sorted(active_keywords))
+    if _active_kw_cache[0] == key:
+        return _active_kw_cache[1]
+    compiled = _build_kw_regex(active_keywords)
+    _active_kw_cache = (key, compiled)
+    return compiled
+
 # ── 소스 티어 분류 (v2: bbc/investing → TIER2로 승격) ──
 SOURCE_TIERS = {
     'TIER1_SOURCE': {'reuters', 'bloomberg', 'wsj', 'ft', 'ap'},
@@ -227,13 +240,14 @@ def _send_error_alert(source, title, exception, dedup_key=None):
 
     cached = _error_alert_cache.get(dedup_key)
     if cached:
-        last_ts, count = cached
+        last_ts, suppressed = cached
         if now - last_ts < _ERROR_ALERT_COOLDOWN_SEC:
-            _error_alert_cache[dedup_key] = (last_ts, count + 1)
+            _error_alert_cache[dedup_key] = (last_ts, suppressed + 1)
             return  # 스팸 방지
 
+    # Cooldown expired or first alert: report suppressed count + 1 (current)
     count = (cached[1] + 1) if cached else 1
-    _error_alert_cache[dedup_key] = (now, 0)
+    _error_alert_cache[dedup_key] = (now, 0)  # reset suppressed count for next window
 
     err_type = type(exception).__name__
     err_msg = str(exception)[:200]
@@ -302,8 +316,7 @@ def worth_llm(title: str, active_keywords=None, source: str = '') -> bool:
         return True
     # 기존 KEYWORDS fallback (하위호환)
     if active_keywords is not None:
-        _re_active = _build_kw_regex(active_keywords)
-        return _kw_match(t, _re_active)
+        return _kw_match(t, _get_active_kw_regex(active_keywords))
     return _kw_match(t, _RE_KEYWORDS)
 
 def extract_keywords(title: str, active_keywords=None):

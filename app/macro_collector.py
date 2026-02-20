@@ -142,7 +142,10 @@ def _store_prices(conn, prices):
                 except Exception as e:
                     _log(f'store {source_name} error: {e}')
     finally:
-        conn.autocommit = prev_autocommit
+        try:
+            conn.autocommit = prev_autocommit
+        except Exception:
+            pass  # connection may be dead; caller will reconnect
     return stored
 
 

@@ -99,6 +99,10 @@ def _load_weights(cur=None):
                     weights['news_event_w'] = float(bump.get('weight', 0.15))
                 else:
                     cur.execute("DELETE FROM openclaw_policies WHERE key = 'news_emergency_bump';")
+                    try:
+                        cur.connection.commit()
+                    except Exception:
+                        pass
     except Exception:
         pass
     return weights

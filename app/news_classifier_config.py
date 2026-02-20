@@ -353,9 +353,9 @@ def get_source_weight(source: str) -> float:
     # Exact match first
     if s in SOURCE_WEIGHTS:
         return SOURCE_WEIGHTS[s]
-    # Substring match
+    # Substring match (key in source only; reverse match causes false positives)
     for key, weight in SOURCE_WEIGHTS.items():
-        if key in s or s in key:
+        if key in s:
             return weight
     return DEFAULT_SOURCE_WEIGHT
 
