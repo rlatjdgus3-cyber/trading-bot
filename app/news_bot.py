@@ -41,6 +41,13 @@ KEYWORDS = [
     "war","missile","sanction","china","boj",
     # crypto-specific
     "hack","exploit","liquidation","bank","regulation",
+    # P1: US politics / macro expansion
+    "presidential","midterm","executive order","debt ceiling","government shutdown",
+    "indictment","impeachment","special counsel",
+    "goldman sachs","jpmorgan","morgan stanley",
+    "semiconductor","chip ban","ai regulation",
+    "immigration","deportation","border",
+    "treasury yield","credit spread","bond auction","term premium","tlt",
 ]
 
 # ── 가십/노이즈 하드 필터 ──
@@ -112,6 +119,11 @@ IMPACT_KEYWORDS = {
     'credit spread', 'yield curve', 'us10y', 'earnings',
     # central banks
     'boj', 'ecb', 'rate decision', 'rate cut', 'rate hike',
+    # P1: US politics / macro expansion
+    'election', 'presidential', 'impeachment', 'indictment',
+    'debt ceiling', 'government shutdown',
+    'immigration', 'deportation',
+    'semiconductor', 'credit spread', 'bond auction', 'term premium',
 }
 MACRO_STANDALONE_KEYWORDS = {
     # existing
@@ -128,6 +140,14 @@ MACRO_STANDALONE_KEYWORDS = {
     'nato', 'invasion', 'embargo',
     # mega-cap earnings (high BTC correlation)
     'earnings',
+    # P1: US politics / macro expansion — pass worth_llm() without crypto keywords
+    'election', 'presidential', 'midterm', 'executive order',
+    'debt ceiling', 'government shutdown', 'shutdown', 'fiscal cliff',
+    'indictment', 'impeachment', 'special counsel',
+    'goldman sachs', 'jpmorgan', 'morgan stanley',
+    'immigration', 'deportation',
+    'semiconductor', 'chip ban', 'ai regulation',
+    'treasury yield', 'credit spread', 'bond auction', 'term premium', 'tlt',
 }
 
 
@@ -245,7 +265,7 @@ def llm_analyze(client, title):
         "schema": {
             "impact_score": "0~10 (0=무관, 5=보통, 8+=높음)",
             "direction": "up/down/neutral",
-            "category": "WAR/US_POLITICS/FED_RATES/CPI_JOBS/NASDAQ_EQUITIES/REGULATION_SEC_ETF/JAPAN_BOJ/CHINA/FIN_STRESS/CRYPTO_SPECIFIC/OTHER",
+            "category": "WAR/US_POLITICS/US_POLITICS_ELECTION/US_FISCAL/US_SCANDAL_LEGAL/FED_RATES/CPI_JOBS/NASDAQ_EQUITIES/TECH_NASDAQ/REGULATION_SEC_ETF/JAPAN_BOJ/CHINA/FIN_STRESS/WALLSTREET_SIGNAL/IMMIGRATION_POLICY/MACRO_RATES/CRYPTO_SPECIFIC/OTHER",
             "relevance": "HIGH/MED/LOW/GOSSIP — 암호화폐/거시경제 무관이면 GOSSIP",
             "impact_path": "예: 금리인상→달러강세→BTC하락",
             "summary_kr": "한국어 1~2문장",
@@ -256,8 +276,8 @@ def llm_analyze(client, title):
             "asset_relevance": "BTC_DIRECT/BTC_INDIRECT/NONE",
         },
         "tier_guide": {
-            "TIER1": "연준/FOMC/Powell, CPI/PPI/NFP 핵심지표, BTC ETF 대규모 자금흐름, SEC/규제, 지정학(전쟁급), 대형기관 BTC 매수/매도",
-            "TIER2": "나스닥/QQQ 1%+ 변동 원인, 금융시스템 리스크(은행/채권 급변), 주요국 정책",
+            "TIER1": "연준/FOMC/Powell, CPI/PPI/NFP 핵심지표, BTC ETF 대규모 자금흐름, SEC/규제, 지정학(전쟁급), 대형기관 BTC 매수/매도, 국채 금리 급변(MACRO_RATES), 부채한도 위기(US_FISCAL)",
+            "TIER2": "나스닥/QQQ 1%+ 변동 원인, 금융시스템 리스크(은행/채권 급변), 주요국 정책, 대선/중간선거(US_POLITICS_ELECTION), 기술/반도체(TECH_NASDAQ), 기소/탄핵(US_SCANDAL_LEGAL), 월가 시그널(WALLSTREET_SIGNAL), 이민정책(IMMIGRATION_POLICY)",
             "TIER3": "일반 크립토 시황, BTC 직접 연결 약한 개별 기업/이슈",
             "TIERX": "개인사연, 주식추천, 칼럼, 클릭유도, 노이즈, 암호화폐/거시경제 무관",
         },
@@ -516,6 +536,29 @@ def main():
                         allow_trading = _shadow.get('allow_for_trading', False)
                     except Exception:
                         pass  # shadow classifier failure should never block insertion
+
+                    # 9.6) Scandal confirmation gate
+                    _shadow_topic = _shadow.get('topic_class_preview', '') if '_shadow' in dir() else ''
+                    _scandal_topic = _shadow_topic if _shadow_topic == 'US_SCANDAL_LEGAL' else (
+                        topic_class if topic_class == 'US_SCANDAL_LEGAL' else '')
+                    if _scandal_topic == 'US_SCANDAL_LEGAL':
+                        try:
+                            from news_classifier_config import scandal_confirmation_check
+                            _scandal_cur = None
+                            try:
+                                _scandal_cur = db.cursor()
+                            except Exception:
+                                pass
+                            _scandal = scandal_confirmation_check(
+                                'US_SCANDAL_LEGAL', title, source, impact,
+                                db_cursor=_scandal_cur)
+                            if not _scandal['confirmed']:
+                                allow_trading = False
+                                exclusion_reason = exclusion_reason or f"scandal_unconfirmed: {_scandal['reason']}"
+                            if _scandal.get('impact_cap') and impact > _scandal['impact_cap']:
+                                impact = _scandal['impact_cap']
+                        except Exception:
+                            pass
 
                     # 9.7) BTC keyword fallback for still-unclassified items
                     if topic_class in ('unclassified', 'noise', '', None):

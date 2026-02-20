@@ -719,11 +719,22 @@ CATEGORY_KR = {
     'FIN_STRESS': '금융 스트레스',
     'CRYPTO_SPECIFIC': '크립토',
     'OTHER': '기타',
+    # P1: US politics / macro expansion
+    'US_POLITICS_ELECTION': '미국 선거/입법',
+    'US_FISCAL': '미국 재정/부채',
+    'US_SCANDAL_LEGAL': '스캔들/법적',
+    'WALLSTREET_SIGNAL': '월가 시그널',
+    'IMMIGRATION_POLICY': '이민 정책',
+    'TECH_NASDAQ': '기술/나스닥',
+    'MACRO_RATES': '금리/채권',
 }
 
 MACRO_CATEGORIES = {
     'FED_RATES', 'CPI_JOBS', 'NASDAQ_EQUITIES', 'US_POLITICS',
     'WAR', 'JAPAN_BOJ', 'CHINA', 'FIN_STRESS',
+    # P1: US politics / macro expansion
+    'US_POLITICS_ELECTION', 'US_FISCAL', 'US_SCANDAL_LEGAL',
+    'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY', 'TECH_NASDAQ', 'MACRO_RATES',
 }
 CRYPTO_CATEGORIES = {'CRYPTO_SPECIFIC', 'REGULATION_SEC_ETF'}
 

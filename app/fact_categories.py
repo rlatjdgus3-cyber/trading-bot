@@ -53,6 +53,44 @@ CATEGORIES = {
         'eu regulation',
         '유럽중앙은행', '유로', '라가르드',
     ],
+    # P1: US politics / macro expansion
+    'us_fiscal': [
+        'debt ceiling', 'deficit', 'fiscal policy', 'fiscal cliff',
+        'government shutdown', 'treasury auction', 'budget',
+        'sequester', 'national debt', 'continuing resolution',
+        '부채 한도', '재정 적자', '정부 셧다운', '예산', '국가 부채',
+    ],
+    'us_scandal_legal': [
+        'indictment', 'impeach', 'special counsel', 'grand jury',
+        'arraign', 'subpoena', 'criminal charges', 'plea deal',
+        'felony', 'obstruction', 'ethics probe',
+        '기소', '탄핵', '특별 검사', '대배심', '소환장',
+    ],
+    'wallstreet_signal': [
+        'goldman sachs', 'jpmorgan', 'morgan stanley',
+        'analyst upgrade', 'analyst downgrade', 'price target',
+        'strategist', 'wall street forecast',
+        'bank of america', 'citigroup', 'blackrock',
+        '골드만', 'JP모건', '모건 스탠리', '목표 주가', '월가',
+    ],
+    'tech_sector': [
+        'semiconductor', 'chip ban', 'chip export', 'chip war',
+        'ai regulation', 'big tech', 'antitrust',
+        'tsmc', 'asml', 'foundry', 'chip shortage', 'chip act',
+        '반도체', '칩 수출', '칩 전쟁', 'AI 규제', '빅테크', '반독점',
+    ],
+    'immigration': [
+        'immigration', 'border wall', 'border security', 'deportation',
+        'asylum', 'visa ban', 'migrant', 'refugee',
+        'ice raid', 'dhs', 'undocumented',
+        '이민', '국경', '추방', '망명', '난민',
+    ],
+    'macro_rates': [
+        'treasury yield', 'yield curve', 'credit spread', 'us10y',
+        'term premium', 'bond auction', 'bond selloff', 'tlt',
+        'real rate', 'real yield', 'duration risk', 'swap spread',
+        '국채 수익률', '수익률 곡선', '신용 스프레드', '채권 입찰',
+    ],
 }
 
 # Short keywords that need word-boundary regex to avoid false positives

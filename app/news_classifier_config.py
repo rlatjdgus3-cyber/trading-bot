@@ -65,6 +65,9 @@ IN_SCOPE_TOPICS = frozenset({
     'FED_FOMC', 'MACRO_INDICATORS', 'EQUITY_MOVES', 'ETF_FLOWS',
     'SEC_REGULATION', 'INSTITUTIONAL_BTC', 'GEOPOLITICAL',
     'CRYPTO_GENERAL',
+    # P1: US politics / macro expansion
+    'US_POLITICS_ELECTION', 'US_FISCAL_DEBT', 'US_SCANDAL_LEGAL',
+    'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY', 'TECH_NASDAQ', 'MACRO_RATES',
 })
 
 # ── Strategy category keyword patterns (A~G) ────────────
@@ -94,7 +97,41 @@ STRATEGY_CATEGORIES_V2 = {
         r'(?<!\bbrowser )(?<!\bformat )(?<!\bconsole )'
         r'\b(war|sanction|tariff|embargo|missile|invasion|'
         r'geopolitic|trump|biden|china.?us|russia|iran|nato|'
-        r'election|white house|congress)\b'),
+        r'white house|congress)\b'),
+    # P1: 7 new categories
+    'US_POLITICS_ELECTION': re.compile(
+        r'(?i)\b(election|midterm|caucus|ballot|polling|executive order|'
+        r'presidential|gubernatorial|swing state|electoral college|'
+        r'voter|campaign|nominee|primary|inauguration)\b'),
+    'US_FISCAL_DEBT': re.compile(
+        r'(?i)\b(debt ceiling|deficit|fiscal (policy|cliff)|government shutdown|'
+        r'treasury auction|budget (deal|bill|crisis)|sequester|'
+        r'federal (spending|budget)|continuing resolution|appropriation|'
+        r'national debt|fiscal stimulus)\b'),
+    'US_SCANDAL_LEGAL': re.compile(
+        r'(?i)\b(indictment|impeach|special counsel|grand jury|arraign|'
+        r'subpoena|criminal charges|plea (deal|guilty)|felony|'
+        r'obstruction|contempt of congress|ethics (probe|violation)|'
+        r'classified documents|hush money)\b'),
+    'WALLSTREET_SIGNAL': re.compile(
+        r'(?i)\b(goldman sachs|jpmorgan|morgan stanley|analyst (upgrade|downgrade)|'
+        r'price target|strategist|wall street (forecast|outlook|consensus)|'
+        r'bank of america|citigroup|wells fargo|blackrock|'
+        r'institutional (forecast|call)|equity research)\b'),
+    'IMMIGRATION_POLICY': re.compile(
+        r'(?i)\b(immigration|border (wall|security|crisis)|deportation|'
+        r'asylum|visa (ban|policy)|migrant|refugee|'
+        r'ice raid|dhs|cbp|undocumented|h-1b|green card)\b'),
+    'TECH_NASDAQ': re.compile(
+        r'(?i)\b(tech stocks|semiconductor|chip (ban|export|shortage|act)|'
+        r'ai regulation|big tech|antitrust|'
+        r'artificial intelligence|ai (boom|bubble|arms race)|'
+        r'chip war|fab|foundry|tsmc|asml)\b'),
+    'MACRO_RATES': re.compile(
+        r'(?i)\b(treasury yield|yield curve|credit spread|us10y|us2y|'
+        r'term premium|bond (auction|selloff|sell-off|rally)|tlt|'
+        r'real (rate|yield)|duration risk|swap spread|'
+        r'sovereign debt|bills? auction|coupon auction)\b'),
 }
 
 # ── Strategy category Korean patterns (A~G) ──────────────
@@ -118,6 +155,26 @@ STRATEGY_CATEGORIES_KO = {
     'GEOPOLITICAL': re.compile(
         r'(?<!스트리밍 )(?<!가격 )전쟁|제재|관세|금수|미사일|침공|지정학|트럼프|바이든|'
         r'미중|러시아|이란|NATO|나토'),
+    # P1: 7 new categories (Korean)
+    'US_POLITICS_ELECTION': re.compile(
+        r'선거|중간선거|대선|대통령\s*선거|행정명령|예비선거|투표|후보|취임'),
+    'US_FISCAL_DEBT': re.compile(
+        r'부채\s*한도|재정\s*적자|재정\s*정책|정부\s*셧다운|국채\s*입찰|'
+        r'예산\s*(안|위기)|국가\s*부채|재정\s*절벽'),
+    'US_SCANDAL_LEGAL': re.compile(
+        r'기소|탄핵|특별\s*검사|대배심|소환장|형사\s*고발|유죄|윤리\s*조사'),
+    'WALLSTREET_SIGNAL': re.compile(
+        r'골드만\s*삭스|JP모건|모건\s*스탠리|애널리스트|목표\s*주가|'
+        r'투자\s*의견|월가\s*(전망|컨센서스)|블랙록'),
+    'IMMIGRATION_POLICY': re.compile(
+        r'이민\s*(정책|개혁)|국경\s*(장벽|위기)|추방|망명|'
+        r'비자\s*(금지|정책)|난민|이주민|불법\s*체류'),
+    'TECH_NASDAQ': re.compile(
+        r'기술주|반도체|칩\s*(수출|규제|부족)|AI\s*규제|빅테크|반독점|'
+        r'인공지능|AI\s*(붐|버블)|칩\s*전쟁|TSMC|ASML'),
+    'MACRO_RATES': re.compile(
+        r'국채\s*수익률|수익률\s*곡선|신용\s*스프레드|'
+        r'기간\s*프리미엄|채권\s*(입찰|매도|매각)|TLT|실질\s*금리|듀레이션'),
 }
 
 # ── Keyword-based topic estimation (for unclassified) ────
@@ -162,6 +219,36 @@ TOPIC_KEYWORD_MAP = {
                           'bitcoin purchase', 'btc purchase', 'galaxy digital',
                           'grayscale', 'fidelity crypto', 'blackrock bitcoin',
                           'corporate treasury', 'bitcoin adoption'},
+    # P1: 7 new categories
+    'US_POLITICS_ELECTION': {'election', 'presidential', 'midterm', 'caucus',
+                             'ballot', 'polling', 'executive order', 'electoral',
+                             'swing state', 'campaign', 'nominee', 'primary',
+                             'inauguration', 'gubernatorial'},
+    'US_FISCAL_DEBT': {'debt ceiling', 'deficit', 'fiscal policy', 'fiscal cliff',
+                       'government shutdown', 'treasury auction', 'budget',
+                       'sequester', 'federal spending', 'national debt',
+                       'continuing resolution', 'appropriation', 'fiscal stimulus'},
+    'US_SCANDAL_LEGAL': {'indictment', 'impeach', 'impeachment', 'special counsel',
+                         'grand jury', 'arraign', 'subpoena', 'criminal charges',
+                         'plea deal', 'felony', 'obstruction', 'contempt',
+                         'ethics probe', 'classified documents', 'hush money'},
+    'WALLSTREET_SIGNAL': {'goldman sachs', 'jpmorgan', 'morgan stanley',
+                          'analyst upgrade', 'analyst downgrade', 'price target',
+                          'strategist', 'wall street forecast', 'bank of america',
+                          'citigroup', 'wells fargo', 'blackrock',
+                          'equity research'},
+    'IMMIGRATION_POLICY': {'immigration', 'border wall', 'border security',
+                           'deportation', 'asylum', 'visa ban', 'migrant',
+                           'refugee', 'ice raid', 'dhs', 'undocumented',
+                           'h-1b', 'green card', 'border crisis'},
+    'TECH_NASDAQ': {'tech stocks', 'semiconductor', 'chip ban', 'chip export',
+                    'ai regulation', 'big tech', 'antitrust',
+                    'artificial intelligence', 'ai boom', 'chip war',
+                    'tsmc', 'asml', 'foundry', 'chip shortage', 'chip act'},
+    'MACRO_RATES': {'treasury yield', 'yield curve', 'credit spread', 'us10y',
+                    'us2y', 'term premium', 'bond auction', 'bond selloff',
+                    'tlt', 'real rate', 'real yield', 'duration risk',
+                    'swap spread', 'sovereign debt', 'coupon auction'},
 }
 
 # ── Relevance boost keywords (US macro / Nasdaq) ────────
@@ -182,6 +269,13 @@ RELEVANCE_BOOST_KEYWORDS = {
     # Politics / geopolitical
     'tariff', 'sanction', 'election', 'trump', 'white house',
     'debt ceiling', 'government shutdown', 'geopolitical',
+    # P1: US politics / macro expansion
+    'presidential', 'midterm', 'executive order',
+    'indictment', 'impeachment', 'special counsel',
+    'goldman sachs', 'jpmorgan', 'morgan stanley',
+    'semiconductor', 'chip ban', 'ai regulation', 'big tech',
+    'bond auction', 'credit spread', 'tlt', 'term premium',
+    'immigration', 'deportation', 'border',
 }
 RELEVANCE_BOOST_AMOUNT = 0.15
 
@@ -409,3 +503,80 @@ def preview_classify(title: str, source: str, impact_score=0,
         'deny_reasons': deny_reasons,
         'APPLIED': not APPROVAL_REQUIRED,
     }
+
+
+# ── Scandal Confirmation Gate (P2) ──────────────────────────
+SCANDAL_CONFIRMATION_CONFIG = {
+    'min_source_quality': 0.85,
+    'allowed_tiers': ('TIER1', 'TIER2'),
+    'confirmation_window_min': 120,
+    'min_independent_sources': 2,
+    'rumor_keywords': re.compile(
+        r'(?i)\b(claim|rumor|alleged|reportedly|unconfirmed|sources say|speculation)\b'),
+    'rumor_impact_cap': 4,
+}
+
+
+def scandal_confirmation_check(topic, title, source, impact_score,
+                                db_cursor=None) -> dict:
+    """Check if a scandal/legal news item is sufficiently confirmed.
+
+    Only applies to US_SCANDAL_LEGAL topic.
+    Returns:
+        {confirmed, reason, impact_cap, allow_storage(always True), allow_trading}
+    """
+    cfg = SCANDAL_CONFIRMATION_CONFIG
+    result = {
+        'confirmed': True,
+        'reason': '',
+        'impact_cap': None,
+        'allow_storage': True,
+        'allow_trading': True,
+    }
+
+    # Only gate US_SCANDAL_LEGAL
+    if topic != 'US_SCANDAL_LEGAL':
+        return result
+
+    # Check rumor keywords → cap impact
+    title_text = title or ''
+    if cfg['rumor_keywords'].search(title_text):
+        result['impact_cap'] = cfg['rumor_impact_cap']
+        result['reason'] = 'rumor_keyword_detected'
+
+    # Check source quality
+    src_quality = get_source_weight(source)
+    if src_quality < cfg['min_source_quality']:
+        result['confirmed'] = False
+        result['allow_trading'] = False
+        result['reason'] = f'source_quality_low({src_quality:.2f}<{cfg["min_source_quality"]})'
+        return result
+
+    # Check independent source corroboration from DB
+    if db_cursor:
+        try:
+            db_cursor.execute("""
+                SELECT COUNT(DISTINCT source)
+                FROM news
+                WHERE topic_class = 'US_SCANDAL_LEGAL'
+                  AND ts >= now() - interval '%s minutes'
+                  AND source != %%s
+                  AND exclusion_reason IS NULL
+            """ % cfg['confirmation_window_min'], (source,))
+            row = db_cursor.fetchone()
+            independent_count = (row[0] if row and row[0] else 0)
+            if independent_count < cfg['min_independent_sources']:
+                result['confirmed'] = False
+                result['allow_trading'] = False
+                result['reason'] = (
+                    f'insufficient_sources({independent_count}'
+                    f'<{cfg["min_independent_sources"]})')
+                return result
+        except Exception:
+            # DB check failure → unconfirmed (conservative)
+            result['confirmed'] = False
+            result['allow_trading'] = False
+            result['reason'] = 'db_check_failed'
+            return result
+
+    return result

@@ -373,6 +373,60 @@ def compute_total(cur=None, exchange=None):
         except Exception as e:
             _log(f'BREAKOUT news override skip: {e}')
 
+        # ── Dynamic news weight boost for high-impact political/macro events ──
+        high_impact_news_boost = False
+        try:
+            news_details = news_evt_result.get('details', {})
+            hi_meta = news_details.get('high_impact_meta', {})
+            if (hi_meta.get('has_high_impact')
+                    and hi_meta.get('top_impact', 0) >= 7
+                    and hi_meta.get('top_source_quality', 0) >= 16):
+                base_news_w = weights['news_event_w']
+                boosted_w = min(0.15, base_news_w * 3)
+
+                # QQQ 30min corroboration: if |QQQ change| > $1.50 → boost further
+                try:
+                    cur.execute("""
+                        WITH latest AS (SELECT price FROM macro_data WHERE source='QQQ' ORDER BY ts DESC LIMIT 1),
+                             past AS (SELECT price FROM macro_data WHERE source='QQQ'
+                                      AND ts <= now()-interval '30 minutes' ORDER BY ts DESC LIMIT 1)
+                        SELECT (SELECT price FROM latest) - (SELECT price FROM past);
+                    """)
+                    qqq_row = cur.fetchone()
+                    if qqq_row and qqq_row[0] and abs(float(qqq_row[0])) > 1.50:
+                        boosted_w = min(0.18, boosted_w + 0.03)
+                except Exception:
+                    pass
+
+                # VIX spike corroboration: if VIX up >10% in 30min → boost further
+                try:
+                    cur.execute("""
+                        WITH latest AS (SELECT price FROM macro_data WHERE source='VIX' ORDER BY ts DESC LIMIT 1),
+                             past AS (SELECT price FROM macro_data WHERE source='VIX'
+                                      AND ts <= now()-interval '30 minutes' ORDER BY ts DESC LIMIT 1)
+                        SELECT (SELECT price FROM latest), (SELECT price FROM past);
+                    """)
+                    vix_row = cur.fetchone()
+                    if vix_row and vix_row[0] and vix_row[1] and float(vix_row[1]) > 0:
+                        vix_change_pct = (float(vix_row[0]) - float(vix_row[1])) / float(vix_row[1])
+                        if vix_change_pct > 0.10:
+                            boosted_w = min(0.20, boosted_w + 0.02)
+                except Exception:
+                    pass
+
+                # Final cap: 0.20
+                boosted_w = min(0.20, boosted_w)
+                delta = boosted_w - base_news_w
+                if delta > 0:
+                    weights['news_event_w'] = boosted_w
+                    # Delta taken from tech_w only
+                    weights['tech_w'] -= delta
+                    high_impact_news_boost = True
+                    _log(f'HIGH_IMPACT news_w boost: {base_news_w:.2f} -> {boosted_w:.2f} '
+                         f'(cat={hi_meta.get("top_category")} impact={hi_meta.get("top_impact")})')
+        except Exception as e:
+            _log(f'HIGH_IMPACT news boost skip: {e}')
+
         # GUARD: NEWS_EVENT cannot trigger trades alone.
         # If both TECH and POSITION are neutral (abs < 10), zero out NEWS_EVENT.
         news_event_guarded = False
@@ -429,6 +483,7 @@ def compute_total(cur=None, exchange=None):
             'news_event_score': news_event_score,
             'news_event_guarded': news_event_guarded,
             'breakout_news_override': breakout_news_override,
+            'high_impact_news_boost': high_impact_news_boost,
             # Legacy compat
             'macro_score': macro_score,
             'liquidity_score': 0,

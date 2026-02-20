@@ -47,6 +47,14 @@ CATEGORY_WEIGHT_DEFAULT = {
     'JAPAN_BOJ': 15, 'CHINA': 15,
     'FIN_STRESS': 18, 'CRYPTO_SPECIFIC': 14,
     'OTHER': 5,
+    # P1: US politics / macro expansion
+    'US_POLITICS_ELECTION': 16,
+    'US_FISCAL': 19,          # debt ceiling crises move BTC
+    'US_SCANDAL_LEGAL': 12,   # lower — rumor-prone
+    'WALLSTREET_SIGNAL': 10,  # deliberately capped (P4 spec)
+    'IMMIGRATION_POLICY': 8,
+    'TECH_NASDAQ': 15,
+    'MACRO_RATES': 20,        # treasury rates correlate with BTC
 }
 # Will be populated from DB if available
 CATEGORY_WEIGHT = dict(CATEGORY_WEIGHT_DEFAULT)
@@ -104,8 +112,11 @@ TIER_MULTIPLIERS = {
 
 # ── 전략 반영 카테고리 ────────────────────────────────────
 # STRATEGY_CATEGORIES에 포함된 카테고리만 전략 점수에 의미있게 반영
-STRATEGY_TIER1 = {'FED_RATES', 'CPI_JOBS', 'REGULATION_SEC_ETF', 'WAR'}
-STRATEGY_TIER2 = {'NASDAQ_EQUITIES', 'US_POLITICS', 'FIN_STRESS', 'CRYPTO_SPECIFIC'}
+STRATEGY_TIER1 = {'FED_RATES', 'CPI_JOBS', 'REGULATION_SEC_ETF', 'WAR',
+                   'MACRO_RATES', 'US_FISCAL'}
+STRATEGY_TIER2 = {'NASDAQ_EQUITIES', 'US_POLITICS', 'FIN_STRESS', 'CRYPTO_SPECIFIC',
+                   'US_POLITICS_ELECTION', 'TECH_NASDAQ', 'US_SCANDAL_LEGAL',
+                   'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY'}
 STRATEGY_CATEGORIES = STRATEGY_TIER1 | STRATEGY_TIER2
 # 카테고리별 전략 가중치
 STRATEGY_CATEGORY_MULT = {}
@@ -331,6 +342,9 @@ def _majority_direction(gpt_dir, trace_ret_2h, kw_sentiment):
 MACRO_CATEGORIES = {
     'FED_RATES', 'CPI_JOBS', 'NASDAQ_EQUITIES', 'US_POLITICS',
     'WAR', 'JAPAN_BOJ', 'CHINA', 'FIN_STRESS',
+    # P1: US politics / macro expansion
+    'US_POLITICS_ELECTION', 'US_FISCAL', 'US_SCANDAL_LEGAL',
+    'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY', 'TECH_NASDAQ', 'MACRO_RATES',
 }
 CRYPTO_CATEGORIES = {'CRYPTO_SPECIFIC', 'REGULATION_SEC_ETF'}
 
@@ -711,6 +725,30 @@ def compute(cur):
             score_trace += f" corr:{btc_qqq_corr:.2f}"
         score_trace += f" -> {blended_score:+d} 방향:{dir_char}{ctx_str}"
 
+        # P1: Compute high_impact_meta for dynamic news weight boost
+        top_category = ''
+        top_impact = 0
+        top_source_quality = 0
+        has_high_impact = False
+        for r in deduped:
+            news_id = r[0]
+            cat = row_cats[news_id]
+            imp = int(r[3] or 0)
+            sq = _get_source_quality(r[2])
+            if cat in STRATEGY_TIER1 and imp >= 7:
+                has_high_impact = True
+                if imp > top_impact or (imp == top_impact and sq > top_source_quality):
+                    top_impact = imp
+                    top_category = cat
+                    top_source_quality = sq
+
+        high_impact_meta = {
+            'has_high_impact': has_high_impact,
+            'top_category': top_category,
+            'top_impact': top_impact,
+            'top_source_quality': top_source_quality,
+        }
+
         return {
             'score': blended_score,
             'is_supplementary': True,
@@ -730,6 +768,7 @@ def compute(cur):
                 'score_trace': score_trace,
                 'stats_version': stats_version,
                 'stats_total_samples': total_samples,
+                'high_impact_meta': high_impact_meta,
             },
             'action_constraints': {
                 'can_open': False,

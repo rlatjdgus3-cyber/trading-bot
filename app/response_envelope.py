@@ -497,11 +497,15 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
         stage = strat_pos.get('stage', 0)
         cap_used = strat_pos.get('capital_used_usdt', 0)
         budget_pct = strat_pos.get('trade_budget_used_pct', 0)
-        # Show PLAN.* state with intent hint
+        # Show PLAN.* state with intent/filled hint
         display_state = strat_state
         intent_hint = ''
         if strat_state.startswith('PLAN.INTENT_') and exch_position == 'NONE':
-            intent_hint = ' (아직 주문/체결 아님)'
+            intent_hint = ' <- 전략 신호 (미체결)'
+        elif strat_state.startswith('PLAN.OPEN') and exch_position in ('LONG', 'SHORT'):
+            intent_hint = ' <- 체결 확인(FILLED)'
+        elif strat_state.startswith('PLAN.OPEN') and exch_position == 'NONE':
+            intent_hint = ' <- DB 기록만 (거래소 미확인)'
         sections.append(f'   - 상태: {display_state}{intent_hint}')
         sections.append(f'   - 방향: {side.upper() if side else "?"}')
         sections.append(f'   - 수량: {qty}')
@@ -728,7 +732,11 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
             exch_position = exch_pos.get('exchange_position', 'UNKNOWN') if exch_pos else 'UNKNOWN'
             note = ''
             if state == 'INTENT_ENTER' and exch_position == 'NONE':
-                note = ' (체결 확정 아님)'
+                note = ' <- 전략 신호 (미체결)'
+            elif state == 'OPEN' and exch_position in ('LONG', 'SHORT'):
+                note = ' <- 체결 확인(FILLED)'
+            elif state == 'OPEN' and exch_position == 'NONE':
+                note = ' <- DB 기록만 (거래소 미확인)'
             sections.append(
                 f'[STRATEGY_DB] State: {state} {side} qty={qty} stage={stage}{note}'
             )
