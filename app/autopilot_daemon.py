@@ -1476,7 +1476,140 @@ def _run_strategy_v2(cur, scores, regime_ctx):
          f'reason={decision.get("reason", "")[:80]}')
 
     # In 'shadow' mode, don't execute — just logged above
-    # In 'on' mode, future integration point for replacing old logic
+    if STRATEGY_V2_ENABLED != 'on':
+        return None
+
+    # ── 'on' mode: execute v2 decisions ──
+    if action == 'HOLD':
+        return 'HOLD'  # Caller will skip old logic
+
+    side = decision.get('side', '').upper()
+    reason = decision.get('reason', '')
+    meta = decision.get('meta', {})
+    meta['strategy_v2'] = True
+    meta['mode'] = mode
+    meta['drift_submode'] = drift_submode
+
+    if action == 'EXIT' and position:
+        # Enqueue CLOSE via execution_queue
+        direction = position['side'].upper()
+        # Duplicate check: don't enqueue if CLOSE already pending
+        cur.execute("""
+            SELECT id FROM execution_queue
+            WHERE symbol = %s AND action_type = 'CLOSE' AND direction = %s
+              AND status IN ('PENDING', 'PICKED', 'SENT')
+              AND ts >= now() - interval '5 minutes';
+        """, (SYMBOL, direction))
+        if cur.fetchone():
+            _log(f'v2 EXIT skipped: CLOSE already pending in queue')
+            return 'HOLD'
+        cur.execute("""
+            INSERT INTO execution_queue
+                (symbol, action_type, direction, source, reason, priority,
+                 expire_at, meta)
+            VALUES (%s, 'CLOSE', %s, 'autopilot_v2', %s, 2,
+                    now() + interval '5 minutes', %s::jsonb)
+            RETURNING id;
+        """, (SYMBOL, direction, reason, json.dumps(meta, default=str)))
+        eq_row = cur.fetchone()
+        eq_id = eq_row[0] if eq_row else None
+        _log(f'v2 EXIT enqueued: CLOSE {direction} eq_id={eq_id}')
+        _notify_telegram(
+            f'🔴 V2 EXIT: {direction} → CLOSE\n'
+            f'mode={mode} reason={reason[:60]}')
+        return 'ACTED'
+
+    if action == 'ENTER' and not position:
+        # Enqueue via signals_action_v3 (same as old flow)
+        if dedupe_hit:
+            _log('v2 ENTER skipped: dedupe hit')
+            return 'HOLD'
+        if gate_status == 'BLOCKED':
+            _log('v2 ENTER skipped: gate BLOCKED')
+            return 'HOLD'
+
+        import safety_manager
+        eq = safety_manager.get_equity_limits(cur)
+        usdt_amount = eq.get('slice_usdt', 0)
+        usdt_amount = min(usdt_amount, eq.get('operating_cap', 0))
+        if usdt_amount < 5:
+            _log('v2 ENTER skipped: usdt_amount < 5')
+            return 'HOLD'
+
+        leverage = meta.get('leverage', 3)
+        entry_meta = {
+            'direction': side,
+            'qty': usdt_amount,
+            'dry_run': False,
+            'source': 'autopilot_v2',
+            'reason': reason,
+            'strategy_v2': True,
+            'mode': mode,
+            'leverage': leverage,
+            'tp': decision.get('tp'),
+            'sl': decision.get('sl'),
+            'order_type': decision.get('order_type', 'market'),
+        }
+        now_unix = int(time.time())
+        ts_text = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now_unix))
+        cur.execute("""
+            INSERT INTO signals_action_v3 (
+                ts, symbol, tf, strategy, signal, action, price, meta, created_at_unix, processed, stage
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, NULL, %s::jsonb, %s, false, 'SIGNAL_CREATED'
+            ) RETURNING id;
+        """, (ts_text, SYMBOL, 'auto', 'AUTOPILOT_V2', 'AUTO_ENTRY', 'OPEN',
+              json.dumps(entry_meta, ensure_ascii=False, default=str), now_unix))
+        row = cur.fetchone()
+        signal_id = row[0] if row else None
+        _log(f'v2 ENTER signal: {side} signal_id={signal_id} usdt={usdt_amount}')
+        _notify_telegram(
+            f'🟢 V2 ENTER: {side}\n'
+            f'mode={mode} tp={decision.get("tp")} sl={decision.get("sl")}\n'
+            f'reason={reason[:60]}')
+        return 'ACTED'
+
+    if action == 'ADD' and position:
+        if dedupe_hit:
+            _log('v2 ADD skipped: dedupe hit')
+            return 'HOLD'
+        if gate_status == 'BLOCKED':
+            _log('v2 ADD skipped: gate BLOCKED')
+            return 'HOLD'
+
+        direction = side or position['side'].upper()
+        # Duplicate check
+        cur.execute("""
+            SELECT id FROM execution_queue
+            WHERE symbol = %s AND action_type = 'ADD' AND direction = %s
+              AND status IN ('PENDING', 'PICKED')
+              AND ts >= now() - interval '5 minutes';
+        """, (SYMBOL, direction))
+        if cur.fetchone():
+            _log('v2 ADD skipped: duplicate pending in queue')
+            return 'HOLD'
+
+        import safety_manager
+        add_usdt = safety_manager.get_add_slice_usdt(cur)
+        (ok, safety_reason) = safety_manager.run_all_checks(cur, add_usdt)
+        if not ok:
+            _log(f'v2 ADD safety block: {safety_reason}')
+            return 'HOLD'
+
+        cur.execute("""
+            INSERT INTO execution_queue
+                (symbol, action_type, direction, target_usdt,
+                 source, reason, priority, expire_at, meta)
+            VALUES (%s, 'ADD', %s, %s,
+                    'autopilot_v2', %s, 4, now() + interval '5 minutes', %s::jsonb)
+            RETURNING id;
+        """, (SYMBOL, direction, add_usdt, reason, json.dumps(meta, default=str)))
+        eq_row = cur.fetchone()
+        eq_id = eq_row[0] if eq_row else None
+        _log(f'v2 ADD enqueued: {direction} usdt={add_usdt} eq_id={eq_id}')
+        return 'ACTED'
+
+    return None
 
 
 def _cycle():
@@ -1543,10 +1676,15 @@ def _cycle():
 
             # ── STRATEGY V2: early gate check + 3-mode routing ──
             if STRATEGY_V2_ENABLED != 'off':
+                v2_result = None
                 try:
-                    _run_strategy_v2(cur, scores, regime_ctx)
+                    v2_result = _run_strategy_v2(cur, scores, regime_ctx)
                 except Exception as e:
                     _log(f'strategy_v2 error (non-fatal): {e}')
+
+                # In 'on' mode: v2 decision replaces old logic
+                if STRATEGY_V2_ENABLED == 'on' and v2_result in ('HOLD', 'ACTED'):
+                    return  # v2 handled this cycle
 
                 # EARLY GATE CHECK — before any signal generation
                 try:
