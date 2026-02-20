@@ -40,6 +40,9 @@ WAIT_REASON_KR = {
     'WAIT_REGIME_BREAKOUT': 'BREAKOUT 모드 — VA 돌파 확인 대기',
     'WAIT_REGIME_SHOCK': 'SHOCK 모드 — 진입 차단',
     'WAIT_REGIME_TRANSITION': '레짐 전환 쿨다운 중',
+    'WAIT_COOLDOWN': '포지션 종료 후 쿨다운 대기 (TP/SL)',
+    'WAIT_DEDUPED': '동일 존/방향 신호 중복 차단 (5분 버킷)',
+    'WAIT_DAILY_LIMIT': '일일 체결 한도 도달',
 }
 
 
@@ -627,8 +630,9 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
     return '\n'.join(sections)
 
 
-def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason, capital_info=None):
-    """Format 6-section composite snapshot card with optional capital/leverage info."""
+def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason,
+                    capital_info=None, zone_check=None):
+    """Format composite snapshot card with optional capital/leverage/zone info."""
     recon = None
     if exch_pos and strat_pos:
         import exchange_reader
@@ -760,14 +764,39 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         gate_str = 'N/A'
     sections.append(f'[GATE] Safety: {gate_str}')
 
-    # 5.5 [GUARD] Order Throttle
+    # 5.5 [ZONE_CHECK] Zone & Filter Status
+    if zone_check:
+        zc_lines = ['[ZONE_CHECK]']
+        zc_price = zone_check.get('current_price', 0)
+        zc_lines.append(f'  current_price: ${zc_price:,.1f}')
+        dist_val = zone_check.get('dist_to_val_pct')
+        dist_vah = zone_check.get('dist_to_vah_pct')
+        dist_poc = zone_check.get('dist_to_poc_pct')
+        if dist_val is not None:
+            zc_lines.append(f'  dist_to_VAL: {dist_val:+.2f}%')
+        if dist_vah is not None:
+            zc_lines.append(f'  dist_to_VAH: {dist_vah:+.2f}%')
+        if dist_poc is not None:
+            zc_lines.append(f'  dist_to_POC: {dist_poc:+.2f}%')
+        zc_lines.append(f'  in_long_zone: {"YES" if zone_check.get("in_long_zone") else "NO"}')
+        zc_lines.append(f'  in_short_zone: {"YES" if zone_check.get("in_short_zone") else "NO"}')
+        if zone_check.get('in_mid_zone_ban'):
+            zc_lines.append(f'  MID_ZONE_BAN: YES ({zone_check.get("zone_detail", "").strip()})')
+        if zone_check.get('chase_block'):
+            zc_lines.append(f'  CHASE_BLOCK: {zone_check["chase_block"]}')
+        sections.append('\n'.join(zc_lines))
+
+    # 5.6 [THROTTLE] Order Throttle (renamed from GUARD)
     if capital_info:
         try:
             import order_throttle
             ts = order_throttle.get_throttle_status()
-            guard_lines = ['[GUARD] Order Throttle']
+            guard_lines = ['[THROTTLE] Order Throttle']
             guard_lines.append(f'  attempts: {ts["hourly_count"]}/{ts["hourly_limit"]} (1h) | '
                               f'{ts["10min_count"]}/{ts["10min_limit"]} (10m)')
+            # Daily trade count (FILLED)
+            if zone_check and zone_check.get('daily_trade_count') is not None:
+                guard_lines.append(f'  daily_trade_count(FILLED): {zone_check["daily_trade_count"]}/60')
             if ts.get('entry_locked'):
                 guard_lines.append(f'  ENTRY LOCKED: {ts["lock_reason"]} -> {ts["lock_expires_str"]}')
             if ts.get('last_reject'):
@@ -776,9 +805,44 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
             cd_active = [f'{k}={v:.0f}s' for k, v in ts.get('cooldowns', {}).items() if v > 0]
             if cd_active:
                 guard_lines.append(f'  cooldowns: {", ".join(cd_active)}')
+            # WAIT_REASON detail
+            if wait_reason and wait_reason not in ('', 'N/A'):
+                wait_kr = WAIT_REASON_KR.get(wait_reason, wait_reason)
+                guard_lines.append(f'  WAIT_REASON: {wait_reason} — {wait_kr}')
+            # Next order allowed
+            try:
+                next_ts, next_reason = order_throttle.get_next_try_ts()
+                if next_ts > 0:
+                    from datetime import datetime, timezone
+                    next_str = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime('%H:%M:%S UTC')
+                    guard_lines.append(f'  next_order_allowed_at: {next_str} ({next_reason})')
+                else:
+                    guard_lines.append(f'  next_order_allowed_at: NOW')
+            except Exception:
+                pass
             sections.append('\n'.join(guard_lines))
         except Exception:
             pass
+
+    # 5.7 [LAST ACTION] Signal suppression info
+    if zone_check and zone_check.get('signal_policy'):
+        sp = zone_check['signal_policy']
+        la_lines = ['[LAST ACTION]']
+        suppress = sp.get('last_suppress_reason', 'none')
+        suppress_ts = sp.get('last_suppress_ts', 0)
+        la_lines.append(f'  last_suppress_reason: {suppress}')
+        if suppress_ts:
+            try:
+                from datetime import datetime, timezone
+                ts_str = datetime.fromtimestamp(suppress_ts, tz=timezone.utc).strftime('%H:%M:%S UTC')
+                la_lines.append(f'  last_suppress_ts: {ts_str}')
+            except Exception:
+                la_lines.append(f'  last_suppress_ts: {suppress_ts}')
+        for d in ('LONG', 'SHORT'):
+            cd_rem = sp.get(f'cooldown_{d}_remaining', 0)
+            if cd_rem > 0:
+                la_lines.append(f'  cooldown_{d}: {cd_rem}s remaining')
+        sections.append('\n'.join(la_lines))
 
     # 6. [SWITCH] Entry/Exit + WAIT_REASON
     if switch_status is not None:

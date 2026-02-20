@@ -54,6 +54,8 @@ def classify(cur, symbol='BTC/USDT:USDT'):
     # --- BB width ratio ---
     bbw_ratio = None
     bb_mid = None
+    bb_up = None
+    bb_dn = None
     try:
         cur.execute("""
             SELECT bb_up, bb_dn, bb_mid FROM indicators
@@ -87,6 +89,9 @@ def classify(cur, symbol='BTC/USDT:USDT'):
         raw['bbw_ratio'] = bbw_ratio
     except Exception as e:
         _log(f'BBW error: {e}')
+
+    # v14.1: compute absolute bb_width_pct once (used in all regime returns)
+    bb_width_pct = ((bb_up - bb_dn) / bb_mid * 100) if (bb_mid and bb_mid > 0 and bb_up is not None and bb_dn is not None) else None
 
     # --- Volume Profile ---
     poc = vah = val = None
@@ -154,29 +159,24 @@ def classify(cur, symbol='BTC/USDT:USDT'):
     except Exception as e:
         _log(f'vol_ratio error: {e}')
 
-    # --- 15m candle check for breakout (3 candles above/below VA) ---
+    # --- 5m candle check for breakout (2 consecutive 5m closes outside VA) ---
     breakout_va_confirmed = False
     breakout_direction = None
     try:
         cur.execute("""
             SELECT c FROM candles
-            WHERE symbol = %s AND tf = '1m'
-            ORDER BY ts DESC LIMIT 15;
+            WHERE symbol = %s AND tf = '5m'
+            ORDER BY ts DESC LIMIT 3;
         """, (symbol,))
-        c15_rows = cur.fetchall()
-        if len(c15_rows) >= 15 and vah and val:
-            # Check last 3 "5m blocks" (5 candles each)
-            blocks = []
-            for i in range(3):
-                block_candles = c15_rows[i*5:(i+1)*5]
-                block_close = float(block_candles[0][0])  # most recent in block
-                blocks.append(block_close)
-
-            # All 3 blocks above VAH or below VAL
-            if all(b > vah for b in blocks):
+        c5m_rows = cur.fetchall()
+        if len(c5m_rows) >= 2 and vah and val:
+            close_0 = float(c5m_rows[0][0])
+            close_1 = float(c5m_rows[1][0])
+            # 2 consecutive 5m closes above VAH or below VAL
+            if close_0 > vah and close_1 > vah:
                 breakout_va_confirmed = True
                 breakout_direction = 'UP'
-            elif all(b < val for b in blocks):
+            elif close_0 < val and close_1 < val:
                 breakout_va_confirmed = True
                 breakout_direction = 'DOWN'
         raw['breakout_va_confirmed'] = breakout_va_confirmed
@@ -206,6 +206,7 @@ def classify(cur, symbol='BTC/USDT:USDT'):
             'confidence': confidence,
             'adx_14': adx_14, 'plus_di': plus_di, 'minus_di': minus_di,
             'bbw_ratio': bbw_ratio,
+            'bb_width_pct': bb_width_pct,
             'poc': poc, 'vah': vah, 'val': val,
             'price_vs_va': price_vs_va,
             'flow_bias': flow_bias, 'flow_shock': flow_shock,
@@ -226,21 +227,39 @@ def classify(cur, symbol='BTC/USDT:USDT'):
     if cond_a:
         bo_count += 1
 
-    # Condition B: vol_ratio >= 2.0
-    cond_b = vol_ratio_5m >= 2.0
+    # Condition B: vol_ratio >= 1.8
+    cond_b = vol_ratio_5m >= 1.8
     bo_conditions['vol_ratio'] = {'value': round(vol_ratio_5m, 2), 'met': cond_b}
     if cond_b:
         bo_count += 1
 
-    # Condition C: ADX > 25
-    cond_c = adx_14 is not None and adx_14 > 25
-    bo_conditions['adx_gt_25'] = {'value': adx_14, 'met': cond_c}
+    # Condition C: BB width expanding (bbw_ratio > 1.2) OR EMA alignment (9>21>50 or 9<21<50)
+    bbw_expanding = bbw_ratio is not None and bbw_ratio > 1.2
+    ema_aligned = False
+    try:
+        cur.execute("""
+            SELECT ema_9, ema_21, ema_50 FROM indicators
+            WHERE symbol = %s AND ema_9 IS NOT NULL
+            ORDER BY ts DESC LIMIT 1;
+        """, (symbol,))
+        ema_row = cur.fetchone()
+        if ema_row and ema_row[0] is not None and ema_row[1] is not None and ema_row[2] is not None:
+            e9, e21, e50 = float(ema_row[0]), float(ema_row[1]), float(ema_row[2])
+            ema_aligned = (e9 > e21 > e50) or (e9 < e21 < e50)
+    except Exception:
+        pass
+    cond_c = bbw_expanding or ema_aligned
+    bo_conditions['bbw_or_ema'] = {
+        'bbw_expanding': bbw_expanding,
+        'ema_aligned': ema_aligned,
+        'met': cond_c,
+    }
     if cond_c:
         bo_count += 1
 
     if bo_count >= 2:
         confidence = min(100, 50 + bo_count * 15)
-        if adx_14 is not None and adx_14 > 30:
+        if ema_aligned and bbw_expanding:
             confidence = min(100, confidence + 10)
 
         return {
@@ -248,6 +267,7 @@ def classify(cur, symbol='BTC/USDT:USDT'):
             'confidence': confidence,
             'adx_14': adx_14, 'plus_di': plus_di, 'minus_di': minus_di,
             'bbw_ratio': bbw_ratio,
+            'bb_width_pct': bb_width_pct,
             'poc': poc, 'vah': vah, 'val': val,
             'price_vs_va': price_vs_va,
             'flow_bias': flow_bias, 'flow_shock': flow_shock,
@@ -260,7 +280,13 @@ def classify(cur, symbol='BTC/USDT:USDT'):
 
     # 3. RANGE (default)
     confidence = 50
-    if adx_14 is not None and adx_14 < 20 and bbw_ratio is not None and bbw_ratio < 1.0:
+    # v14.1: tightened RANGE thresholds — ADX < 18 + bb_width_pct < 1.2 → high confidence
+    if adx_14 is not None and adx_14 < 18 and bb_width_pct is not None and bb_width_pct < 1.2:
+        if price_vs_va == 'INSIDE':
+            confidence = 90
+        else:
+            confidence = 75
+    elif adx_14 is not None and adx_14 < 20 and bbw_ratio is not None and bbw_ratio < 1.0:
         if price_vs_va == 'INSIDE':
             confidence = 85
         else:
@@ -273,6 +299,7 @@ def classify(cur, symbol='BTC/USDT:USDT'):
         'confidence': confidence,
         'adx_14': adx_14, 'plus_di': plus_di, 'minus_di': minus_di,
         'bbw_ratio': bbw_ratio,
+        'bb_width_pct': bb_width_pct,
         'poc': poc, 'vah': vah, 'val': val,
         'price_vs_va': price_vs_va,
         'flow_bias': flow_bias, 'flow_shock': flow_shock,
