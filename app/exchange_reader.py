@@ -791,7 +791,9 @@ def check_and_recover_mismatch(cur, exch_pos, strat_pos, ttl_minutes=10):
         return (False, 'OK', 'no mismatch')
 
     # Case A: Exchange=NONE but DB thinks we have a position intent
-    if exch_position == 'NONE' and strat_state in ('INTENT_ENTER', 'IN_POSITION'):
+    if exch_position == 'NONE' and strat_state in (
+            'INTENT_ENTER', 'IN_POSITION',
+            'PLAN.INTENT_ENTER', 'PLAN.ORDER_REQUESTED', 'PLAN.ENTERING', 'PLAN.OPEN'):
         try:
             cur.execute("""
                 SELECT updated_at FROM position_state
@@ -831,7 +833,7 @@ def check_and_recover_mismatch(cur, exch_pos, strat_pos, ttl_minutes=10):
             return (False, 'ERROR', str(e))
 
     # Case B: Exchange has position but DB says FLAT
-    if exch_position in ('LONG', 'SHORT') and strat_state == 'FLAT':
+    if exch_position in ('LONG', 'SHORT') and strat_state in ('FLAT', 'PLAN.NONE'):
         try:
             exch_qty = exch_pos.get('exch_pos_qty', 0)
             exch_entry = exch_pos.get('exch_entry_price', 0)

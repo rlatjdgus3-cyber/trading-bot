@@ -19,6 +19,10 @@ import time
 
 LOG_PREFIX = '[health_scorer]'
 
+# Cache for exchange API calls (avoid redundant fetches)
+_cache = {'exch_ts': 0, 'exch_score': 12, 'bal_ts': 0, 'bal_score': 12}
+_CACHE_TTL = 30  # seconds
+
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
@@ -103,15 +107,22 @@ def _score_service_health():
 
 
 def _score_exchange_connectivity():
-    """Score exchange connectivity: 25 pts max."""
+    """Score exchange connectivity: 25 pts max. Cached for 30s."""
+    now = time.time()
+    if now - _cache['bal_ts'] < _CACHE_TTL:
+        return _cache['bal_score']
     try:
         import exchange_reader
         bal = exchange_reader.fetch_balance()
         if bal.get('data_status') == 'OK':
-            return 25
+            score = 25
         elif bal.get('data_status') == 'ERROR':
-            return 0
-        return 12  # Partial/unknown
+            score = 0
+        else:
+            score = 12
+        _cache['bal_ts'] = now
+        _cache['bal_score'] = score
+        return score
     except Exception as e:
         _log(f'exchange_connectivity score error: {e}')
         return 0
@@ -164,9 +175,12 @@ def _score_data_freshness(cur):
 
 
 def _score_reconcile(cur):
-    """Score reconcile status: 15 pts max."""
+    """Score reconcile status: 15 pts max. Cached for 30s."""
     if cur is None:
         return 8  # Unknown
+    now = time.time()
+    if now - _cache['exch_ts'] < _CACHE_TTL:
+        return _cache['exch_score']
     try:
         import exchange_reader
         exch = exchange_reader.fetch_position()
@@ -174,10 +188,14 @@ def _score_reconcile(cur):
         result = exchange_reader.reconcile(exch, strat)
         status = result.get('legacy', 'UNKNOWN') if isinstance(result, dict) else result
         if status == 'MATCH':
-            return 15
+            score = 15
         elif status == 'MISMATCH':
-            return 0
-        return 8  # UNKNOWN
+            score = 0
+        else:
+            score = 8
+        _cache['exch_ts'] = now
+        _cache['exch_score'] = score
+        return score
     except Exception as e:
         _log(f'reconcile score error: {e}')
         return 8

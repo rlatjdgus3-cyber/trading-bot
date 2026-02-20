@@ -31,7 +31,8 @@ def format_mctx(features, regime_ctx):
 
     # Regime section
     lines.append(f'  레짐: {regime} (confidence={conf})')
-    adx = regime_ctx.get('adx_14') or features.get('adx')
+    adx_raw = regime_ctx.get('adx_14')
+    adx = adx_raw if adx_raw is not None else features.get('adx')
     lines.append(f'  ADX: {adx:.1f}' if adx is not None else '  ADX: N/A')
     flow = regime_ctx.get('flow_bias', 0)
     lines.append(f'  flow_bias: {flow:+.1f}')
@@ -51,9 +52,15 @@ def format_mctx(features, regime_ctx):
     lines.append('')
 
     # VA/POC section
-    vah = features.get('vah') or regime_ctx.get('vah')
-    val = features.get('val') or regime_ctx.get('val')
-    poc = features.get('poc') or regime_ctx.get('poc')
+    vah = features.get('vah')
+    if vah is None:
+        vah = regime_ctx.get('vah')
+    val = features.get('val')
+    if val is None:
+        val = regime_ctx.get('val')
+    poc = features.get('poc')
+    if poc is None:
+        poc = regime_ctx.get('poc')
     if vah and val:
         va_line = f'  VAH: ${vah:,.0f} / VAL: ${val:,.0f}'
         if poc:

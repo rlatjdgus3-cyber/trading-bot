@@ -492,10 +492,11 @@ def _reconcile_and_heal(ex, cur):
             return
 
         exch_pos = exch_data.get('exchange_position', 'UNKNOWN')
+        strat_state = strat_data.get('strategy_state', 'FLAT')
         detail = recon_result['detail']
 
         # Case A: Exchange=NONE, DB thinks position → reset DB to PLAN.NONE
-        if exch_pos == 'NONE' and 'exch_none' in detail:
+        if exch_pos == 'NONE' and strat_state not in ('FLAT', 'PLAN.NONE'):
             # Check if this has persisted (wait at least 60s before healing)
             cur.execute("SELECT state_changed_at FROM position_state WHERE symbol = %s;", (SYMBOL,))
             row = cur.fetchone()
@@ -528,7 +529,7 @@ def _reconcile_and_heal(ex, cur):
                 pass
 
         # Case B: Exchange has position, DB=FLAT → sync DB from exchange
-        elif exch_pos in ('LONG', 'SHORT') and 'db_flat' in detail:
+        elif exch_pos in ('LONG', 'SHORT') and strat_state in ('FLAT', 'PLAN.NONE'):
             exch_qty = exch_data.get('exch_pos_qty', 0)
             exch_entry = exch_data.get('exch_entry_price', 0)
             cur.execute("""
@@ -554,7 +555,7 @@ def _reconcile_and_heal(ex, cur):
                 pass
 
         # Case C: Qty mismatch → update DB qty to match exchange
-        elif 'qty_diff' in detail:
+        elif exch_pos in ('LONG', 'SHORT') and strat_state not in ('FLAT', 'PLAN.NONE'):
             exch_qty = exch_data.get('exch_pos_qty', 0)
             cur.execute("""
                 UPDATE position_state SET

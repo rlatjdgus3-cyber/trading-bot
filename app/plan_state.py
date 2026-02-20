@@ -127,7 +127,7 @@ def map_legacy(side, stage, order_state=None):
     """
     if not side:
         return 'FLAT'
-    if order_state is not None:
+    if order_state is not None and order_state != '':
         os_upper = (order_state or 'NONE').upper()
         mapping = {
             'NONE': 'FLAT',
@@ -178,6 +178,9 @@ def transition_for_action(action_type, phase='request'):
     """
     is_entry = action_type.upper() in ENTRY_ACTIONS
     is_exit = action_type.upper() in EXIT_ACTIONS
+
+    if not is_entry and not is_exit:
+        return PLAN_NONE  # unknown action, fail-safe
 
     if phase == 'request':
         return PLAN_ORDER_REQUESTED if is_entry else PLAN_INTENT_EXIT
