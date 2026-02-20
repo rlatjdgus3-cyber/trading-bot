@@ -88,20 +88,21 @@ def set_env_kv(key, value):
     env_file = '/root/trading-bot/app/.env'
     if not os.path.exists(env_file):
         open(env_file, 'a', encoding='utf-8').close()
-    (rc, _) = run([
-        'bash',
-        '-lc',
-        f"grep -q '^{key}=' {env_file}"])
-    if rc == 0:
-        run([
-            'bash',
-            '-lc',
-            f"sed -i 's/^{key}=.*/{key}={value}/' {env_file}"])
-        return None
-    run([
-        'bash',
-        '-lc',
-        f"echo '{key}={value}' >> {env_file}"])
+    # Pure Python implementation — no shell injection risk
+    lines = []
+    found = False
+    with open(env_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith(f'{key}='):
+                lines.append(f'{key}={value}\n')
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f'{key}={value}\n')
+    with open(env_file, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
 
 
 def restart_core():

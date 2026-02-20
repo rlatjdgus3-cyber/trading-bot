@@ -73,8 +73,13 @@ def _get_price_after(cur, ts, hours):
         return float(row[0])
 
 
-def _classify_outcome(action, move_4h):
+def _classify_outcome(action, move_4h, position_side=None):
     """Classify whether the Claude recommendation was correct.
+
+    Args:
+        action: executed action (HOLD, REDUCE, CLOSE, REVERSE, etc.)
+        move_4h: BTC price move % in 4 hours after action
+        position_side: 'long' or 'short' — the position side at action time
 
     - HOLD + small move -> correct
     - REDUCE/CLOSE + adverse move -> correct (avoided loss)
@@ -86,6 +91,8 @@ def _classify_outcome(action, move_4h):
 
     action_upper = action.upper()
     abs_move = abs(move_4h)
+    is_long = (position_side or '').lower() == 'long'
+    is_short = (position_side or '').lower() == 'short'
 
     if action_upper == 'HOLD':
         if abs_move < 1.0:
@@ -96,23 +103,48 @@ def _classify_outcome(action, move_4h):
             return 'incorrect'
 
     elif action_upper in ('REDUCE', 'CLOSE', 'CLOSE_ALL'):
-        # These are defensive actions; correct if price moved adversely
-        if move_4h < -1.0:
-            return 'correct'
-        elif move_4h > 1.0:
-            return 'incorrect'
+        # Defensive actions: correct if price moved against the closed position
+        if is_long:
+            # Closed LONG: correct if price dropped (avoided loss)
+            if move_4h < -1.0:
+                return 'correct'
+            elif move_4h > 1.0:
+                return 'incorrect'
+        elif is_short:
+            # Closed SHORT: correct if price rose (avoided loss)
+            if move_4h > 1.0:
+                return 'correct'
+            elif move_4h < -1.0:
+                return 'incorrect'
         else:
-            return 'neutral'
+            # Unknown side: fall back to original LONG-biased logic
+            if move_4h < -1.0:
+                return 'correct'
+            elif move_4h > 1.0:
+                return 'incorrect'
+        return 'neutral'
 
     elif action_upper == 'REVERSE':
-        # Correct if the market moved in the expected new direction
-        if abs_move > 1.0:
-            return 'correct'
+        # Reverse from LONG→SHORT: correct if price dropped
+        # Reverse from SHORT→LONG: correct if price rose
+        if is_long:
+            # Was LONG, reversed to SHORT → price drop = correct
+            if move_4h < -1.0:
+                return 'correct'
+            elif move_4h > 1.0:
+                return 'incorrect'
+        elif is_short:
+            # Was SHORT, reversed to LONG → price rise = correct
+            if move_4h > 1.0:
+                return 'correct'
+            elif move_4h < -1.0:
+                return 'incorrect'
         else:
-            return 'neutral'
+            if abs_move > 1.0:
+                return 'correct'
+        return 'neutral'
 
     elif action_upper == 'ADVISORY':
-        # Advisory-only: no trade executed, record price movement as neutral
         return 'neutral'
 
     else:
@@ -124,7 +156,7 @@ def _classify_outcome(action, move_4h):
 def _fill_analysis_outcomes(cur):
     """Fill pending analysis outcomes with price data."""
     cur.execute("""
-        SELECT ao.id, ao.claude_analysis_id, ao.executed_action, ca.ts
+        SELECT ao.id, ao.claude_analysis_id, ao.executed_action, ca.ts, ca.input_packet
         FROM analysis_outcomes ao
         JOIN claude_analyses ca ON ca.id = ao.claude_analysis_id
         WHERE ao.outcome_label = 'pending'
@@ -133,7 +165,7 @@ def _fill_analysis_outcomes(cur):
     pending = cur.fetchall()
     filled = 0
 
-    for ao_id, ca_id, action, ca_ts in pending:
+    for ao_id, ca_id, action, ca_ts, input_packet in pending:
         btc_price = _get_price_at(cur, ca_ts)
         if btc_price is None:
             continue
@@ -146,7 +178,15 @@ def _fill_analysis_outcomes(cur):
         move_4h = round(((price_4h - btc_price) / btc_price) * 100, 4) if price_4h else None
         move_24h = round(((price_24h - btc_price) / btc_price) * 100, 4) if price_24h else None
 
-        outcome = _classify_outcome(action, move_4h)
+        # Extract position side from input_packet for direction-aware classification
+        position_side = None
+        try:
+            pkt = input_packet if isinstance(input_packet, dict) else (
+                __import__('json').loads(input_packet) if input_packet else {})
+            position_side = (pkt.get('position') or {}).get('side')
+        except Exception:
+            pass
+        outcome = _classify_outcome(action, move_4h, position_side=position_side)
 
         updates = []
         params = []

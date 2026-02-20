@@ -153,27 +153,37 @@ def main():
     last_emit = 0
     while True:
         time.sleep(POLL_SEC)
-        if BOT_STATE != 'RUNNING':
-            continue
-        ind = fetch_indicator_for_decision()
-        if not ind:
-            continue
-        decision = decide(ind)
-        if not decision:
-            continue
-        now = time.time()
-        if now - last_emit < MIN_SIGNAL_INTERVAL_SEC:
-            continue
-        ts_text = ts_to_text(ind['ts'])
-        sig = decision['signal']
-        act = decision['action']
-        if action_exists(ts_text, sig, act):
-            print(f'[controller] SKIP duplicate ts={ts_text!s} signal={sig!s} action={act!s}', flush=True)
+        try:
+            bot_state = os.environ.get('BOT_STATE', 'RUNNING')
+            if bot_state != 'RUNNING':
+                continue
+            ind = fetch_indicator_for_decision()
+            if not ind:
+                continue
+            decision = decide(ind)
+            if not decision:
+                continue
+            now = time.time()
+            if now - last_emit < MIN_SIGNAL_INTERVAL_SEC:
+                continue
+            ts_text = ts_to_text(ind['ts'])
+            sig = decision['signal']
+            act = decision['action']
+            if action_exists(ts_text, sig, act):
+                print(f'[controller] SKIP duplicate ts={ts_text!s} signal={sig!s} action={act!s}', flush=True)
+                last_emit = now
+                continue
+            print(f'[controller] INSERT action ts={ts_text!s} signal={sig!s} action={act!s}', flush=True)
+            insert_action(ts_text, sig, act, decision['price'], decision['meta'])
             last_emit = now
-            continue
-        print(f'[controller] INSERT action ts={ts_text!s} signal={sig!s} action={act!s}', flush=True)
-        insert_action(ts_text, sig, act, decision['price'], decision['meta'])
-        last_emit = now
+        except KeyboardInterrupt:
+            print('[controller] interrupted, shutting down', flush=True)
+            break
+        except Exception as e:
+            print(f'[controller] loop error: {e}', flush=True)
+            import traceback
+            traceback.print_exc()
+            time.sleep(POLL_SEC)
 
 
 if __name__ == '__main__':

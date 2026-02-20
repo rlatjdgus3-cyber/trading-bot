@@ -45,6 +45,7 @@ _migrations_done = False
 _exchange = None
 _last_add_price = 0.0           # last ADD attempt price
 _last_add_ts = 0.0
+_add_dedup_initialized = False
 ADD_PRICE_DEDUP_PCT = 0.1       # ±0.1% range
 ADD_PRICE_DEDUP_SEC = 600       # 10min window
 
@@ -1548,6 +1549,10 @@ def _run_strategy_v2(cur, scores, regime_ctx):
             return 'HOLD'
 
         leverage = meta.get('leverage', 3)
+        size_multiplier = meta.get('size_multiplier')
+        if size_multiplier is not None and 0 < size_multiplier < 1:
+            usdt_amount = usdt_amount * size_multiplier
+            _log(f'v2 ENTER size_multiplier={size_multiplier} applied: usdt={usdt_amount:.0f}')
         entry_meta = {
             'direction': side,
             'qty': usdt_amount,
@@ -1560,6 +1565,7 @@ def _run_strategy_v2(cur, scores, regime_ctx):
             'tp': decision.get('tp'),
             'sl': decision.get('sl'),
             'order_type': decision.get('order_type', 'market'),
+            'size_multiplier': size_multiplier,
         }
         now_unix = int(time.time())
         ts_text = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now_unix))
@@ -1828,7 +1834,28 @@ def _cycle():
                         _log('ADD blocked: duplicate pending in queue')
                     else:
                         # ADD price dedup: block ±0.1% same price within 10min
-                        global _last_add_price, _last_add_ts
+                        global _last_add_price, _last_add_ts, _add_dedup_initialized
+                        # Restore dedup state from last ADD in execution_queue on first use
+                        if not _add_dedup_initialized:
+                            _add_dedup_initialized = True
+                            try:
+                                cur.execute("""
+                                    SELECT target_usdt, extract(epoch from ts) FROM execution_queue
+                                    WHERE symbol = %s AND action_type = 'ADD'
+                                      AND status NOT IN ('REJECTED', 'EXPIRED')
+                                    ORDER BY ts DESC LIMIT 1;
+                                """, (SYMBOL,))
+                                _prev = cur.fetchone()
+                                if _prev and _prev[1]:
+                                    # Use mark_price at that time as proxy
+                                    cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
+                                    _mp = cur.fetchone()
+                                    if _mp:
+                                        _last_add_price = float(_mp[0])
+                                        _last_add_ts = float(_prev[1])
+                                        _log(f'ADD_PRICE_DEDUP restored from DB: price={_last_add_price}, ts={_last_add_ts:.0f}')
+                            except Exception as _e:
+                                _log(f'ADD_PRICE_DEDUP init error (non-fatal): {_e}')
                         try:
                             cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
                             price_row = cur.fetchone()
