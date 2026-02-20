@@ -456,6 +456,7 @@ def _check_autopilot_enabled(cur=None):
         db_migrations.ensure_trade_process_log(cur)
         db_migrations.ensure_stage_column(cur)
         db_migrations.ensure_alert_dedup_state(cur)
+        db_migrations.ensure_plan_state_column(cur)
         _migrations_done = True
     cur.execute('SELECT enabled FROM autopilot_config ORDER BY id DESC LIMIT 1;')
     row = cur.fetchone()
