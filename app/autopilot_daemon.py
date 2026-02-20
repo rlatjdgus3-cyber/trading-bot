@@ -17,6 +17,14 @@ import traceback
 import urllib.parse
 import urllib.request
 sys.path.insert(0, '/root/trading-bot/app')
+
+# ── Strategy v2 feature flag ──
+# 'off': use only old logic
+# 'shadow': run new logic in parallel, log decisions but don't execute
+# 'on': use new logic for entry/add decisions
+STRATEGY_V2_ENABLED = os.getenv('STRATEGY_V2_ENABLED', 'shadow')
+_v2_migrations_done = False
+
 LOG_PREFIX = '[autopilot]'
 SYMBOL = 'BTC/USDT:USDT'
 ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
@@ -135,8 +143,36 @@ _last_suppress_reason = ''
 _last_suppress_ts = 0
 
 
-def _record_signal_emission(cur, symbol, direction):
+def _compute_signal_key(cur, symbol, direction, regime_ctx=None):
+    """Compute composite signal key for dedup: symbol:regime:side:zone_anchor:time_bucket_5m."""
+    regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
+    # Determine zone anchor based on current price vs VA/BB levels
+    zone_anchor = 'UNKNOWN'
+    try:
+        cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (symbol,))
+        row = cur.fetchone()
+        price = float(row[0]) if row and row[0] else 0
+        if price > 0 and regime_ctx:
+            vah = regime_ctx.get('vah')
+            val = regime_ctx.get('val')
+            poc = regime_ctx.get('poc')
+            if val and price > 0 and abs(price - val) / val * 100 <= 0.3:
+                zone_anchor = 'VAL'
+            elif vah and price > 0 and abs(price - vah) / vah * 100 <= 0.3:
+                zone_anchor = 'VAH'
+            elif poc and price > 0 and abs(price - poc) / poc * 100 <= 0.2:
+                zone_anchor = 'POC'
+            else:
+                zone_anchor = 'MID'
+    except Exception:
+        pass
+    time_bucket = int(time.time()) // 300
+    return f'{symbol}:{regime}:{direction}:{zone_anchor}:{time_bucket}'
+
+
+def _record_signal_emission(cur, symbol, direction, regime_ctx=None):
     """Record signal emission timestamp in DB for cooldown tracking."""
+    # Legacy direction-based key (backward compat)
     key = f'autopilot:signal:{symbol}:{direction}'
     cur.execute("""
         INSERT INTO alert_dedup_state (key, last_sent_ts, suppressed_count)
@@ -144,13 +180,25 @@ def _record_signal_emission(cur, symbol, direction):
         ON CONFLICT (key) DO UPDATE
         SET last_sent_ts = now(), suppressed_count = 0;
     """, (key,))
+    # Composite signal key (5m bucket dedup)
+    if regime_ctx:
+        sig_key = _compute_signal_key(cur, symbol, direction, regime_ctx)
+        composite_db_key = f'autopilot:signal:{sig_key}'
+        cur.execute("""
+            INSERT INTO alert_dedup_state (key, last_sent_ts, suppressed_count)
+            VALUES (%s, now(), 0)
+            ON CONFLICT (key) DO UPDATE
+            SET last_sent_ts = now(), suppressed_count = 0;
+        """, (composite_db_key,))
 
 
-def _is_in_repeat_cooldown(cur, symbol, direction, cooldown_sec=None):
+def _is_in_repeat_cooldown(cur, symbol, direction, cooldown_sec=None, regime_ctx=None):
     """Check if same symbol+direction signal was emitted within cooldown window.
+    Also checks composite signal_key for 5m bucket dedup.
     Returns (in_cooldown: bool, remaining_sec: int)."""
     if cooldown_sec is None:
         cooldown_sec = REPEAT_SIGNAL_COOLDOWN_SEC
+    # 1. Legacy direction-based check (10min)
     key = f'autopilot:signal:{symbol}:{direction}'
     try:
         cur.execute("""
@@ -164,6 +212,23 @@ def _is_in_repeat_cooldown(cur, symbol, direction, cooldown_sec=None):
                 return (True, cooldown_sec - elapsed)
     except Exception:
         pass
+    # 2. Composite signal_key check (same zone+bucket within 5min)
+    if regime_ctx:
+        try:
+            sig_key = _compute_signal_key(cur, symbol, direction, regime_ctx)
+            composite_db_key = f'autopilot:signal:{sig_key}'
+            cur.execute("""
+                SELECT EXTRACT(EPOCH FROM (now() - last_sent_ts))::int
+                FROM alert_dedup_state WHERE key = %s;
+            """, (composite_db_key,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                elapsed = row[0]
+                bucket_cooldown = 300  # 5min bucket
+                if elapsed < bucket_cooldown:
+                    return (True, bucket_cooldown - elapsed)
+        except Exception:
+            pass
     return (False, 0)
 
 
@@ -199,7 +264,7 @@ def _check_stop_loss_cooldown(cur, symbol):
     return (True, '', 0)
 
 
-def should_emit_signal(cur, symbol, direction, conf):
+def should_emit_signal(cur, symbol, direction, conf, regime_ctx=None):
     """Central gate: decide if a new signal should be emitted.
     Returns (ok, reason).
     """
@@ -213,8 +278,8 @@ def should_emit_signal(cur, symbol, direction, conf):
         _last_suppress_ts = now_ts
         return (False, reason)
 
-    # 2. Repeat signal cooldown
-    (in_cd, remaining) = _is_in_repeat_cooldown(cur, symbol, direction)
+    # 2. Repeat signal cooldown (direction + composite key)
+    (in_cd, remaining) = _is_in_repeat_cooldown(cur, symbol, direction, regime_ctx=regime_ctx)
     if in_cd:
         reason = f'REPEAT_SIGNAL_SUPPRESSED: dir={direction} cooldown_remaining={remaining}sec'
         _last_suppress_reason = reason
@@ -274,12 +339,14 @@ def get_signal_policy_snapshot(cur):
         snapshot['regime'] = regime
         snapshot['regime_confidence'] = regime_ctx.get('confidence', 0)
         snapshot['regime_bbw_ratio'] = regime_ctx.get('bbw_ratio')
+        snapshot['regime_bb_width_pct'] = regime_ctx.get('bb_width_pct')
         snapshot['regime_adx'] = regime_ctx.get('adx_14')
         snapshot['max_stage'] = r_params.get('stage_max', 7)
         snapshot['add_min_interval_sec'] = r_params.get('add_min_interval_sec', 300)
         snapshot['max_adds_per_30m'] = r_params.get('max_adds_per_30m', 3)
         snapshot['add_retest_required'] = r_params.get('add_retest_required', False)
         snapshot['event_add_blocked'] = r_params.get('event_add_blocked', False)
+        snapshot['same_dir_reentry_cooldown_sec'] = r_params.get('same_dir_reentry_cooldown_sec', 600)
 
         # ADD interval remaining
         (interval_ok, remaining) = _check_add_interval(cur, r_params)
@@ -406,9 +473,10 @@ def _risk_checks(cur=None):
         return (False, 'trade_switch OFF')
 
     cur.execute("""
-        SELECT count(*) FROM trade_process_log
-        WHERE source = 'autopilot'
-          AND ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul';
+        SELECT count(*) FROM execution_log
+        WHERE symbol = 'BTC/USDT:USDT' AND status = 'FILLED'
+          AND order_type IN ('OPEN', 'ADD')
+          AND last_fill_at >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul';
     """)
     row = cur.fetchone()
     daily_count = int(row[0]) if row else 0
@@ -499,6 +567,313 @@ def _check_consec_loss_cooldown(cur, direction, regime_params):
     return (True, '')
 
 
+def _compute_entry_zones(price, regime_ctx, bb_data=None):
+    """Compute zone-based entry eligibility for RANGE mode.
+
+    Returns dict with zone flags and distance metrics.
+    FAIL-OPEN: returns all-False zones if data unavailable.
+    """
+    result = {
+        'in_long_zone': False,
+        'in_short_zone': False,
+        'in_mid_zone_ban': False,
+        'dist_to_val_pct': None,
+        'dist_to_vah_pct': None,
+        'dist_to_poc_pct': None,
+        'zone_detail': '',
+    }
+    if not price or price <= 0:
+        return result
+
+    vah = regime_ctx.get('vah') if regime_ctx else None
+    val = regime_ctx.get('val') if regime_ctx else None
+    poc = regime_ctx.get('poc') if regime_ctx else None
+
+    # Get regime params for margins
+    import regime_reader
+    regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
+    r_params = regime_reader.get_regime_params(regime, regime_ctx.get('shock_type') if regime_ctx else None)
+    va_margin = r_params.get('zone_margin_va_pct', 0.12) / 100
+    bb_margin = r_params.get('zone_margin_bb_pct', 0.08) / 100
+    mid_ban_pct = r_params.get('mid_zone_ban_pct', 0.15) / 100
+
+    bb_lower = bb_data.get('bb_lower') if bb_data else None
+    bb_upper = bb_data.get('bb_upper') if bb_data else None
+    bb_mid = bb_data.get('bb_mid') if bb_data else None
+
+    # Distance calculations
+    if val and val > 0:
+        result['dist_to_val_pct'] = round((price - val) / val * 100, 3)
+    if vah and vah > 0:
+        result['dist_to_vah_pct'] = round((price - vah) / vah * 100, 3)
+    if poc and poc > 0:
+        result['dist_to_poc_pct'] = round((price - poc) / poc * 100, 3)
+
+    # LONG_ZONE: price <= max(VAL*(1+va_margin), BB_lower*(1+bb_margin))
+    long_boundaries = []
+    if val and val > 0:
+        long_boundaries.append(val * (1 + va_margin))
+    if bb_lower and bb_lower > 0:
+        long_boundaries.append(bb_lower * (1 + bb_margin))
+    if long_boundaries and price <= max(long_boundaries):
+        result['in_long_zone'] = True
+        result['zone_detail'] += 'LONG_ZONE '
+
+    # SHORT_ZONE: price >= min(VAH*(1-va_margin), BB_upper*(1-bb_margin))
+    short_boundaries = []
+    if vah and vah > 0:
+        short_boundaries.append(vah * (1 - va_margin))
+    if bb_upper and bb_upper > 0:
+        short_boundaries.append(bb_upper * (1 - bb_margin))
+    if short_boundaries and price >= min(short_boundaries):
+        result['in_short_zone'] = True
+        result['zone_detail'] += 'SHORT_ZONE '
+
+    # MID_ZONE_BAN: |price - POC| <= mid_ban_pct OR |price - BB_mid| <= mid_ban_pct
+    if poc and poc > 0 and abs(price - poc) / poc <= mid_ban_pct:
+        result['in_mid_zone_ban'] = True
+        result['zone_detail'] += 'MID_BAN(POC) '
+    elif bb_mid and bb_mid > 0 and abs(price - bb_mid) / bb_mid <= mid_ban_pct:
+        result['in_mid_zone_ban'] = True
+        result['zone_detail'] += 'MID_BAN(BB_mid) '
+
+    return result
+
+
+# ── Anti-chase filter state ──
+_anti_chase_ban_until = 0.0
+_anti_chase_ban_reason = ''
+
+
+def _check_anti_chase(cur, regime_ctx, dry_run=False):
+    """Anti-chase filter for RANGE mode.
+    Blocks entry for 3min after sharp 1m/5m price moves.
+    dry_run=True: read-only check (no global state mutation), used by /snapshot.
+    Returns (ok, reason)."""
+    global _anti_chase_ban_until, _anti_chase_ban_reason
+
+    now = time.time()
+    if now < _anti_chase_ban_until:
+        remaining = int(_anti_chase_ban_until - now)
+        return (False, f'ANTI_CHASE active: {_anti_chase_ban_reason} ({remaining}s remaining)')
+
+    regime = regime_ctx.get('regime', 'UNKNOWN') if regime_ctx else 'UNKNOWN'
+    if regime != 'RANGE':
+        return (True, 'not RANGE mode')
+
+    import regime_reader
+    r_params = regime_reader.get_regime_params(regime, regime_ctx.get('shock_type') if regime_ctx else None)
+    ret_1m_threshold = r_params.get('anti_chase_ret_1m', 0.25)
+    ret_5m_threshold = r_params.get('anti_chase_ret_5m', 0.60)
+    ban_sec = r_params.get('anti_chase_ban_sec', 180)
+
+    try:
+        cur.execute("""
+            SELECT c FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT 6;
+        """, (SYMBOL,))
+        rows = cur.fetchall()
+        if len(rows) >= 2:
+            c_now = float(rows[0][0])
+            c_1m_ago = float(rows[1][0])
+            if c_1m_ago > 0:
+                ret_1m = abs(c_now - c_1m_ago) / c_1m_ago * 100
+                if ret_1m > ret_1m_threshold:
+                    if not dry_run:
+                        _anti_chase_ban_until = now + ban_sec
+                        _anti_chase_ban_reason = f'ret_1m={ret_1m:.2f}% > {ret_1m_threshold}%'
+                    return (False, f'ANTI_CHASE: ret_1m={ret_1m:.2f}% > {ret_1m_threshold}%')
+        if len(rows) >= 6:
+            c_now = float(rows[0][0])
+            c_5m_ago = float(rows[5][0])
+            if c_5m_ago > 0:
+                ret_5m = abs(c_now - c_5m_ago) / c_5m_ago * 100
+                if ret_5m > ret_5m_threshold:
+                    if not dry_run:
+                        _anti_chase_ban_until = now + ban_sec
+                        _anti_chase_ban_reason = f'ret_5m={ret_5m:.2f}% > {ret_5m_threshold}%'
+                    return (False, f'ANTI_CHASE: ret_5m={ret_5m:.2f}% > {ret_5m_threshold}%')
+    except Exception as e:
+        _log(f'anti_chase check error (FAIL-OPEN): {e}')
+
+    return (True, '')
+
+
+def _get_bb_data(cur):
+    """Fetch BB band data from indicators table. Returns dict or empty."""
+    try:
+        cur.execute("""
+            SELECT bb_up, bb_dn, bb_mid FROM indicators
+            WHERE symbol = %s
+            ORDER BY ts DESC LIMIT 1;
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        if row and row[0] and row[1] and row[2]:
+            return {
+                'bb_upper': float(row[0]),
+                'bb_lower': float(row[1]),
+                'bb_mid': float(row[2]),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def _check_reversal_confirmation(cur, direction):
+    """Check reversal confirmation for RANGE entry.
+    RSI(5m) turning or candle engulfing pattern.
+    Returns (ok, reason)."""
+    try:
+        # RSI check: two recent 5m RSI values
+        cur.execute("""
+            SELECT rsi_14 FROM indicators
+            WHERE symbol = %s AND tf = '5m' AND rsi_14 IS NOT NULL
+            ORDER BY ts DESC LIMIT 2;
+        """, (SYMBOL,))
+        rsi_rows = cur.fetchall()
+        if len(rsi_rows) >= 2:
+            rsi_now = float(rsi_rows[0][0])
+            rsi_prev = float(rsi_rows[1][0])
+            if direction == 'LONG':
+                # RSI was oversold and turning up
+                if rsi_prev < 35 and rsi_now > rsi_prev:
+                    return (True, f'RSI reversal LONG: {rsi_prev:.0f}→{rsi_now:.0f}')
+            else:
+                # RSI was overbought and turning down
+                if rsi_prev > 65 and rsi_now < rsi_prev:
+                    return (True, f'RSI reversal SHORT: {rsi_prev:.0f}→{rsi_now:.0f}')
+
+        # Candle engulfing pattern check
+        cur.execute("""
+            SELECT o, c FROM candles
+            WHERE symbol = %s AND tf = '5m'
+            ORDER BY ts DESC LIMIT 2;
+        """, (SYMBOL,))
+        c_rows = cur.fetchall()
+        if len(c_rows) >= 2:
+            cur_o, cur_c = float(c_rows[0][0]), float(c_rows[0][1])
+            prev_o, prev_c = float(c_rows[1][0]), float(c_rows[1][1])
+            if direction == 'LONG':
+                # Bullish engulfing: prev bearish, cur bullish and engulfs prev
+                if prev_c < prev_o and cur_c > cur_o and cur_c > prev_o and cur_o < prev_c:
+                    return (True, 'bullish engulfing')
+            else:
+                # Bearish engulfing: prev bullish, cur bearish and engulfs prev
+                if prev_c > prev_o and cur_c < cur_o and cur_c < prev_o and cur_o > prev_c:
+                    return (True, 'bearish engulfing')
+    except Exception as e:
+        _log(f'reversal_confirmation error (FAIL-OPEN): {e}')
+        return (True, f'FAIL-OPEN: {e}')
+
+    return (False, 'no reversal confirmation')
+
+
+def _check_post_close_cooldown(cur, symbol):
+    """Post-position-close cooldown: TP→3min, SL→10min.
+    Returns (ok, reason, remaining_sec)."""
+    try:
+        cur.execute("""
+            SELECT order_type, realized_pnl, last_fill_at
+            FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+              AND order_type IN ('CLOSE', 'FULL_CLOSE')
+              AND last_fill_at >= now() - interval '15 minutes'
+            ORDER BY last_fill_at DESC LIMIT 1;
+        """, (symbol,))
+        row = cur.fetchone()
+        if row and row[2]:
+            from datetime import datetime, timezone
+            pnl = float(row[1]) if row[1] is not None else 0
+            fill_ts = row[2]
+            if fill_ts.tzinfo is None:
+                fill_ts = fill_ts.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - fill_ts).total_seconds()
+            if pnl < 0:
+                # SL → 10min cooldown
+                cooldown = 600
+                if elapsed < cooldown:
+                    return (False, f'POST_SL_COOLDOWN: {int(cooldown - elapsed)}s remaining', int(cooldown - elapsed))
+            else:
+                # TP → 3min cooldown
+                cooldown = 180
+                if elapsed < cooldown:
+                    return (False, f'POST_TP_COOLDOWN: {int(cooldown - elapsed)}s remaining', int(cooldown - elapsed))
+    except Exception as e:
+        _log(f'post_close_cooldown error (FAIL-OPEN): {e}')
+    return (True, '', 0)
+
+
+def _check_zone_reentry_ban(cur, symbol, direction, regime_ctx):
+    """After SL at a zone, ban re-entry in same direction until price moves past POC/BB_mid.
+    Returns (ok, reason)."""
+    if not regime_ctx or regime_ctx.get('regime') != 'RANGE':
+        return (True, '')
+    try:
+        # Find most recent SL in last 30 minutes
+        cur.execute("""
+            SELECT direction, realized_pnl, last_fill_at
+            FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+              AND order_type IN ('CLOSE', 'FULL_CLOSE')
+              AND realized_pnl < 0
+              AND last_fill_at >= now() - interval '30 minutes'
+            ORDER BY last_fill_at DESC LIMIT 1;
+        """, (symbol,))
+        row = cur.fetchone()
+        if not row:
+            return (True, '')
+        sl_direction = row[0]
+        if sl_direction != direction:
+            return (True, '')
+        # Same direction SL occurred — check if price has moved past POC/BB_mid
+        cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (symbol,))
+        price_row = cur.fetchone()
+        price = float(price_row[0]) if price_row and price_row[0] else 0
+        if not price:
+            return (True, 'FAIL-OPEN: no price')
+        poc = regime_ctx.get('poc')
+        bb_data = _get_bb_data(cur)
+        bb_mid = bb_data.get('bb_mid')
+        mid_ref = poc or bb_mid
+        if not mid_ref:
+            return (True, 'FAIL-OPEN: no POC/BB_mid')
+        if direction == 'LONG' and price < mid_ref:
+            return (False, f'ZONE_REENTRY_BAN: SL LONG → price {price:.0f} < mid {mid_ref:.0f}')
+        elif direction == 'SHORT' and price > mid_ref:
+            return (False, f'ZONE_REENTRY_BAN: SL SHORT → price {price:.0f} > mid {mid_ref:.0f}')
+    except Exception as e:
+        _log(f'zone_reentry_ban error (FAIL-OPEN): {e}')
+    return (True, '')
+
+
+def _check_post_sl_opposite_ban(cur, symbol):
+    """After any SL, block ALL direction entries for 10 minutes.
+    Returns (ok, reason)."""
+    try:
+        cur.execute("""
+            SELECT last_fill_at FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+              AND order_type IN ('CLOSE', 'FULL_CLOSE')
+              AND realized_pnl < 0
+              AND last_fill_at >= now() - interval '10 minutes'
+            ORDER BY last_fill_at DESC LIMIT 1;
+        """, (symbol,))
+        row = cur.fetchone()
+        if row and row[0]:
+            from datetime import datetime, timezone
+            fill_ts = row[0]
+            if fill_ts.tzinfo is None:
+                fill_ts = fill_ts.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - fill_ts).total_seconds()
+            remaining = int(600 - elapsed)
+            if remaining > 0:
+                return (False, f'POST_SL_BAN: all entries blocked ({remaining}s remaining)')
+    except Exception as e:
+        _log(f'post_sl_opposite_ban error (FAIL-OPEN): {e}')
+    return (True, '')
+
+
 def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
     """Check if entry is allowed based on regime's entry filter.
 
@@ -525,11 +900,7 @@ def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
     dominant = scores.get('dominant_side', 'LONG')
 
     if entry_filter == 'band_edge':
-        # RANGE mode: price must be near VAL/VAH or BB boundary
-        proximity = params.get('entry_proximity_pct', 0.3)
-        vah = regime_ctx.get('vah')
-        val = regime_ctx.get('val')
-
+        # RANGE mode: zone-based entry with anti-chase, mid-zone ban, reversal confirmation
         if not price:
             try:
                 ex = _get_exchange()
@@ -538,31 +909,41 @@ def _check_regime_entry_filter(cur, regime_ctx, scores, price=None):
             except Exception:
                 return (True, 'price fetch failed — FAIL-OPEN')
 
+        vah = regime_ctx.get('vah')
+        val = regime_ctx.get('val')
         if not vah or not val:
             return (True, 'VAH/VAL unavailable — FAIL-OPEN')
 
-        near_val = abs(price - val) / val * 100 <= proximity if val > 0 else False
-        near_vah = abs(price - vah) / vah * 100 <= proximity if vah > 0 else False
+        # 1. Fetch BB data
+        bb_data = _get_bb_data(cur)
 
-        if dominant == 'LONG' and near_val:
-            # RSI filter: LONG entry needs RSI oversold
-            rsi_5m = _get_rsi_5m(cur)
-            rsi_oversold = params.get('rsi_oversold', 30)
-            if rsi_5m is not None and rsi_5m > rsi_oversold:
-                return (False, f'RANGE LONG: RSI 과매도 미달 (RSI={rsi_5m:.0f} > {rsi_oversold})')
-            return (True, f'RANGE LONG: 가격 VAL 근접 ({price:.0f} ≈ {val:.0f})')
-        if dominant == 'SHORT' and near_vah:
-            # RSI filter: SHORT entry needs RSI overbought
-            rsi_5m = _get_rsi_5m(cur)
-            rsi_overbought = params.get('rsi_overbought', 70)
-            if rsi_5m is not None and rsi_5m < rsi_overbought:
-                return (False, f'RANGE SHORT: RSI 과매수 미달 (RSI={rsi_5m:.0f} < {rsi_overbought})')
-            return (True, f'RANGE SHORT: 가격 VAH 근접 ({price:.0f} ≈ {vah:.0f})')
-        # Also allow if near opposite band (counter-trend at boundary)
-        if near_val or near_vah:
-            return (True, f'RANGE: 밴드 경계 근접')
+        # 2. Compute entry zones
+        zones = _compute_entry_zones(price, regime_ctx, bb_data)
 
-        return (False, f'RANGE 모드: 밴드 경계 대기 (VAL={val:.0f} VAH={vah:.0f} price={price:.0f})')
+        # 3. MID_ZONE_BAN check
+        if zones['in_mid_zone_ban']:
+            return (False, f'RANGE MID_ZONE_BAN: 중앙 진입 금지 ({zones["zone_detail"].strip()})')
+
+        # 4. BAND_OVERHEAT check
+        bb_upper = bb_data.get('bb_upper')
+        bb_lower = bb_data.get('bb_lower')
+        if dominant == 'LONG' and bb_upper and price > bb_upper:
+            return (False, f'RANGE BAND_OVERHEAT: LONG @ price {price:.0f} > BB_upper {bb_upper:.0f}')
+        if dominant == 'SHORT' and bb_lower and price < bb_lower:
+            return (False, f'RANGE BAND_OVERHEAT: SHORT @ price {price:.0f} < BB_lower {bb_lower:.0f}')
+
+        # 5. ZONE_GATE: LONG needs LONG_ZONE, SHORT needs SHORT_ZONE
+        if dominant == 'LONG' and not zones['in_long_zone']:
+            return (False, f'RANGE ZONE_GATE: LONG 진입 불가 (not in LONG_ZONE, dist_val={zones["dist_to_val_pct"]}%)')
+        if dominant == 'SHORT' and not zones['in_short_zone']:
+            return (False, f'RANGE ZONE_GATE: SHORT 진입 불가 (not in SHORT_ZONE, dist_vah={zones["dist_to_vah_pct"]}%)')
+
+        # 6. Reversal confirmation
+        (rev_ok, rev_reason) = _check_reversal_confirmation(cur, dominant)
+        if not rev_ok:
+            return (False, f'RANGE NO_REVERSAL: {rev_reason}')
+
+        return (True, f'RANGE {dominant}: zone OK ({zones["zone_detail"].strip()}) + {rev_reason}')
 
     if entry_filter == 'breakout_confirm':
         if not regime_ctx.get('breakout_confirmed'):
@@ -699,6 +1080,66 @@ def _check_add_retest(cur, pos_side, regime_params):
         return (True, f'FAIL-OPEN: retest check error ({e})')
 
 
+# v14.1: Telegram throttled notification (dedup by msg_type, once per 10min)
+_tg_throttle_cache = {}
+
+def _notify_telegram_throttled(text, msg_type='info', cooldown_sec=600):
+    """Send Telegram message with dedup by msg_type (default once per 10min)."""
+    now = time.time()
+    last = _tg_throttle_cache.get(msg_type, 0)
+    if now - last < cooldown_sec:
+        return
+    _tg_throttle_cache[msg_type] = now
+    _notify_telegram(text)
+
+
+def _check_same_dir_reentry_cooldown(cur, direction, regime_params):
+    """v14.1: Check same-direction re-entry cooldown.
+    After a position is closed, block same-direction re-entry for N seconds.
+    Returns (ok, remaining_sec)."""
+    cooldown_sec = regime_params.get('same_dir_reentry_cooldown_sec', 600)
+    try:
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (now() - MAX(ts)))::int
+            FROM execution_log
+            WHERE symbol = %s AND direction = %s
+              AND close_reason IS NOT NULL
+              AND status = 'FILLED'
+              AND ts >= now() - interval '1 hour';
+        """, (SYMBOL, direction))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            elapsed = row[0]
+            if elapsed < cooldown_sec:
+                return (False, cooldown_sec - elapsed)
+    except Exception:
+        pass
+    return (True, 0)
+
+
+def _check_breakout_structure_intact(cur, pos_side, regime_ctx):
+    """Check if BREAKOUT structure is still intact for ADD.
+    LONG: price must remain > VAH. SHORT: price must remain < VAL.
+    Returns (ok, reason)."""
+    try:
+        vah = regime_ctx.get('vah')
+        val = regime_ctx.get('val')
+        cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
+        row = cur.fetchone()
+        price = float(row[0]) if row and row[0] else 0
+        if not price:
+            return (True, 'FAIL-OPEN: no price')
+        if pos_side == 'long' and vah:
+            if price <= vah:
+                return (False, f'BREAKOUT LONG: price {price:.0f} <= VAH {vah:.0f} — structure broken')
+        elif pos_side == 'short' and val:
+            if price >= val:
+                return (False, f'BREAKOUT SHORT: price {price:.0f} >= VAL {val:.0f} — structure broken')
+    except Exception as e:
+        return (True, f'FAIL-OPEN: structure check error ({e})')
+    return (True, 'structure intact')
+
+
 def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, regime_ctx=None):
     """Evaluate whether ADD is allowed for an existing position.
     Returns (decision, reason) -- 'ADD', 'HOLD', 'BLOCKED'."""
@@ -727,6 +1168,17 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, 
     (retest_ok, retest_reason) = _check_add_retest(cur, pos_side, r_params)
     if not retest_ok:
         return ('HOLD', retest_reason)
+
+    # ── BREAKOUT structure intact check ──
+    if regime == 'BREAKOUT' and r_params.get('add_structure_intact_required'):
+        (struct_ok, struct_reason) = _check_breakout_structure_intact(cur, pos_side, regime_ctx)
+        if not struct_ok:
+            return ('HOLD', struct_reason)
+
+    # ── v14.1: same-direction re-entry cooldown ──
+    (reentry_ok, reentry_remaining) = _check_same_dir_reentry_cooldown(cur, direction, r_params)
+    if not reentry_ok:
+        return ('HOLD', f'SAME_DIR_COOLDOWN: {reentry_remaining}s remaining')
 
     # ── Profit-zone-only ADD (loss-zone averaging forbidden) ──
     add_min_profit = r_params.get('add_min_profit_pct', 0.25)
@@ -855,6 +1307,177 @@ def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
         traceback.print_exc()
 
 
+def _ensure_v2_migrations(cur):
+    """Run strategy v2 DB migrations once."""
+    global _v2_migrations_done
+    if _v2_migrations_done:
+        return
+    try:
+        from strategy.migrations import run_migrations
+        run_migrations(cur)
+        _v2_migrations_done = True
+    except Exception as e:
+        _log(f'v2 migrations error (non-fatal): {e}')
+        _v2_migrations_done = True  # don't retry every cycle
+
+
+def _run_strategy_v2(cur, scores, regime_ctx):
+    """Run strategy v2 routing and decision logic.
+
+    In 'shadow' mode: log decision but don't execute.
+    In 'on' mode: decision will be used by caller (future integration).
+    """
+    _ensure_v2_migrations(cur)
+
+    from strategy.common.features import build_feature_snapshot
+    from strategy.regime_router import route, get_mode_config
+    from strategy.common.dedupe import is_duplicate, record_signal, make_signal_key
+    from strategy.common.risk import validate_min_qty
+    from strategy.modes.static_range import StaticRangeStrategy
+    from strategy.modes.volatile_range import VolatileRangeStrategy
+    from strategy.modes.shock_breakout import ShockBreakoutStrategy
+
+    mode_strategies = {
+        'A': StaticRangeStrategy(),
+        'B': VolatileRangeStrategy(),
+        'C': ShockBreakoutStrategy(),
+    }
+
+    # 1. Build feature snapshot
+    features = build_feature_snapshot(cur, SYMBOL)
+
+    # 2. Get gate/throttle status
+    import order_throttle
+    throttle_status = order_throttle.get_throttle_status(cur)
+    gate_blocked = throttle_status.get('entry_locked', False)
+    gate_status = 'BLOCKED' if gate_blocked else 'OPEN'
+
+    # 3. Get current position
+    cur.execute('SELECT side, total_qty, avg_entry_price, stage FROM position_state WHERE symbol = %s;', (SYMBOL,))
+    ps_row = cur.fetchone()
+    position = None
+    if ps_row and ps_row[0] and float(ps_row[1] or 0) > 0:
+        position = {
+            'side': ps_row[0].upper(),
+            'total_qty': float(ps_row[1]),
+            'avg_entry_price': float(ps_row[2]) if ps_row[2] else 0,
+            'stage': int(ps_row[3]) if ps_row[3] else 1,
+        }
+
+    # 4. Route to mode
+    route_result = route(features, gate_status=gate_status, current_position=position)
+    mode = route_result['mode']
+    drift_submode = route_result.get('drift_submode')
+    mode_config = get_mode_config(mode)
+
+    # 5. Fetch candles and indicators for context
+    candles = []
+    indicators = {}
+    try:
+        cur.execute("""
+            SELECT ts, o, h, l, c, v FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT 10
+        """, (SYMBOL,))
+        for row in cur.fetchall():
+            candles.append({
+                'ts': row[0], 'o': float(row[1]), 'h': float(row[2]),
+                'l': float(row[3]), 'c': float(row[4]), 'v': float(row[5]),
+            })
+    except Exception:
+        pass
+
+    try:
+        cur.execute("""
+            SELECT atr_14, rsi_14, bb_mid, bb_up, bb_dn, vwap
+            FROM indicators WHERE symbol = %s
+            ORDER BY ts DESC LIMIT 1
+        """, (SYMBOL,))
+        ind_row = cur.fetchone()
+        if ind_row:
+            indicators = {
+                'atr_14': float(ind_row[0]) if ind_row[0] else None,
+                'rsi_14': float(ind_row[1]) if ind_row[1] else None,
+                'bb_mid': float(ind_row[2]) if ind_row[2] else None,
+                'bb_up': float(ind_row[3]) if ind_row[3] else None,
+                'bb_dn': float(ind_row[4]) if ind_row[4] else None,
+                'vwap': float(ind_row[5]) if ind_row[5] else None,
+            }
+    except Exception:
+        pass
+
+    # 6. Build context and call mode strategy
+    ctx = {
+        'features': features,
+        'position': position,
+        'regime_ctx': regime_ctx,
+        'config': mode_config,
+        'price': features.get('price'),
+        'indicators': indicators,
+        'vol_profile': {
+            'poc': features.get('poc'),
+            'vah': features.get('vah'),
+            'val': features.get('val'),
+        },
+        'candles': candles,
+        'drift_submode': drift_submode,
+    }
+
+    strategy = mode_strategies.get(mode)
+    if not strategy:
+        _log(f'v2: unknown mode {mode}')
+        return
+
+    decision = strategy.decide(ctx)
+
+    # 7. Check dedupe
+    dedupe_hit = False
+    signal_key = decision.get('signal_key')
+    if signal_key and decision['action'] in ('ENTER', 'ADD'):
+        dedupe_hit = is_duplicate(cur, signal_key)
+        if not dedupe_hit:
+            record_signal(cur, signal_key)
+
+    # 8. Detect chase entry
+    chase_entry = decision.get('chase_entry', False)
+    if not chase_entry and decision['action'] == 'ENTER':
+        impulse = features.get('impulse')
+        if impulse is not None and impulse > 0.8:
+            chase_entry = True
+
+    # 9. Log decision to strategy_decision_log
+    try:
+        cur.execute("""
+            INSERT INTO strategy_decision_log
+                (symbol, mode, submode, features, action, side, qty, tp, sl,
+                 gate_status, throttle_status, dedupe_hit, chase_entry,
+                 reasons, signal_key)
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s)
+        """, (
+            SYMBOL, mode, drift_submode or 'none',
+            json.dumps({k: v for k, v in features.items()
+                        if not isinstance(v, (type(None),))}, default=str),
+            decision['action'], decision.get('side'),
+            decision.get('qty'), decision.get('tp'), decision.get('sl'),
+            gate_status, json.dumps(throttle_status, default=str),
+            dedupe_hit, chase_entry,
+            route_result.get('reasons', []),
+            signal_key,
+        ))
+    except Exception as e:
+        _log(f'v2 decision log error (non-fatal): {e}')
+
+    action = decision['action']
+    _log(f'v2[{STRATEGY_V2_ENABLED}]: mode={mode} action={action} '
+         f'side={decision.get("side")} '
+         f'reason={decision.get("reason", "")[:80]}')
+
+    # In 'shadow' mode, don't execute — just logged above
+    # In 'on' mode, future integration point for replacing old logic
+
+
 def _cycle():
     conn = None
     try:
@@ -917,6 +1540,23 @@ def _cycle():
                 _log(f'REGIME VETO: 진입 차단 (flow_bias={regime_ctx.get("flow_bias")})')
                 return
 
+            # ── STRATEGY V2: early gate check + 3-mode routing ──
+            if STRATEGY_V2_ENABLED != 'off':
+                try:
+                    _run_strategy_v2(cur, scores, regime_ctx)
+                except Exception as e:
+                    _log(f'strategy_v2 error (non-fatal): {e}')
+
+                # EARLY GATE CHECK — before any signal generation
+                try:
+                    import order_throttle
+                    blocked, block_reason, _ = order_throttle.is_entry_blocked(cur)
+                    if blocked:
+                        _log(f'GATE_BLOCKED: skipping cycle — {block_reason}')
+                        return  # No signal generation, no spam
+                except Exception as e:
+                    _log(f'early gate check FAIL-OPEN: {e}')
+
             # RECONCILE MISMATCH: block new entries when exchange/strategy disagree
             try:
                 import exchange_reader
@@ -938,6 +1578,31 @@ def _cycle():
                 entry_ok, entry_reason = _check_regime_entry_filter(cur, regime_ctx, scores)
                 if not entry_ok:
                     _log(f'REGIME_FILTER: {entry_reason}')
+                    return
+
+                # RANGE anti-chase filter
+                if regime_ctx.get('regime') == 'RANGE':
+                    chase_ok, chase_reason = _check_anti_chase(cur, regime_ctx)
+                    if not chase_ok:
+                        _log(f'ANTI_CHASE: {chase_reason}')
+                        return
+
+                # Post-close cooldowns (TP→3min, SL→10min)
+                pc_ok, pc_reason, _ = _check_post_close_cooldown(cur, SYMBOL)
+                if not pc_ok:
+                    _log(f'POST_CLOSE_COOLDOWN: {pc_reason}')
+                    return
+
+                # Zone re-entry ban (SL same zone)
+                zr_ok, zr_reason = _check_zone_reentry_ban(cur, SYMBOL, dominant, regime_ctx)
+                if not zr_ok:
+                    _log(f'ZONE_REENTRY: {zr_reason}')
+                    return
+
+                # Post-SL opposite direction ban
+                opp_ok, opp_reason = _check_post_sl_opposite_ban(cur, SYMBOL)
+                if not opp_ok:
+                    _log(f'POST_SL_BAN: {opp_reason}')
                     return
 
                 # RANGE hourly entry cap
@@ -1031,10 +1696,13 @@ def _cycle():
                             _last_add_ts = time.time()
                 else:
                     _log(f'position exists, {decision}: {add_reason}')
+                    # v14.1: ADD blocked → throttled Telegram notification
+                    _notify_telegram_throttled(
+                        f'📊 ADD {decision}: {add_reason}', msg_type='add_blocked')
                 return
 
             # ── v3: Central signal emission gate ──
-            (emit_ok, emit_reason) = should_emit_signal(cur, SYMBOL, dominant, confidence)
+            (emit_ok, emit_reason) = should_emit_signal(cur, SYMBOL, dominant, confidence, regime_ctx=regime_ctx)
             if not emit_ok:
                 should_log, _ = _db_should_log_risk(cur, f'signal_suppress_{emit_reason[:30]}')
                 if should_log:
@@ -1050,7 +1718,7 @@ def _cycle():
             signal_id = _create_autopilot_signal(cur, dominant, scores, equity_limits=eq, regime_ctx=regime_ctx)
             if signal_id:
                 # Record emission for cooldown tracking
-                _record_signal_emission(cur, SYMBOL, dominant)
+                _record_signal_emission(cur, SYMBOL, dominant, regime_ctx=regime_ctx)
                 _log_trade_process(cur, signal_id, scores, 'autopilot', start_stage, entry_pct,
                                     equity_limits=eq)
                 _notify_telegram(

@@ -1,0 +1,40 @@
+daily_trade_limit: 60
+min_order_qty_btc: 0.001
+
+mode_a_static_range:
+  adx_max: 20
+  atr_pct_max: 0.009
+  bb_width_max: 0.012
+  poc_slope_max: 0.001
+  tp_pct: [0.004, 0.008]
+  sl_pct: [0.005, 0.009]
+  max_add_stages: 3
+  stage_allocation: [0.4, 0.35, 0.25]
+  add_cooldown_sec: 300
+  entry_cooldown_same_dir_sec: 300
+  leverage: [3, 5]
+  range_position_long: 0.15
+  range_position_short: 0.85
+  anti_chase_impulse_max: 0.6
+
+mode_b_volatile_range:
+  adx_max: 25
+  drift_poc_slope_min: 0.0015
+  no_trade_zone_edge_pct: 0.002
+  trade_zone_center_pct: 0.003
+  tp_pct: [0.003, 0.006]
+  sl_pct: [0.007, 0.012]
+  max_add_stages: 2
+  rebuild_cooldown_candles: 10
+  leverage: [3, 5]
+
+mode_c_shock_breakout:
+  volume_z_min: 2.0
+  impulse_min: 1.5
+  breakout_buffer_pct: 0.002
+  tp1_pct: [0.006, 0.010]
+  trailing_activate_pct: 0.008
+  trailing_pct: 0.005
+  sl_atr_multiplier: 1.5
+  max_add_stages: 2
+  leverage: [3, 8]

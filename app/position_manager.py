@@ -32,11 +32,15 @@ load_dotenv('/root/trading-bot/app/.env')
 
 SYMBOL = 'BTC/USDT:USDT'
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
+
+# ── Strategy v2 feature flag (mirrors autopilot_daemon) ──
+STRATEGY_V2_ENABLED = os.getenv('STRATEGY_V2_ENABLED', 'shadow')
 LOOP_FAST_SEC = 10
 LOOP_NORMAL_SEC = 15
 LOOP_SLOW_SEC = 30
 LOG_PREFIX = '[pos_mgr]'
 CALLER = 'position_manager'
+_EXIT_ACTIONS = frozenset({'CLOSE', 'REDUCE', 'REVERSE_CLOSE', 'FULL_CLOSE'})
 
 # Build identification — logged on startup for deployment verification
 def _get_build_sha():
@@ -1356,6 +1360,111 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     return 'HOLD'
 
 
+def _check_range_split_tp(ctx, regime_params, regime_ctx, upnl_pct, side, price):
+    """RANGE split TP: TP1 at POC/BB_mid (50% reduce), TP2 at opposite band (full close).
+
+    Returns (action, reason) or None if no TP triggered.
+    """
+    try:
+        poc = regime_ctx.get('poc')
+        vah = regime_ctx.get('vah')
+        val = regime_ctx.get('val')
+
+        # Get BB data from ctx indicators (already fetched in _build_context)
+        ind = ctx.get('indicators', {})
+        bb_mid = ind.get('bb_mid')
+        bb_upper = ind.get('bb_up')
+        bb_lower = ind.get('bb_dn')
+        if bb_mid is not None:
+            bb_mid = float(bb_mid)
+        if bb_upper is not None:
+            bb_upper = float(bb_upper)
+        if bb_lower is not None:
+            bb_lower = float(bb_lower)
+
+        tp1_close_pct = regime_params.get('tp1_close_pct', 50)
+
+        # Check if TP1 already taken: any FILLED REDUCE since last OPEN
+        tp1_taken = False
+        try:
+            conn_tp = get_conn()
+            with conn_tp.cursor() as cur_tp:
+                # Find the most recent OPEN fill time
+                cur_tp.execute("""
+                    SELECT last_fill_at FROM execution_log
+                    WHERE symbol = %s AND order_type = 'OPEN' AND status = 'FILLED'
+                    ORDER BY last_fill_at DESC LIMIT 1;
+                """, (SYMBOL,))
+                open_row = cur_tp.fetchone()
+                if open_row and open_row[0]:
+                    cur_tp.execute("""
+                        SELECT 1 FROM execution_log
+                        WHERE symbol = %s AND order_type = 'REDUCE' AND status = 'FILLED'
+                          AND last_fill_at >= %s
+                        LIMIT 1;
+                    """, (SYMBOL, open_row[0]))
+                    tp1_taken = cur_tp.fetchone() is not None
+            conn_tp.close()
+        except Exception:
+            pass
+
+        if not tp1_taken:
+            # TP1: price reaches POC or BB_mid
+            tp1_hit = False
+            tp1_ref = ''
+            if side == 'long':
+                if poc and price >= poc:
+                    tp1_hit = True
+                    tp1_ref = f'POC={poc:.0f}'
+                elif bb_mid and price >= bb_mid:
+                    tp1_hit = True
+                    tp1_ref = f'BB_mid={bb_mid:.0f}'
+            else:  # short
+                if poc and price <= poc:
+                    tp1_hit = True
+                    tp1_ref = f'POC={poc:.0f}'
+                elif bb_mid and price <= bb_mid:
+                    tp1_hit = True
+                    tp1_ref = f'BB_mid={bb_mid:.0f}'
+
+            if tp1_hit:
+                return ('REDUCE',
+                        f'RANGE TP1: {tp1_ref} 도달 → {tp1_close_pct}% 청산 (uPnL={upnl_pct:.2f}%)')
+
+        # TP2: price reaches opposite band (VAH/BB_upper for LONG, VAL/BB_lower for SHORT)
+        tp2_hit = False
+        tp2_ref = ''
+        if side == 'long':
+            if vah and price >= vah:
+                tp2_hit = True
+                tp2_ref = f'VAH={vah:.0f}'
+            elif bb_upper and price >= bb_upper:
+                tp2_hit = True
+                tp2_ref = f'BB_upper={bb_upper:.0f}'
+        else:  # short
+            if val and price <= val:
+                tp2_hit = True
+                tp2_ref = f'VAL={val:.0f}'
+            elif bb_lower and price <= bb_lower:
+                tp2_hit = True
+                tp2_ref = f'BB_lower={bb_lower:.0f}'
+
+        if tp2_hit:
+            return ('CLOSE',
+                    f'RANGE TP2: {tp2_ref} 도달 → 전량 청산 (uPnL={upnl_pct:.2f}%)')
+
+        # Fallback: tp_pct_max
+        tp_max = regime_params.get('tp_pct_max', 0.90)
+        if tp_max > 0 and upnl_pct >= tp_max:
+            return ('CLOSE', f'RANGE TP (fallback): uPnL {upnl_pct:.2f}% >= {tp_max}%')
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+    return None
+
+
 def _check_take_profit(ctx, regime_params, regime_ctx):
     """Check regime-based take-profit conditions.
 
@@ -1383,6 +1492,12 @@ def _check_take_profit(ctx, regime_params, regime_ctx):
     tp_mode = regime_params.get('tp_mode', 'fixed')
 
     if tp_mode == 'fixed':
+        # Check split TP for RANGE mode
+        if regime_params.get('tp_split_enabled') and regime_ctx.get('regime') == 'RANGE':
+            split_result = _check_range_split_tp(ctx, regime_params, regime_ctx, upnl_pct, side, price)
+            if split_result:
+                return split_result
+
         tp_max = regime_params.get('tp_pct_max', 1.5)
         if tp_max > 0 and upnl_pct >= tp_max:
             return ('CLOSE', f'REGIME TP (fixed): uPnL {upnl_pct:.2f}% >= {tp_max}%')
@@ -1405,6 +1520,87 @@ def _check_take_profit(ctx, regime_params, regime_ctx):
         return None
 
     return None
+
+
+def _v2_position_check(ctx, side, stage, price):
+    """Strategy v2 mode-aware position check.
+
+    Returns (action, reason) tuple if v2 has a recommendation, or None.
+    Only handles EXIT-type decisions from v2 modes. ADD is handled by autopilot.
+    FAIL-OPEN: returns None on any error.
+    """
+    try:
+        from strategy.common.features import build_feature_snapshot
+        from strategy.regime_router import route, get_mode_config
+        from strategy.modes.static_range import StaticRangeStrategy
+        from strategy.modes.volatile_range import VolatileRangeStrategy
+        from strategy.modes.shock_breakout import ShockBreakoutStrategy
+
+        # Need a DB cursor — borrow from ctx if available
+        regime_ctx = ctx.get('regime_ctx', {})
+        vp = ctx.get('vol_profile', {})
+        ind = ctx.get('indicators', {})
+
+        # Build minimal feature snapshot from existing ctx data
+        features = {
+            'symbol': SYMBOL,
+            'price': price,
+            'adx': regime_ctx.get('adx_14'),
+            'bb_width': regime_ctx.get('bb_width_pct', 0) / 100 if regime_ctx.get('bb_width_pct') else None,
+            'poc': vp.get('poc'),
+            'vah': vp.get('vah'),
+            'val': vp.get('val'),
+            'range_position': None,
+            'drift_score': 0,
+            'drift_direction': 'NONE',
+            'poc_slope': None,
+            'atr_pct': None,
+            'volume_z': None,
+            'impulse': None,
+        }
+
+        # Compute range_position if we have price/vah/val
+        if price and vp.get('vah') and vp.get('val'):
+            vah_f, val_f = float(vp['vah']), float(vp['val'])
+            if vah_f != val_f:
+                features['range_position'] = (float(price) - val_f) / (vah_f - val_f)
+
+        route_result = route(features)
+        mode = route_result['mode']
+
+        position = {
+            'side': side.upper() if side else '',
+            'total_qty': 0,
+            'avg_entry_price': ctx.get('position', {}).get('entry_price', 0),
+            'stage': stage,
+        }
+
+        mode_config = get_mode_config(mode)
+        strategies = {'A': StaticRangeStrategy(), 'B': VolatileRangeStrategy(), 'C': ShockBreakoutStrategy()}
+        strategy = strategies.get(mode)
+        if not strategy:
+            return None
+
+        decision_ctx = {
+            'features': features,
+            'position': position,
+            'regime_ctx': regime_ctx,
+            'config': mode_config,
+            'price': price,
+            'indicators': ind,
+            'vol_profile': vp,
+            'candles': ctx.get('candles', []),
+            'drift_submode': route_result.get('drift_submode'),
+        }
+
+        decision = strategy.decide(decision_ctx)
+        if decision['action'] == 'EXIT':
+            return (decision['action'], decision.get('reason', 'v2 exit'))
+        return None
+
+    except Exception as e:
+        _log(f'v2_position_check FAIL-OPEN: {e}')
+        return None
 
 
 def _decide(ctx=None):
@@ -1442,6 +1638,16 @@ def _decide(ctx=None):
         return ('HOLD', 'order in flight — waiting for fill confirmation')
 
     dominant = scores.get('dominant_side', 'LONG')
+
+    # ── Strategy v2: mode-aware exit/add check ──
+    if STRATEGY_V2_ENABLED != 'off':
+        v2_result = _v2_position_check(ctx, side, stage, price)
+        if v2_result:
+            v2_action, v2_reason = v2_result
+            if STRATEGY_V2_ENABLED == 'on' and v2_action in ('CLOSE', 'REDUCE'):
+                return (v2_action, f'v2: {v2_reason}')
+            elif STRATEGY_V2_ENABLED == 'shadow':
+                _log(f'v2[shadow] would: {v2_action} — {v2_reason}')
 
     # ── Regime-based TP check (before SL) ──
     regime_ctx = ctx.get('regime_ctx', {})
@@ -1630,6 +1836,25 @@ def _build_leverage_context(ctx):
 def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
     '''Insert action into execution_queue.'''
     import safety_manager
+
+    # v14.1: Throttle pre-gate — block ENTRY actions at enqueue time
+    # This prevents execution_queue flooding when rate limits are active
+    if action_type not in _EXIT_ACTIONS and direction:
+        try:
+            import order_throttle
+            import regime_reader
+            regime_ctx = regime_reader.get_current_regime(cur)
+            regime = regime_ctx.get('regime') if regime_ctx.get('available') else None
+            throttle_ok, throttle_reason, _ = order_throttle.check_all(
+                cur, action_type, direction=direction, regime=regime)
+            if not throttle_ok:
+                _log(f'ENQUEUE_THROTTLE_BLOCKED: {action_type} {direction} — {throttle_reason}')
+                _send_telegram_throttled(
+                    f'⛔ {action_type} BLOCKED: {throttle_reason}',
+                    msg_type='enqueue_throttle')
+                return None
+        except Exception as e:
+            _log(f'enqueue throttle pre-gate error (FAIL-OPEN): {e}')
 
     # Duplicate action check: block if same action_type already PENDING/PICKED
     # CLOSE 계열은 SENT도 차단 → 첫 CLOSE가 SENT인 동안 재enqueue 방지

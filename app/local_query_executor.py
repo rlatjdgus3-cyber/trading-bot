@@ -110,7 +110,8 @@ def execute(query_type=None, original_text=None):
         'reconcile': _reconcile,
         'mctx_status': _mctx_status,
         'mode_params': _mode_params,
-        'combined_snapshot': _combined_snapshot}
+        'combined_snapshot': _combined_snapshot,
+        'mode_performance': _mode_performance}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -694,7 +695,9 @@ def _combined_snapshot(_text=None):
                 lines.append(f'REGIME: {regime} (conf={regime_conf}%)')
                 bbw_str = f'{bbw:.2f}' if bbw is not None else 'N/A'
                 adx_str = f'{adx:.1f}' if adx is not None else 'N/A'
-                lines.append(f'  근거: BBW={bbw_str}, ADX={adx_str}')
+                bbw_pct = sp.get('regime_bb_width_pct')
+                bbw_pct_str = f'{bbw_pct:.2f}%' if bbw_pct is not None else 'N/A'
+                lines.append(f'  근거: BBW_ratio={bbw_str}, BB_WIDTH={bbw_pct_str}, ADX={adx_str}')
                 lines.append(f'max_stage: {sp.get("max_stage", "?")}')
                 if sp.get('in_transition'):
                     lines.append('  (레짐 전환 쿨다운 중)')
@@ -725,6 +728,7 @@ def _combined_snapshot(_text=None):
                 lines.append(f'ADD 30분: {sp.get("adds_30m_count", 0)}/{sp.get("adds_30m_limit", "?")}')
                 lines.append(f'리테스트 필수: {"YES" if sp.get("add_retest_required") else "NO"}')
                 lines.append(f'EVENT→ADD: {"차단" if sp.get("event_add_blocked") else "허용"}')
+                lines.append(f'동일방향 재진입 쿨다운: {sp.get("same_dir_reentry_cooldown_sec", "?")}s')
                 next_add = sp.get('next_add_earliest', 'NOW')
                 lines.append(f'다음 ADD 가능: {next_add}')
 
@@ -872,6 +876,7 @@ def _snapshot(_text=None):
     switch_status = None
     wait_reason = None
     capital_info = None
+    zone_check = None
     try:
         conn = _db()
         with conn.cursor() as cur:
@@ -906,6 +911,64 @@ def _snapshot(_text=None):
                 }
             except Exception:
                 pass
+
+            # Zone check data for ZONE_CHECK section
+            try:
+                import regime_reader
+                import autopilot_daemon
+                import order_throttle
+
+                regime_ctx = regime_reader.get_current_regime(cur)
+                regime = regime_ctx.get('regime', 'UNKNOWN')
+
+                # Current price
+                cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;",
+                            ('BTC/USDT:USDT',))
+                zc_price_row = cur.fetchone()
+                zc_price = float(zc_price_row[0]) if zc_price_row and zc_price_row[0] else 0
+
+                # BB data
+                bb_data = autopilot_daemon._get_bb_data(cur)
+
+                # Compute zones
+                zones = autopilot_daemon._compute_entry_zones(zc_price, regime_ctx, bb_data)
+
+                zone_check = {
+                    'current_price': zc_price,
+                    'regime': regime,
+                    **zones,
+                }
+
+                # Anti-chase status (RANGE only)
+                if regime == 'RANGE':
+                    chase_ok, chase_reason = autopilot_daemon._check_anti_chase(cur, regime_ctx, dry_run=True)
+                    if not chase_ok:
+                        zone_check['chase_block'] = chase_reason
+
+                # Daily trade count (FILLED basis)
+                cur.execute("""
+                    SELECT count(*) FROM execution_log
+                    WHERE symbol = 'BTC/USDT:USDT' AND status = 'FILLED'
+                      AND order_type IN ('OPEN', 'ADD')
+                      AND last_fill_at >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul';
+                """)
+                dtc_row = cur.fetchone()
+                zone_check['daily_trade_count'] = int(dtc_row[0]) if dtc_row else 0
+
+                # Throttle attempt count
+                ts = order_throttle.get_throttle_status()
+                zone_check['throttle_attempts_1h'] = ts.get('hourly_count', 0)
+                zone_check['throttle_limit_1h'] = ts.get('hourly_limit', 12)
+
+                # Signal policy snapshot
+                try:
+                    zone_check['signal_policy'] = autopilot_daemon.get_signal_policy_snapshot(cur)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                _log(f'_snapshot zone_check error: {e}')
+
     except Exception as e:
         _log(f'_snapshot gate/switch error: {e}')
         if gate_status is None:
@@ -919,7 +982,7 @@ def _snapshot(_text=None):
 
     return response_envelope.format_snapshot(
         exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason,
-        capital_info=capital_info)
+        capital_info=capital_info, zone_check=zone_check)
 
 
 def _score_summary(_text=None):
@@ -4314,6 +4377,107 @@ def _debug_backfill_ack(_text=None):
         return f'✅ backfill job acked: id={row[0]} name={row[1]} started={row[2]}'
     except Exception as e:
         return f'⚠ backfill_ack 실패: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _mode_performance(_text=None):
+    """Strategy v2 mode performance report: per-mode (A/B/C) win rate, avg PnL, etc."""
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            # Check if table exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'strategy_decision_log'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                return '📊 Strategy v2 모드 성능\n\n테이블 없음 — strategy v2 미활성화 상태'
+
+            # Decision counts per mode
+            cur.execute("""
+                SELECT mode,
+                       COUNT(*) AS total_decisions,
+                       COUNT(*) FILTER (WHERE action = 'ENTER') AS enters,
+                       COUNT(*) FILTER (WHERE action = 'ADD') AS adds,
+                       COUNT(*) FILTER (WHERE action = 'EXIT') AS exits,
+                       COUNT(*) FILTER (WHERE action = 'HOLD') AS holds,
+                       COUNT(*) FILTER (WHERE dedupe_hit = true) AS deduped,
+                       COUNT(*) FILTER (WHERE chase_entry = true) AS chased
+                FROM strategy_decision_log
+                WHERE ts >= now() - interval '24 hours'
+                GROUP BY mode
+                ORDER BY mode
+            """)
+            rows = cur.fetchall()
+
+            if not rows:
+                return '📊 Strategy v2 모드 성능\n\n최근 24시간 결정 없음'
+
+            lines = ['📊 Strategy v2 모드 성능 (24h)\n']
+            for r in rows:
+                mode, total, enters, adds, exits, holds, deduped, chased = r
+                lines.append(f'MODE_{mode}: {total}건')
+                lines.append(f'  ENTER={enters} ADD={adds} EXIT={exits} HOLD={holds}')
+                lines.append(f'  dedupe={deduped} chase_blocked={chased}')
+                lines.append('')
+
+            # PnL by mode (join with execution_log if mode column exists)
+            try:
+                cur.execute("""
+                    SELECT mode,
+                           COUNT(*) AS filled,
+                           ROUND(AVG(realized_pnl)::numeric, 4) AS avg_pnl,
+                           ROUND(SUM(realized_pnl)::numeric, 4) AS total_pnl,
+                           COUNT(*) FILTER (WHERE realized_pnl > 0) AS wins,
+                           COUNT(*) FILTER (WHERE realized_pnl <= 0) AS losses
+                    FROM execution_log
+                    WHERE mode IS NOT NULL
+                      AND status = 'FILLED'
+                      AND realized_pnl IS NOT NULL
+                      AND ts >= now() - interval '24 hours'
+                    GROUP BY mode
+                    ORDER BY mode
+                """)
+                pnl_rows = cur.fetchall()
+                if pnl_rows:
+                    lines.append('─── PnL by Mode ───')
+                    for r in pnl_rows:
+                        mode, filled, avg_pnl, total_pnl, wins, losses = r
+                        wr = wins / filled * 100 if filled > 0 else 0
+                        lines.append(f'MODE_{mode}: {filled}건 WR={wr:.0f}% '
+                                     f'avg={avg_pnl} total={total_pnl}')
+            except Exception:
+                pass  # mode column may not exist yet
+
+            # Gate block stats
+            try:
+                cur.execute("""
+                    SELECT gate_status, COUNT(*)
+                    FROM strategy_decision_log
+                    WHERE ts >= now() - interval '24 hours'
+                    GROUP BY gate_status
+                """)
+                gate_rows = cur.fetchall()
+                if gate_rows:
+                    lines.append('')
+                    lines.append('─── Gate Status ───')
+                    for gs, cnt in gate_rows:
+                        lines.append(f'  {gs}: {cnt}건')
+            except Exception:
+                pass
+
+            return '\n'.join(lines)
+
+    except Exception as e:
+        return f'조회 실패: {e}'
     finally:
         if conn:
             try:

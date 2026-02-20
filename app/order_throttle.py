@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 
 LOG_PREFIX = '[order_throttle]'
 
+DAILY_TRADE_LIMIT = 60
+KST_UTC_OFFSET_SEC = 9 * 3600      # KST = UTC+9
+
 # ── Constants ────────────────────────────────────────────
 MAX_ATTEMPTS_PER_HOUR = 12          # Bybit 15 - 3 safety margin
 MAX_ATTEMPTS_PER_10MIN = 4
@@ -23,6 +26,7 @@ COOLDOWN_AFTER_REDUCE_SEC = 30
 COOLDOWN_AFTER_REVERSE_SEC = 90
 EVENT_DEBOUNCE_SEC = 120
 RATE_LIMIT_LOCKOUT_SEC = 3600       # 15/15 hit -> 1 hour lockout
+THROTTLE_BACKOFF_STAGES = [60, 120, 300, 600]  # 1m→2m→5m→10m exponential backoff
 DB_ERROR_BACKOFF_SEC = 300
 DB_ERROR_MAX_CONSECUTIVE = 3        # 3 consecutive -> trade OFF
 NETWORK_BACKOFF_BASE = 5            # 5->10->20->40->300 max
@@ -56,6 +60,7 @@ _state = {
     'recent_attempts': [],          # list of float timestamps (sliding 1hr, ENTRY only)
     'last_signal_key': '',          # 'LONG:OPEN' format
     'last_signal_ts': 0.0,
+    'throttle_backoff_stage': 0,    # exponential backoff stage index
 }
 _loaded = False
 _lock = threading.Lock()
@@ -319,10 +324,17 @@ def handle_rejection(cur, error_code, reject_reason):
         if (error_code == 10006
                 or '한도 초과' in (reject_reason or '')
                 or 'rate limit' in reason_lower):
-            _state['entry_lock_until'] = time.time() + RATE_LIMIT_LOCKOUT_SEC
-            _state['entry_lock_reason'] = 'RATE_LIMIT_HIT'
+            # Exponential backoff: escalate stage
+            stage = _state['throttle_backoff_stage']
+            if stage < len(THROTTLE_BACKOFF_STAGES):
+                lockout = THROTTLE_BACKOFF_STAGES[stage]
+                _state['throttle_backoff_stage'] = stage + 1
+            else:
+                lockout = THROTTLE_BACKOFF_STAGES[-1]
+            _state['entry_lock_until'] = time.time() + lockout
+            _state['entry_lock_reason'] = f'RATE_LIMIT_HIT (stage {stage})'
             _state['network_consecutive'] = 0
-            _log(f'RATE_LIMIT_HIT: locked for {RATE_LIMIT_LOCKOUT_SEC}s')
+            _log(f'RATE_LIMIT_HIT: locked for {lockout}s (backoff stage {stage})')
             return
 
         # 2. Min qty — FIX #5: proper parenthesization
@@ -367,6 +379,7 @@ def handle_success(action_type):
     with _lock:
         _state['network_consecutive'] = 0
         _state['db_error_consecutive'] = 0
+        _state['throttle_backoff_stage'] = 0  # reset exponential backoff
         # Clear entry lock if it was from a transient error
         if _state['entry_lock_reason'] in ('NETWORK_ERROR', 'MIN_QTY'):
             _state['entry_lock_until'] = 0
@@ -556,6 +569,80 @@ def get_next_try_ts():
     # Return the latest blocker (all must clear)
     max_ts, max_reason = max(blockers, key=lambda x: x[0])
     return (max_ts, max_reason)
+
+
+def _get_kst_day_start():
+    """Compute KST 00:00 as UTC timestamp.
+    KST = UTC+9, so KST midnight = UTC 15:00 previous day.
+    """
+    import math
+    now = time.time()
+    kst_now = now + KST_UTC_OFFSET_SEC
+    kst_day_start = math.floor(kst_now / 86400) * 86400
+    return kst_day_start - KST_UTC_OFFSET_SEC  # convert back to UTC epoch
+
+
+def _count_daily_orders_kst(cur):
+    """Count filled/sent orders since KST 00:00.
+    Uses execution_log (FILLED/SENT) — not attempts.
+    """
+    kst_start = _get_kst_day_start()
+    try:
+        cur.execute("""
+            SELECT COUNT(*) FROM execution_log
+            WHERE symbol = 'BTC/USDT:USDT'
+              AND status IN ('FILLED', 'SENT')
+              AND ts >= to_timestamp(%s)
+        """, (kst_start,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        _log(f'_count_daily_orders_kst error (FAIL-OPEN): {e}')
+        return 0
+
+
+def is_entry_blocked(cur):
+    """Unified pre-signal gate check. Should be called BEFORE signal generation.
+
+    Returns (blocked: bool, reason: str, cooldown_until: float).
+    If blocked=True, caller should skip entire signal generation cycle.
+    FAIL-OPEN: returns (False, '', 0) on any unexpected error.
+    """
+    try:
+        _ensure_loaded(cur)
+        now = time.time()
+
+        # 1. Daily limit (KST boundary)
+        daily_count = _count_daily_orders_kst(cur)
+        if daily_count >= DAILY_TRADE_LIMIT:
+            kst_start = _get_kst_day_start()
+            next_day = kst_start + 86400
+            return (True, f'daily_limit ({daily_count}/{DAILY_TRADE_LIMIT} KST)', next_day)
+
+        # 2. Entry lock (rejection-based lockout)
+        ok, reason, lock_ts = check_entry_lock()
+        if not ok:
+            return (True, reason, lock_ts)
+
+        # 3. Rejection cooldown
+        with _lock:
+            if _state['last_reject_ts'] > 0:
+                elapsed = now - _state['last_reject_ts']
+                if elapsed < REJECTION_COOLDOWN_SEC:
+                    return (True,
+                            f'rejection_cooldown ({REJECTION_COOLDOWN_SEC - elapsed:.0f}s remaining)',
+                            _state['last_reject_ts'] + REJECTION_COOLDOWN_SEC)
+
+        # 4. Rate limits (hourly + 10min)
+        ok, reason, next_ts = check_rate_limit(cur)
+        if not ok:
+            return (True, reason, next_ts)
+
+        return (False, '', 0)
+
+    except Exception as e:
+        _log(f'is_entry_blocked FAIL-OPEN: {e}')
+        return (False, '', 0)
 
 
 def get_state_snapshot():

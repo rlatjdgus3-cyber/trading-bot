@@ -44,6 +44,7 @@ def _default():
         'poc': None,
         'price_vs_va': None,
         'bbw_ratio': None,
+        'bb_width_pct': None,
     }
 
 
@@ -146,6 +147,22 @@ def get_current_regime(cur, symbol='BTC/USDT:USDT'):
         if regime != raw_regime:
             in_transition = True
 
+        # v14.1: Compute absolute bb_width_pct from indicators table
+        bb_width_pct = None
+        try:
+            cur.execute("""
+                SELECT bb_up, bb_dn, bb_mid FROM indicators
+                WHERE symbol = %s
+                ORDER BY ts DESC LIMIT 1;
+            """, (symbol,))
+            bb_row = cur.fetchone()
+            if bb_row and bb_row[0] and bb_row[1] and bb_row[2]:
+                bb_mid_val = float(bb_row[2])
+                if bb_mid_val > 0:
+                    bb_width_pct = (float(bb_row[0]) - float(bb_row[1])) / bb_mid_val * 100
+        except Exception:
+            pass
+
         return {
             'regime': regime,
             'confidence': int(row[1]) if row[1] and not stale else 0,
@@ -162,6 +179,7 @@ def get_current_regime(cur, symbol='BTC/USDT:USDT'):
             'poc': float(row[9]) if row[9] is not None else None,
             'price_vs_va': row[10],
             'bbw_ratio': float(row[11]) if row[11] is not None else None,
+            'bb_width_pct': bb_width_pct,
         }
     except Exception as e:
         # FAIL-OPEN: table doesn't exist, DB error, etc.
@@ -172,7 +190,7 @@ def get_current_regime(cur, symbol='BTC/USDT:USDT'):
 def get_stage_limit(regime, shock_type=None):
     """Get maximum stage count for a given regime.
 
-    RANGE:          2
+    RANGE:          3
     BREAKOUT:       7
     SHOCK/VETO:     0  (block all entries)
     SHOCK/RISK_DOWN: 2
@@ -180,7 +198,7 @@ def get_stage_limit(regime, shock_type=None):
     UNKNOWN:        7  (FAIL-OPEN, no restriction)
     """
     if regime == 'RANGE':
-        return 2
+        return 3
     if regime == 'BREAKOUT':
         return 7
     if regime == 'SHOCK':
@@ -199,13 +217,29 @@ def get_stage_limit(regime, shock_type=None):
 
 REGIME_PARAMS = {
     'RANGE': {
-        'tp_mode': 'fixed',  'tp_pct_min': 0.3, 'tp_pct_max': 0.7,
-        'sl_pct': 0.8,
+        'tp_mode': 'fixed',  'tp_pct_min': 0.35, 'tp_pct_max': 0.90,
+        'sl_pct': 0.60,
+        'sl_pct_min': 0.40, 'sl_pct_max': 0.70,
         'leverage_min': 3, 'leverage_max': 5,
-        'stage_max': 2,
+        'stage_max': 3,
+        'stage_allocation': [0.4, 0.35, 0.25],  # stage 1/2/3 capital split
         'entry_filter': 'band_edge',   # BB/VA boundary within 0.3%
         'entry_proximity_pct': 0.3,
         'add_score_threshold': 70,
+        # TP split (RANGE only)
+        'tp_split_enabled': True,
+        'tp1_target': 'POC_or_BB_mid',   # TP1: POC/BB_mid 도달 → 50% 청산
+        'tp1_close_pct': 50,
+        'tp2_target': 'opposite_band',    # TP2: 반대 밴드 도달 → 전량 청산
+        'tp2_close_pct': 100,
+        # Zone margin
+        'zone_margin_va_pct': 0.12,
+        'zone_margin_bb_pct': 0.08,
+        'mid_zone_ban_pct': 0.15,
+        # Anti-chase filter
+        'anti_chase_ret_1m': 0.25,
+        'anti_chase_ret_5m': 0.60,
+        'anti_chase_ban_sec': 180,
         # TIME STOP & entry caps
         'time_stop_min': 25,
         'max_entries_per_hour': 3,
@@ -236,6 +270,8 @@ REGIME_PARAMS = {
         'add_min_profit_pct': 0.4,
         # Trailing SL to breakeven
         'trailing_be_threshold_pct': 0.8,
+        # ADD structure integrity check
+        'add_structure_intact_required': True,
         # Stage-based leverage ranges
         'stage_leverage': {1: (3, 5), 2: (4, 6), 3: (4, 6), 4: (4, 6),
                            5: (5, 8), 6: (5, 8), 7: (5, 8)},
@@ -286,3 +322,23 @@ def get_regime_params(regime, shock_type=None):
         params['leverage_max'] = 6
         return params
     return dict(REGIME_PARAMS.get(regime, REGIME_PARAMS['UNKNOWN']))
+
+
+# ── Strategy v2: YAML-based mode params ──
+
+def get_mode_params(mode):
+    """Get mode-specific parameters from YAML config (strategy v2).
+
+    Args:
+        mode: 'A', 'B', or 'C'
+
+    Returns:
+        dict — mode config from strategy_modes.yaml, or empty dict on error.
+    FAIL-OPEN: returns {} if config unavailable.
+    """
+    try:
+        from strategy.regime_router import get_mode_config
+        return get_mode_config(mode)
+    except Exception as e:
+        _log(f'get_mode_params FAIL-OPEN: {e}')
+        return {}
