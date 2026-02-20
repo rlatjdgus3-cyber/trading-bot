@@ -1577,9 +1577,15 @@ def run_all():
             # Hourly trade limit 8→15
             ensure_safety_limits_hourly_15(cur)
             # Macro events table (FRED/FOMC history)
-            ensure_macro_events()
+            try:
+                ensure_macro_events()
+            except Exception as e:
+                _log(f'ensure_macro_events failed in run_all: {e}')
             # News relevance_verified column
-            ensure_news_relevance_verified()
+            try:
+                ensure_news_relevance_verified()
+            except Exception as e:
+                _log(f'ensure_news_relevance_verified failed in run_all: {e}')
             # News tier columns + source accuracy table
             ensure_news_tier_columns(cur)
             ensure_news_source_accuracy(cur)

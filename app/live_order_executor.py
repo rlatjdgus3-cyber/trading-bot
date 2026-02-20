@@ -625,6 +625,12 @@ def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
         usdt = order_cap
     dir_upper = (direction or "LONG").upper()
 
+    # Apply size_multiplier from meta (e.g., MODE_B uses 0.7)
+    _size_mult = (meta or {}).get('size_multiplier')
+    if _size_mult is not None and 0 < _size_mult < 1:
+        usdt = usdt * _size_mult
+        log(f"EQ id={eq_id} ADD size_multiplier={_size_mult} applied: usdt={usdt:.0f}")
+
     # Exposure cap enforcement
     usdt, cap_reason = enforce_exposure_cap(ex, usdt, cur=cur)
     if usdt <= 0:
@@ -730,6 +736,12 @@ def _eq_handle_reverse_open(ex, cur, eq_id, direction, target_usdt, reason, meta
     if usdt <= 0:
         usdt = order_cap
     dir_upper = (direction or "LONG").upper()
+
+    # Apply size_multiplier from meta (e.g., MODE_B uses 0.7)
+    _size_mult = (meta or {}).get('size_multiplier')
+    if _size_mult is not None and 0 < _size_mult < 1:
+        usdt = usdt * _size_mult
+        log(f"EQ id={eq_id} REVERSE_OPEN size_multiplier={_size_mult} applied: usdt={usdt:.0f}")
 
     # Exposure cap enforcement
     usdt, cap_reason = enforce_exposure_cap(ex, usdt, cur=cur)
@@ -901,7 +913,7 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
         if _pre_min_cost > 0 and usdt_size < _pre_min_cost:
             log(f'ORDER BLOCKED: usdt_size {usdt_size:.2f} < minNotional {_pre_min_cost}')
             _send_telegram(f'주문 차단: 최소금액 미달 ({usdt_size:.2f} < {_pre_min_cost})')
-            return None
+            raise ValueError(f'usdt_size {usdt_size:.2f} < minNotional {_pre_min_cost}')
     except Exception as e:
         log(f'pre-validation check warning: {e}')
 
@@ -1032,12 +1044,17 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
             corrected_amount = ecl.align_qty(final_amount, info['stepSize'])
             if corrected_amount >= info['minQty'] and corrected_amount != final_amount:
                 try:
+                    retry_coid = _generate_client_order_id('RETRY', direction)
+                    retry_params = {'orderLinkId': retry_coid}
                     if direction == "LONG":
-                        order = ex.create_market_buy_order(SYMBOL, corrected_amount)
+                        order = ex.create_market_buy_order(SYMBOL, corrected_amount, params=retry_params)
                     else:
-                        order = ex.create_market_sell_order(SYMBOL, corrected_amount)
+                        order = ex.create_market_sell_order(SYMBOL, corrected_amount, params=retry_params)
+                    order['_client_order_id'] = retry_coid
                     ecl.record_order_sent(SYMBOL, price=price, side=direction.lower())
                     ecl.record_success(SYMBOL)
+                    if cur:
+                        order_throttle.record_attempt(cur, 'OPEN', direction, 'SUCCESS')
                     log(f"auto-correction succeeded: {final_amount} -> {corrected_amount}")
                     if cur:
                         ecl.log_compliance_event(
@@ -1045,7 +1062,8 @@ def place_open_order(ex, direction: str, usdt_size: float, cur=None, meta=None):
                             compliance_passed=True,
                             detail={'original_qty': final_amount,
                                     'corrected_qty': corrected_amount,
-                                    'error_code': error_code})
+                                    'error_code': error_code,
+                                    'retry_coid': retry_coid})
                     return order, price, corrected_amount
                 except Exception as e2:
                     log(f"auto-correction retry failed: {e2}")

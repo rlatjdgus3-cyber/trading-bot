@@ -50,6 +50,8 @@ def _load_env(path=None):
 
 
 def _tg_send(text=None):
+    if not text:
+        return None
     env = _load_env(ENV_PATH)
     token = env.get('TELEGRAM_BOT_TOKEN', '').strip()
     chat_id = int(env.get('TELEGRAM_ALLOWED_CHAT_ID', '0'))
@@ -86,12 +88,14 @@ def _save_state(state=None):
 
 
 def _log_event(conn=None, event_type=None, detail=None):
-    '''Insert into test_events_log.'''
+    '''Insert into test_events_log (detail is JSONB).'''
     try:
+        import json as _json
+        detail_json = _json.dumps({'msg': str(detail or '')}, ensure_ascii=False)
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO test_events_log (event_type, detail) VALUES (%s, %s);",
-                (event_type, detail or '')
+                "INSERT INTO test_events_log (event_type, detail) VALUES (%s, %s::jsonb);",
+                (event_type, detail_json)
             )
         conn.commit()
     except Exception as e:

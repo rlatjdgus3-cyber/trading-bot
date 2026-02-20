@@ -284,10 +284,10 @@ def get_health_risk_multiplier(cur):
 
 def is_gate_pass(cur):
     """Check if safety gate passes (for auto-recovery decision).
-    Wraps run_all_checks with emergency=True to skip daily/hourly limits.
+    Uses emergency=False to respect daily/hourly limits.
     Returns (ok: bool, reason: str).
     """
-    return run_all_checks(cur, emergency=True)
+    return run_all_checks(cur, emergency=False)
 
 
 def get_block_reason_code(cur, limits=None):

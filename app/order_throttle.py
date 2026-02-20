@@ -75,31 +75,29 @@ def _log(msg):
 def _ensure_loaded(cur):
     """Load recent 1-hour attempts from DB to initialize in-memory sliding window.
     Safe to call repeatedly (idempotent after first load).
+    Uses double-checked locking to prevent TOCTOU race.
     """
     global _loaded
-    # FIX #8: check _loaded under lock to prevent double-load race
+    if _loaded:
+        return
     with _lock:
         if _loaded:
             return
-    try:
-        cur.execute("""
-            SELECT extract(epoch FROM ts)
-            FROM order_attempt_log
-            WHERE symbol = 'BTC/USDT:USDT'
-              AND action_type NOT IN ('CLOSE', 'REDUCE', 'REVERSE_CLOSE', 'FULL_CLOSE')
-              AND ts >= now() - interval '1 hour'
-            ORDER BY ts;
-        """)
-        rows = cur.fetchall()
-        with _lock:
+        try:
+            cur.execute("""
+                SELECT extract(epoch FROM ts)
+                FROM order_attempt_log
+                WHERE symbol = 'BTC/USDT:USDT'
+                  AND action_type NOT IN ('CLOSE', 'REDUCE', 'REVERSE_CLOSE', 'FULL_CLOSE')
+                  AND ts >= now() - interval '1 hour'
+                ORDER BY ts;
+            """)
+            rows = cur.fetchall()
             _state['recent_attempts'] = [float(r[0]) for r in rows]
             _loaded = True
-        _log(f'loaded {len(rows)} recent attempts from DB')
-    except Exception as e:
-        _log(f'_ensure_loaded error (non-fatal): {e}')
-        # FIX #3: set _loaded under lock even on exception path
-        with _lock:
-            _loaded = True
+            _log(f'loaded {len(rows)} recent attempts from DB')
+        except Exception as e:
+            _log(f'_ensure_loaded error (non-fatal, will retry next cycle): {e}')
 
 
 # ── Sliding window helpers ───────────────────────────────
