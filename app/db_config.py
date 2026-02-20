@@ -20,6 +20,9 @@ DB_PORT = int(os.getenv('DB_PORT', '5432'))
 DB_NAME = os.getenv('DB_NAME', 'trading')
 DB_USER = os.getenv('DB_USER', 'bot')
 DB_PASS = os.getenv('DB_PASS', 'botpass')
+if DB_PASS == 'botpass' and not os.getenv('DB_PASS'):
+    import warnings
+    warnings.warn('DB_PASS using default fallback — set DB_PASS in .env for production', stacklevel=1)
 
 DB_CONFIG = dict(
     host=DB_HOST,

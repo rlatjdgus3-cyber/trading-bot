@@ -9,11 +9,13 @@ Outputs: {mode, confidence, reasons, drift_submode}
 """
 
 import os
+import threading
 import yaml
 
 LOG_PREFIX = '[regime_router]'
 
 _config = None
+_config_lock = threading.Lock()
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                             'config', 'strategy_modes.yaml')
 
@@ -27,21 +29,25 @@ def _load_config():
     global _config
     if _config is not None:
         return _config
-    try:
-        with open(_CONFIG_PATH, 'r') as f:
-            _config = yaml.safe_load(f)
-        _log(f'config loaded from {_CONFIG_PATH}')
-        return _config
-    except Exception as e:
-        _log(f'config load FAIL-OPEN: {e}')
-        _config = {}
-        return _config
+    with _config_lock:
+        if _config is not None:
+            return _config
+        try:
+            with open(_CONFIG_PATH, 'r') as f:
+                _config = yaml.safe_load(f)
+            _log(f'config loaded from {_CONFIG_PATH}')
+            return _config
+        except Exception as e:
+            _log(f'config load FAIL-OPEN: {e}')
+            _config = {}
+            return _config
 
 
 def reload_config():
     """Force-reload config (for testing / hot reload)."""
     global _config
-    _config = None
+    with _config_lock:
+        _config = None
     return _load_config()
 
 
@@ -174,7 +180,7 @@ def route(features, gate_status=None, current_position=None):
     reasons.append('MODE_B: volatile range (default)')
     drift_submode = None
     drift_min = cfg_b.get('drift_poc_slope_min', 0.0015)
-    if drift_score > drift_min and drift_dir in ('UP', 'DOWN'):
+    if drift_min is not None and drift_score > drift_min and drift_dir in ('UP', 'DOWN'):
         drift_submode = drift_dir
         reasons.append(f'drift={drift_dir} (score={drift_score:.4f})')
         confidence += 5

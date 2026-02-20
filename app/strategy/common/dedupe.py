@@ -63,8 +63,8 @@ def record_signal(cur, signal_key):
         _log(f'record_signal FAIL-OPEN: {e}')
 
 
-def cleanup_expired(cur, max_age_sec=600):
-    """Mark old entries as expired. Called periodically.
+def cleanup_expired(cur, max_age_sec=600, delete_after_sec=3600):
+    """Mark old entries as expired, then DELETE very old rows.
 
     FAIL-OPEN: silently ignores errors.
     """
@@ -75,5 +75,11 @@ def cleanup_expired(cur, max_age_sec=600):
             WHERE ts < now() - make_interval(secs => %s)
               AND expired = false
         """, (max_age_sec,))
+        # Hard-delete rows older than delete_after_sec to prevent table bloat
+        cur.execute("""
+            DELETE FROM signal_dedup_log
+            WHERE expired = true
+              AND ts < now() - make_interval(secs => %s)
+        """, (delete_after_sec,))
     except Exception as e:
         _log(f'cleanup_expired FAIL-OPEN: {e}')

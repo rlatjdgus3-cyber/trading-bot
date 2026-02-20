@@ -646,7 +646,11 @@ def ensure_price_event_stats(cur):
     """)
     if cur.fetchone():
         _log('ensure_price_event_stats: already exists')
-        cur.execute("REFRESH MATERIALIZED VIEW public.price_event_stats;")
+        try:
+            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY public.price_event_stats;")
+        except Exception:
+            cur.connection.rollback()
+            cur.execute("REFRESH MATERIALIZED VIEW public.price_event_stats;")
         _log('ensure_price_event_stats: refreshed')
         return
     cur.execute("""
@@ -1073,17 +1077,21 @@ def cleanup_old_data(cur):
         ('event_trigger_log', 'ts', 30),
         ('claude_call_log', 'ts', 60),
     ]
+    # table/ts_col names are hardcoded literals above — safe for f-string.
+    _ALLOWED_TABLES = {t for t, _, _ in policies}
     for table, ts_col, days in policies:
+        if table not in _ALLOWED_TABLES:
+            continue
         try:
             total_deleted = 0
             while True:
                 cur.execute(f"""
                     DELETE FROM {table} WHERE ctid IN (
                         SELECT ctid FROM {table}
-                        WHERE {ts_col} < now() - interval '{days} days'
+                        WHERE {ts_col} < now() - interval '%s days'
                         LIMIT 5000
                     );
-                """)
+                """, (days,))
                 batch_del = cur.rowcount
                 total_deleted += batch_del
                 if batch_del < 5000:

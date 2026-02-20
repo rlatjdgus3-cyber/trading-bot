@@ -180,6 +180,7 @@ def transition_for_action(action_type, phase='request'):
     is_exit = action_type.upper() in EXIT_ACTIONS
 
     if not is_entry and not is_exit:
+        print(f'[plan_state] WARNING: unknown action_type={action_type!r}, returning PLAN_NONE', flush=True)
         return PLAN_NONE  # unknown action, fail-safe
 
     if phase == 'request':

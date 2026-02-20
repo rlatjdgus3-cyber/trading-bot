@@ -39,6 +39,8 @@ def _db_conn():
 
 def _load_env(path=None):
     env = {}
+    if path is None:
+        return env
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
