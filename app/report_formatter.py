@@ -745,7 +745,7 @@ def _parse_news_category(summary: str) -> str:
         return 'OTHER'
     # Find all bracket tags (case-insensitive)
     tags = _re.findall(r'\[([A-Za-z_]+)\]', summary)
-    direction_tags = {'up', 'down', 'neutral'}
+    direction_tags = {'up', 'down', 'neutral', 'bullish', 'bearish'}
     for tag in tags:
         if tag.lower() in direction_tags:
             continue  # skip direction tags

@@ -368,7 +368,6 @@ class TestStrategyCategories(unittest.TestCase):
     def test_other_not_in_strategy(self):
         """OTHER는 전략 카테고리에 없음."""
         assert 'OTHER' not in self.categories
-        assert 'JAPAN_BOJ' not in self.categories
 
 
 class TestExpandedReportRouting(unittest.TestCase):

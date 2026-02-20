@@ -484,12 +484,14 @@ def main():
                             log(f"[news_bot] LLM error: {llm_err}")
 
                     # 7) 소스 가중치 기반 티어 캡 (weight < 0.6 → TIER3)
+                    _DENY_THRESHOLD = 0.60
                     try:
                         from news_classifier_config import get_source_weight, DENY_SOURCE_WEIGHT_THRESHOLD
                         _sw = get_source_weight(source)
+                        _DENY_THRESHOLD = DENY_SOURCE_WEIGHT_THRESHOLD
                     except Exception:
                         _sw = 0.55 if source_tier == 'REFERENCE_ONLY' else 0.70
-                    if _sw < DENY_SOURCE_WEIGHT_THRESHOLD and tier in ('TIER1', 'TIER2'):
+                    if _sw < _DENY_THRESHOLD and tier in ('TIER1', 'TIER2'):
                         tier = 'TIER3'
 
                     # 8) 유효 티어 가드
@@ -501,7 +503,7 @@ def main():
                     exclusion_reason = None
                     _low_tier = tier in ('TIER3', 'TIERX')
                     _low_rel = (rel_score > 0 and rel_score < 0.55) or relevance in ('GOSSIP', 'LOW')
-                    _low_src = _sw < DENY_SOURCE_WEIGHT_THRESHOLD  # from step 7
+                    _low_src = _sw < _DENY_THRESHOLD  # from step 7
 
                     if tier == 'TIERX':
                         exclusion_reason = 'TIERX: noise/column/stock_pick'
@@ -517,6 +519,7 @@ def main():
                     # 9.5) Shadow classifier — preview_classify (two-tier allow)
                     allow_storage = False
                     allow_trading = False
+                    _shadow = {}
                     try:
                         import news_classifier_config as _ncc
                         _shadow = _ncc.preview_classify(
@@ -540,13 +543,13 @@ def main():
                         pass  # shadow classifier failure should never block insertion
 
                     # 9.6) Scandal confirmation gate
-                    _shadow_topic = _shadow.get('topic_class_preview', '') if '_shadow' in dir() else ''
+                    _shadow_topic = _shadow.get('topic_class_preview', '')
                     _scandal_topic = _shadow_topic if _shadow_topic == 'US_SCANDAL_LEGAL' else (
                         topic_class if topic_class == 'US_SCANDAL_LEGAL' else '')
                     if _scandal_topic == 'US_SCANDAL_LEGAL':
+                        _scandal_cur = None
                         try:
                             from news_classifier_config import scandal_confirmation_check
-                            _scandal_cur = None
                             try:
                                 _scandal_cur = db.cursor()
                             except Exception:
@@ -561,6 +564,12 @@ def main():
                                 impact = _scandal['impact_cap']
                         except Exception:
                             pass
+                        finally:
+                            if _scandal_cur:
+                                try:
+                                    _scandal_cur.close()
+                                except Exception:
+                                    pass
 
                     # 9.7) BTC keyword fallback for still-unclassified items
                     if topic_class in ('unclassified', 'noise', '', None):

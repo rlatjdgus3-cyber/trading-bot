@@ -116,7 +116,8 @@ STRATEGY_TIER1 = {'FED_RATES', 'CPI_JOBS', 'REGULATION_SEC_ETF', 'WAR',
                    'MACRO_RATES', 'US_FISCAL'}
 STRATEGY_TIER2 = {'NASDAQ_EQUITIES', 'US_POLITICS', 'FIN_STRESS', 'CRYPTO_SPECIFIC',
                    'US_POLITICS_ELECTION', 'TECH_NASDAQ', 'US_SCANDAL_LEGAL',
-                   'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY'}
+                   'WALLSTREET_SIGNAL', 'IMMIGRATION_POLICY',
+                   'JAPAN_BOJ', 'CHINA'}
 STRATEGY_CATEGORIES = STRATEGY_TIER1 | STRATEGY_TIER2
 # 카테고리별 전략 가중치
 STRATEGY_CATEGORY_MULT = {}
@@ -802,6 +803,17 @@ def _empty_result():
             'bullish': 0, 'bearish': 0, 'neutral': 0,
             'watch_matched': [],
             'score_trace': '',
+            'macro_count': 0,
+            'crypto_count': 0,
+            'macro_score': 0,
+            'crypto_score': 0,
+            'macro_bonus': 0,
+            'high_impact_meta': {
+                'has_high_impact': False,
+                'top_category': '',
+                'top_impact': 0,
+                'top_source_quality': 0,
+            },
         },
         'action_constraints': {
             'can_open': False,

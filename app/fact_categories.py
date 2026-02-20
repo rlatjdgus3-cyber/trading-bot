@@ -41,7 +41,6 @@ CATEGORIES = {
     ],
     'japan_boj': [
         'boj', 'bank of japan', 'yen ', 'jpy', 'ueda', 'kuroda',
-        'yield curve',
         '일본은행', '엔화', '일본 금리',
     ],
     'china': [
@@ -61,10 +60,10 @@ CATEGORIES = {
         '부채 한도', '재정 적자', '정부 셧다운', '예산', '국가 부채',
     ],
     'us_scandal_legal': [
-        'indictment', 'impeach', 'special counsel', 'grand jury',
+        'indictment', 'special counsel', 'grand jury',
         'arraign', 'subpoena', 'criminal charges', 'plea deal',
         'felony', 'obstruction', 'ethics probe',
-        '기소', '탄핵', '특별 검사', '대배심', '소환장',
+        '기소', '특별 검사', '대배심', '소환장',
     ],
     'wallstreet_signal': [
         'goldman sachs', 'jpmorgan', 'morgan stanley',
@@ -74,10 +73,10 @@ CATEGORIES = {
         '골드만', 'JP모건', '모건 스탠리', '목표 주가', '월가',
     ],
     'tech_sector': [
-        'semiconductor', 'chip ban', 'chip export', 'chip war',
-        'ai regulation', 'big tech', 'antitrust',
+        'chip ban', 'chip export', 'chip war',
+        'ai regulation', 'antitrust',
         'tsmc', 'asml', 'foundry', 'chip shortage', 'chip act',
-        '반도체', '칩 수출', '칩 전쟁', 'AI 규제', '빅테크', '반독점',
+        '칩 수출', '칩 전쟁', 'AI 규제', '반독점',
     ],
     'immigration': [
         'immigration', 'border wall', 'border security', 'deportation',
@@ -95,8 +94,8 @@ CATEGORIES = {
 
 # Short keywords that need word-boundary regex to avoid false positives
 _SHORT_WORDS = {
-    'ai', 'aml', 'ban', 'boj', 'cny', 'cpi', 'ecb', 'etf',
-    'eur', 'fed', 'jpy', 'kyc', 'ppi', 'sec', 'war', 'yen',
+    'ai', 'aml', 'ban', 'boj', 'cny', 'cpi', 'dhs', 'ecb', 'etf',
+    'eur', 'fed', 'jpy', 'kyc', 'ppi', 'sec', 'tlt', 'war', 'yen',
     'euro', 'meta',
 }
 

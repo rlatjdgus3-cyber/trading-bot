@@ -40,12 +40,11 @@ WAIT_REASON_KR = {
     'WAIT_REGIME_BREAKOUT': 'BREAKOUT 모드 — VA 돌파 확인 대기',
     'WAIT_REGIME_SHOCK': 'SHOCK 모드 — 진입 차단',
     'WAIT_REGIME_TRANSITION': '레짐 전환 쿨다운 중',
-    'WAIT_COOLDOWN': '포지션 종료 후 쿨다운 대기 (TP/SL)',
+    'WAIT_COOLDOWN': '포지션 종료 후 쿨다운 대기 (TP/SL/손절)',
     'WAIT_DEDUPED': '동일 존/방향 신호 중복 차단 (5분 버킷)',
     'WAIT_DAILY_LIMIT': '일일 체결 한도 도달',
     'WAIT_LIQUIDITY': '슬리피지/스프레드 불량 — 주문 보류',
     'WAIT_RETRY': 'API 오류 후 재시도 대기',
-    'WAIT_COOLDOWN': '최근 손절/청산 이후 쿨다운',
 }
 
 
@@ -722,7 +721,7 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         state = strat_pos.get('strategy_state', 'UNKNOWN')
         if strat_pos.get('data_status') == 'ERROR':
             sections.append('[STRATEGY_DB] State: UNKNOWN (ERROR)')
-        elif state == 'FLAT':
+        elif state in ('FLAT', 'PLAN.NONE'):
             sections.append('[STRATEGY_DB] State: FLAT')
         else:
             side = strat_pos.get('side', '?')
@@ -731,11 +730,11 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
             # INTENT_ENTER + exchange=NONE → 체결 확정 아님 표기
             exch_position = exch_pos.get('exchange_position', 'UNKNOWN') if exch_pos else 'UNKNOWN'
             note = ''
-            if state == 'INTENT_ENTER' and exch_position == 'NONE':
+            if (state == 'INTENT_ENTER' or state.startswith('PLAN.INTENT_')) and exch_position == 'NONE':
                 note = ' <- 전략 신호 (미체결)'
-            elif state == 'OPEN' and exch_position in ('LONG', 'SHORT'):
+            elif (state == 'OPEN' or state.startswith('PLAN.OPEN')) and exch_position in ('LONG', 'SHORT'):
                 note = ' <- 체결 확인(FILLED)'
-            elif state == 'OPEN' and exch_position == 'NONE':
+            elif (state == 'OPEN' or state.startswith('PLAN.OPEN')) and exch_position == 'NONE':
                 note = ' <- DB 기록만 (거래소 미확인)'
             sections.append(
                 f'[STRATEGY_DB] State: {state} {side} qty={qty} stage={stage}{note}'

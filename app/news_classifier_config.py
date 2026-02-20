@@ -538,9 +538,10 @@ def scandal_confirmation_check(topic, title, source, impact_score,
     if topic != 'US_SCANDAL_LEGAL':
         return result
 
-    # Check rumor keywords → cap impact
+    # Check rumor keywords → cap impact (also use impact_score for additional capping)
     title_text = title or ''
-    if cfg['rumor_keywords'].search(title_text):
+    is_rumor = cfg['rumor_keywords'].search(title_text)
+    if is_rumor:
         result['impact_cap'] = cfg['rumor_impact_cap']
         result['reason'] = 'rumor_keyword_detected'
 
@@ -549,34 +550,44 @@ def scandal_confirmation_check(topic, title, source, impact_score,
     if src_quality < cfg['min_source_quality']:
         result['confirmed'] = False
         result['allow_trading'] = False
-        result['reason'] = f'source_quality_low({src_quality:.2f}<{cfg["min_source_quality"]})'
+        reason_parts = []
+        if is_rumor:
+            reason_parts.append('rumor_keyword_detected')
+        reason_parts.append(f'source_quality_low({src_quality:.2f}<{cfg["min_source_quality"]})')
+        result['reason'] = '; '.join(reason_parts)
         return result
 
     # Check independent source corroboration from DB
-    if db_cursor:
-        try:
-            db_cursor.execute("""
-                SELECT COUNT(DISTINCT source)
-                FROM news
-                WHERE topic_class = 'US_SCANDAL_LEGAL'
-                  AND ts >= now() - interval '%s minutes'
-                  AND source != %%s
-                  AND exclusion_reason IS NULL
-            """ % cfg['confirmation_window_min'], (source,))
-            row = db_cursor.fetchone()
-            independent_count = (row[0] if row and row[0] else 0)
-            if independent_count < cfg['min_independent_sources']:
-                result['confirmed'] = False
-                result['allow_trading'] = False
-                result['reason'] = (
-                    f'insufficient_sources({independent_count}'
-                    f'<{cfg["min_independent_sources"]})')
-                return result
-        except Exception:
-            # DB check failure → unconfirmed (conservative)
+    if not db_cursor:
+        # No DB cursor → cannot verify corroboration (conservative)
+        result['confirmed'] = False
+        result['allow_trading'] = False
+        result['reason'] = 'no_db_cursor_for_corroboration'
+        return result
+
+    try:
+        db_cursor.execute("""
+            SELECT COUNT(DISTINCT source)
+            FROM news
+            WHERE topic_class = 'US_SCANDAL_LEGAL'
+              AND ts >= now() - interval '1 minute' * %s
+              AND source != %s
+              AND exclusion_reason IS NULL
+        """, (cfg['confirmation_window_min'], source))
+        row = db_cursor.fetchone()
+        independent_count = (row[0] if row and row[0] else 0)
+        if independent_count < cfg['min_independent_sources']:
             result['confirmed'] = False
             result['allow_trading'] = False
-            result['reason'] = 'db_check_failed'
+            result['reason'] = (
+                f'insufficient_sources({independent_count}'
+                f'<{cfg["min_independent_sources"]})')
             return result
+    except Exception:
+        # DB check failure → unconfirmed (conservative)
+        result['confirmed'] = False
+        result['allow_trading'] = False
+        result['reason'] = 'db_check_failed'
+        return result
 
     return result

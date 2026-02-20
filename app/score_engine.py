@@ -323,7 +323,7 @@ def compute_total(cur=None, exchange=None):
             btc_qqq_regime = regime_correlation.get_current_regime(cur)
             base_news_w = weights['news_event_w']
             if btc_qqq_regime == 'COUPLED_RISK':
-                weights['news_event_w'] = min(0.05, 0.05)
+                weights['news_event_w'] = min(weights['news_event_w'], 0.03)
             elif btc_qqq_regime == 'DECOUPLED':
                 weights['news_event_w'] = 0.02
             # Redistribute delta across other 3 axes proportionally
@@ -366,8 +366,8 @@ def compute_total(cur=None, exchange=None):
                         pass  # FAIL-OPEN: proceed with override
                     if delta > 0:
                         weights['news_event_w'] = new_news_w
-                        # Reduce tech_w proportionally
-                        weights['tech_w'] -= delta
+                        # Reduce tech_w proportionally, with floor at 0.30
+                        weights['tech_w'] = max(0.30, weights['tech_w'] - delta)
                         breakout_news_override = True
                         _log(f'BREAKOUT news_w override: {base_news_w:.2f} -> {new_news_w:.2f}')
         except Exception as e:
@@ -419,8 +419,8 @@ def compute_total(cur=None, exchange=None):
                 delta = boosted_w - base_news_w
                 if delta > 0:
                     weights['news_event_w'] = boosted_w
-                    # Delta taken from tech_w only
-                    weights['tech_w'] -= delta
+                    # Delta taken from tech_w only, with floor at 0.30
+                    weights['tech_w'] = max(0.30, weights['tech_w'] - delta)
                     high_impact_news_boost = True
                     _log(f'HIGH_IMPACT news_w boost: {base_news_w:.2f} -> {boosted_w:.2f} '
                          f'(cat={hi_meta.get("top_category")} impact={hi_meta.get("top_impact")})')
