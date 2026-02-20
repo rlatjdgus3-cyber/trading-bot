@@ -1546,7 +1546,7 @@ def _v2_position_check(ctx, side, stage, price):
             'symbol': SYMBOL,
             'price': price,
             'adx': regime_ctx.get('adx_14'),
-            'bb_width': regime_ctx.get('bb_width_pct', 0) / 100 if regime_ctx.get('bb_width_pct') else None,
+            'bb_width': regime_ctx.get('bb_width_pct') / 100 if regime_ctx.get('bb_width_pct') is not None else None,
             'poc': vp.get('poc'),
             'vah': vp.get('vah'),
             'val': vp.get('val'),
@@ -1565,15 +1565,15 @@ def _v2_position_check(ctx, side, stage, price):
             if vah_f != val_f:
                 features['range_position'] = (float(price) - val_f) / (vah_f - val_f)
 
-        route_result = route(features)
-        mode = route_result['mode']
-
         position = {
             'side': side.upper() if side else '',
-            'total_qty': 0,
-            'avg_entry_price': ctx.get('position', {}).get('entry_price', 0),
+            'total_qty': float(ctx.get('position', {}).get('qty', 0) or 0),
+            'avg_entry_price': float(ctx.get('position', {}).get('entry_price', 0) or 0),
             'stage': stage,
         }
+
+        route_result = route(features, current_position=position)
+        mode = route_result['mode']
 
         mode_config = get_mode_config(mode)
         strategies = {'A': StaticRangeStrategy(), 'B': VolatileRangeStrategy(), 'C': ShockBreakoutStrategy()}

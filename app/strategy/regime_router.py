@@ -151,7 +151,7 @@ def route(features, gate_status=None, current_position=None):
     a_none_count = sum(1 for x in [adx, bb_width, atr_pct, poc_slope] if x is None)
     a_pass_count = sum(1 for x in a_checks if x)
 
-    if a_pass_count >= 3 or (a_pass_count >= 2 and a_none_count >= 1):
+    if a_pass_count >= 3 or (a_pass_count >= 2 and a_none_count == 1):
         reasons.append('MODE_A: static range conditions met')
         if is_a_adx:
             reasons.append(f'adx={adx:.1f} <= {adx_max}')

@@ -4442,7 +4442,7 @@ def _mode_performance(_text=None):
                     WHERE mode IS NOT NULL
                       AND status = 'FILLED'
                       AND realized_pnl IS NOT NULL
-                      AND ts >= now() - interval '24 hours'
+                      AND COALESCE(last_fill_at, ts) >= now() - interval '24 hours'
                     GROUP BY mode
                     ORDER BY mode
                 """)
@@ -4464,6 +4464,7 @@ def _mode_performance(_text=None):
                     FROM strategy_decision_log
                     WHERE ts >= now() - interval '24 hours'
                     GROUP BY gate_status
+                    ORDER BY gate_status
                 """)
                 gate_rows = cur.fetchall()
                 if gate_rows:

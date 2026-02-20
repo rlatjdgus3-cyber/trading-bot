@@ -128,12 +128,14 @@ class StaticRangeStrategy(ModeStrategy):
         pos_side = position.get('side', '').upper()
         stage = position.get('stage', 1)
         max_stages = config.get('max_add_stages', 3)
+        rp_long = config.get('range_position_long', 0.15)
+        rp_short = config.get('range_position_short', 0.85)
 
         if price is None:
             return self._hold('MODE_A: missing price for position eval')
 
         # EXIT: at opposite VA edge
-        if pos_side == 'LONG' and rp is not None and rp >= 0.85:
+        if pos_side == 'LONG' and rp is not None and rp >= rp_short:
             return {
                 'action': 'EXIT',
                 'side': pos_side,
@@ -146,7 +148,7 @@ class StaticRangeStrategy(ModeStrategy):
                 'order_type': 'market',
                 'meta': {'exit_type': 'opposite_edge'},
             }
-        if pos_side == 'SHORT' and rp is not None and rp <= 0.15:
+        if pos_side == 'SHORT' and rp is not None and rp <= rp_long:
             return {
                 'action': 'EXIT',
                 'side': pos_side,
@@ -165,9 +167,6 @@ class StaticRangeStrategy(ModeStrategy):
             return self._hold(f'MODE_A: stage {stage} >= max {max_stages}')
 
         # ADD: price must be favorable (deeper into edge)
-        rp_long = config.get('range_position_long', 0.15)
-        rp_short = config.get('range_position_short', 0.85)
-
         add_eligible = False
         if pos_side == 'LONG' and rp is not None and rp <= rp_long:
             add_eligible = True
@@ -211,12 +210,10 @@ class StaticRangeStrategy(ModeStrategy):
 
         def _candle_vals(c):
             if isinstance(c, dict):
-                return (
-                    float(c.get('o') or c.get('open') or 0),
-                    float(c.get('h') or c.get('high') or 0),
-                    float(c.get('l') or c.get('low') or 0),
-                    float(c.get('c') or c.get('close') or 0),
-                )
+                def _v(k1, k2):
+                    v = c.get(k1)
+                    return float(v) if v is not None else (float(c[k2]) if c.get(k2) is not None else 0.0)
+                return (_v('o', 'open'), _v('h', 'high'), _v('l', 'low'), _v('c', 'close'))
             return (0, 0, 0, 0)
 
         c0_o, c0_h, c0_l, c0_c = _candle_vals(candles[0])
@@ -226,7 +223,7 @@ class StaticRangeStrategy(ModeStrategy):
             return False
 
         body_0 = abs(c0_c - c0_o)
-        range_0 = c0_h - c0_l if c0_h > c0_l else 0.01
+        range_0 = c0_h - c0_l if c0_h > c0_l else max(c0_h * 0.0001, 0.01)
 
         if side == 'LONG':
             # Rejection wick: long lower wick (>50% of range) + close above open

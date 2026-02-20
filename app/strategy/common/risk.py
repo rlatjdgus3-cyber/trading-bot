@@ -61,7 +61,7 @@ def compute_sl(mode, entry_price, side, atr, level_price, config):
     elif mode == 'C':
         # Hybrid: level-based + ATR multiplier
         atr_mult = config.get('sl_atr_multiplier', 1.5)
-        atr_sl = atr * atr_mult if atr else entry_price * 0.015
+        atr_sl = atr * atr_mult if atr and atr > 0 else entry_price * 0.015
         if side == 'LONG':
             level_sl = level_price if level_price and level_price < entry_price else entry_price * 0.99
             return min(level_sl, entry_price - atr_sl)
@@ -172,6 +172,6 @@ def validate_stage_min_qty(stage_qty, min_qty=0.001):
     Returns:
         (usable: bool, adjusted_qty: float)
     """
-    if stage_qty >= min_qty:
-        return (True, stage_qty)
-    return (False, 0.0)
+    if stage_qty is None or stage_qty < min_qty:
+        return (False, 0.0)
+    return (True, stage_qty)

@@ -19,12 +19,11 @@ def _log(msg):
 def make_signal_key(symbol, mode, side, stage=1):
     """Generate signal dedup key.
 
-    Format: {symbol}:{mode}:{side}:{stage_bucket}:{ts_bucket_3m}
-    ts_bucket_3m groups timestamps into 3-minute windows.
+    Format: {symbol}:{mode}:{side}:{stage_bucket}
+    Dedup time window is handled by DB query in is_duplicate(), not by key.
     """
-    ts_bucket = int(time.time()) // DEFAULT_WINDOW_SEC
     stage_bucket = stage if stage else 1
-    return f'{symbol}:{mode}:{side}:{stage_bucket}:{ts_bucket}'
+    return f'{symbol}:{mode}:{side}:{stage_bucket}'
 
 
 def is_duplicate(cur, signal_key, window_sec=DEFAULT_WINDOW_SEC):

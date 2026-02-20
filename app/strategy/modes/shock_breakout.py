@@ -201,11 +201,10 @@ class ShockBreakoutStrategy(ModeStrategy):
 
         def _vals(c):
             if isinstance(c, dict):
-                return (
-                    float(c.get('l') or c.get('low') or 0),
-                    float(c.get('h') or c.get('high') or 0),
-                    float(c.get('c') or c.get('close') or 0),
-                )
+                def _v(k1, k2):
+                    v = c.get(k1)
+                    return float(v) if v is not None else (float(c[k2]) if c.get(k2) is not None else 0.0)
+                return (_v('l', 'low'), _v('h', 'high'), _v('c', 'close'))
             return (0, 0, 0)
 
         retest_zone = old_level * buffer_pct * 3  # Wider zone for retest detection

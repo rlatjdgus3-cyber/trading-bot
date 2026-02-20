@@ -44,6 +44,8 @@ class VolatileRangeStrategy(ModeStrategy):
         # ── No-trade zones: near edges ──
         upper_no_trade = vah * (1 - no_trade_pct)
         lower_no_trade = val * (1 + no_trade_pct)
+        if upper_no_trade <= lower_no_trade:
+            return self._hold('MODE_B: range too narrow — entire zone is no-trade')
         if price >= upper_no_trade or price <= lower_no_trade:
             edge = 'VAH' if price >= upper_no_trade else 'VAL'
             return self._hold(
@@ -53,9 +55,20 @@ class VolatileRangeStrategy(ModeStrategy):
         # ── Check REBUILD condition: VA breached for 3+ candles ──
         rebuild_needed, rebuild_reason = self._check_rebuild(candles, vah, val, config)
         if rebuild_needed:
-            # If we have a position, hold it during rebuild cooldown
             if position and position.get('side'):
-                return self._hold(f'MODE_B REBUILD: {rebuild_reason}')
+                # Existing position during rebuild → partial exit for safety
+                return {
+                    'action': 'EXIT',
+                    'side': position.get('side', '').upper(),
+                    'qty': None,
+                    'tp': None,
+                    'sl': None,
+                    'reason': f'MODE_B REBUILD EXIT: {rebuild_reason}',
+                    'signal_key': None,
+                    'chase_entry': False,
+                    'order_type': 'market',
+                    'meta': {'exit_type': 'rebuild', 'mode': 'B'},
+                }
             return self._hold(f'MODE_B REBUILD: {rebuild_reason}')
 
         # ── If position exists: evaluate ADD or EXIT ──
@@ -166,7 +179,11 @@ class VolatileRangeStrategy(ModeStrategy):
         if stage >= max_stages:
             return self._hold(f'MODE_B: stage {stage} >= max {max_stages}')
 
-        # ADD only if drift-aligned and price favorable
+        # ADD only if drift-aligned, price favorable, AND retest confirmed
+        candles = ctx.get('candles', [])
+        if not self._check_retest(candles, pos_side, poc):
+            return self._hold(f'MODE_B: ADD waiting retest for {pos_side}')
+
         if pos_side == 'LONG' and price is not None and poc is not None and price < poc:
             atr_val = self._get_atr_from_ctx(ctx)
             tp = risk.compute_tp('B', price, pos_side, poc, config)

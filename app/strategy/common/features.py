@@ -20,7 +20,7 @@ def compute_atr_pct(cur, symbol='BTC/USDT:USDT'):
     try:
         cur.execute("""
             SELECT atr_14 FROM indicators
-            WHERE symbol = %s ORDER BY ts DESC LIMIT 1
+            WHERE symbol = %s AND tf = '1m' ORDER BY ts DESC LIMIT 1
         """, (symbol,))
         row = cur.fetchone()
         if not row or row[0] is None:
@@ -46,7 +46,7 @@ def compute_bb_width(cur, symbol='BTC/USDT:USDT'):
     try:
         cur.execute("""
             SELECT bb_up, bb_dn, bb_mid FROM indicators
-            WHERE symbol = %s ORDER BY ts DESC LIMIT 1
+            WHERE symbol = %s AND tf = '1m' ORDER BY ts DESC LIMIT 1
         """, (symbol,))
         row = cur.fetchone()
         if not row or any(v is None for v in row):
@@ -102,7 +102,7 @@ def compute_impulse(cur, symbol='BTC/USDT:USDT'):
 
         cur.execute("""
             SELECT atr_14 FROM indicators
-            WHERE symbol = %s ORDER BY ts DESC LIMIT 1
+            WHERE symbol = %s AND tf = '1m' ORDER BY ts DESC LIMIT 1
         """, (symbol,))
         atr_row = cur.fetchone()
         if not atr_row or atr_row[0] is None or float(atr_row[0]) == 0:

@@ -62,7 +62,7 @@ def run_migrations(cur):
         BEGIN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'execution_log' AND column_name = 'mode'
+                WHERE table_schema = 'public' AND table_name = 'execution_log' AND column_name = 'mode'
             ) THEN
                 ALTER TABLE execution_log ADD COLUMN mode TEXT;
             END IF;
@@ -75,7 +75,7 @@ def run_migrations(cur):
         BEGIN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'execution_queue' AND column_name = 'signal_key'
+                WHERE table_schema = 'public' AND table_name = 'execution_queue' AND column_name = 'signal_key'
             ) THEN
                 ALTER TABLE execution_queue ADD COLUMN signal_key TEXT;
             END IF;

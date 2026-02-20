@@ -1380,6 +1380,8 @@ def _run_strategy_v2(cur, scores, regime_ctx):
             ORDER BY ts DESC LIMIT 10
         """, (SYMBOL,))
         for row in cur.fetchall():
+            if any(v is None for v in row[1:6]):
+                continue  # skip candles with NULL OHLCV
             candles.append({
                 'ts': row[0], 'o': float(row[1]), 'h': float(row[2]),
                 'l': float(row[3]), 'c': float(row[4]), 'v': float(row[5]),
@@ -1390,7 +1392,7 @@ def _run_strategy_v2(cur, scores, regime_ctx):
     try:
         cur.execute("""
             SELECT atr_14, rsi_14, bb_mid, bb_up, bb_dn, vwap
-            FROM indicators WHERE symbol = %s
+            FROM indicators WHERE symbol = %s AND tf = '1m'
             ORDER BY ts DESC LIMIT 1
         """, (SYMBOL,))
         ind_row = cur.fetchone()
@@ -1457,8 +1459,7 @@ def _run_strategy_v2(cur, scores, regime_ctx):
                     %s, %s)
         """, (
             SYMBOL, mode, drift_submode or 'none',
-            json.dumps({k: v for k, v in features.items()
-                        if not isinstance(v, (type(None),))}, default=str),
+            json.dumps(features, default=str),
             decision['action'], decision.get('side'),
             decision.get('qty'), decision.get('tp'), decision.get('sl'),
             gate_status, json.dumps(throttle_status, default=str),

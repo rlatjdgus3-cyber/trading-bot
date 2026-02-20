@@ -592,6 +592,7 @@ def _count_daily_orders_kst(cur):
             SELECT COUNT(*) FROM execution_log
             WHERE symbol = 'BTC/USDT:USDT'
               AND status IN ('FILLED', 'SENT')
+              AND order_type IN ('OPEN', 'ADD')
               AND ts >= to_timestamp(%s)
         """, (kst_start,))
         row = cur.fetchone()
