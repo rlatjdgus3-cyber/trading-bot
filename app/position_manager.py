@@ -193,7 +193,8 @@ def _build_context(cur=None, pos=None, snapshot=None):
     '''Build full market context for decision engine.'''
     ctx = {
         'position': pos,
-        'price': pos.get('mark_price', 0) if pos else 0}
+        'price': pos.get('mark_price', 0) if pos else 0,
+        'cur': cur}
 
     # Use snapshot for indicators if available
     if snapshot:
@@ -1473,6 +1474,74 @@ def _check_range_split_tp(ctx, regime_params, regime_ctx, upnl_pct, side, price)
     return None
 
 
+def _check_v3_take_profit(ctx, regime_ctx):
+    """V3 dynamic TP: ATR-based target + trailing from peak.
+
+    Two TP triggers (whichever fires first):
+      1. Fixed: uPnL% >= v3_tp_pct (ATR × R-ratio based)
+      2. Trailing: peak drawdown >= v3_tp_pct when peak >= v3_tp_pct
+
+    Returns (action, reason) or None.
+    FAIL-OPEN: returns None on any error.
+    """
+    try:
+        from strategy_v3.config_v3 import is_enabled
+        if not is_enabled():
+            return None
+
+        pos = ctx.get('position', {})
+        side = pos.get('side', '')
+        entry = pos.get('entry_price', 0)
+        price = ctx.get('price', 0)
+        if not side or not entry or entry <= 0 or not price:
+            return None
+
+        # Calculate uPnL%
+        if side == 'long':
+            upnl_pct = (price - entry) / entry * 100
+        else:
+            upnl_pct = (entry - price) / entry * 100
+
+        # Get V3 risk params
+        from strategy.common.features import build_feature_snapshot
+        cur = ctx.get('cur')
+        if not cur:
+            return None
+        features = build_feature_snapshot(cur)
+        if not features:
+            return None
+
+        from strategy_v3.regime_v3 import classify
+        from strategy_v3.risk_v3 import compute_risk
+        v3_regime = classify(features, regime_ctx or {})
+        v3_risk = compute_risk(features, v3_regime)
+
+        tp_pct = v3_risk['tp_pct'] * 100  # convert to percentage
+
+        # 1. Fixed TP: uPnL >= v3_tp_pct
+        if upnl_pct >= tp_pct:
+            return ('CLOSE',
+                    f'V3 TP (fixed): uPnL {upnl_pct:.2f}% >= {tp_pct:.2f}% '
+                    f'(ATR-based, regime={v3_regime["regime_class"]})')
+
+        # 2. Trailing TP: if peak was above tp_pct, close on drawdown
+        peak = ctx.get('pos_state', {}).get('peak_upnl_pct', 0) or 0
+        if peak >= tp_pct:
+            drawdown = peak - upnl_pct
+            # Trail distance = same as tp_pct (1R trailing)
+            trail = tp_pct * 0.5  # trail at 50% of TP distance
+            if drawdown >= trail:
+                return ('CLOSE',
+                        f'V3 TP (trailing): peak={peak:.2f}% now={upnl_pct:.2f}% '
+                        f'drawdown={drawdown:.2f}% >= trail={trail:.2f}% '
+                        f'(regime={v3_regime["regime_class"]})')
+
+        return None
+    except Exception as e:
+        _log(f'V3 TP check FAIL-OPEN: {e}')
+        return None
+
+
 def _check_take_profit(ctx, regime_params, regime_ctx):
     """Check regime-based take-profit conditions.
 
@@ -1667,6 +1736,11 @@ def _decide(ctx=None):
                 regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
         except Exception:
             pass
+    # ── V3 dynamic TP check (ATR-based, runs before regime TP) ──
+    v3_tp_result = _check_v3_take_profit(ctx, regime_ctx)
+    if v3_tp_result:
+        return v3_tp_result
+
     if regime_params:
         tp_result = _check_take_profit(ctx, regime_params, regime_ctx)
         if tp_result:
