@@ -5105,9 +5105,8 @@ def _bundle(_text=None):
                 gate_lines = []
                 import order_throttle
                 ts = order_throttle.get_throttle_status()
-                gate_lines.append(f'  hourly: {ts["hourly_count"]}/{ts["hourly_limit"]}')
-                gate_lines.append(f'  10min: {ts["10min_count"]}/{ts["10min_limit"]}')
-                gate_lines.append(f'  daily: {ts["daily_count"]}/{ts["daily_limit"]}')
+                gate_lines.append(f'  hourly: {ts.get("hourly_count", "?")}/{ts.get("hourly_limit", "?")}')
+                gate_lines.append(f'  10min: {ts.get("10min_count", "?")}/{ts.get("10min_limit", "?")}')
                 gate_lines.append(f'  locked: {ts.get("entry_locked", False)} '
                                   f'reason: {ts.get("lock_reason", "")}')
                 import safety_manager
@@ -5154,7 +5153,8 @@ def _bundle(_text=None):
                 cur.execute("""
                     SELECT action_type, direction, outcome, reject_reason,
                            to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr
-                    FROM order_attempt_log WHERE outcome != 'ALLOWED'
+                    FROM order_attempt_log
+                    WHERE outcome NOT IN ('ALLOWED', 'SUCCESS')
                     ORDER BY ts DESC LIMIT 10;
                 """)
                 rej_rows = cur.fetchall()
