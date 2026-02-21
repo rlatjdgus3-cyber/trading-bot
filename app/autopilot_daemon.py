@@ -1616,7 +1616,7 @@ def _run_strategy_v2(cur, scores, regime_ctx):
 
     side = decision.get('side', '').upper()
     reason = decision.get('reason', '')
-    meta = decision.get('meta', {})
+    meta = decision.get('meta') or {}
     meta['strategy_v2'] = True
     meta['mode'] = mode
     meta['drift_submode'] = drift_submode
