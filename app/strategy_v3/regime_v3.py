@@ -67,8 +67,53 @@ def _safe_bool(val, default=False):
     return default
 
 
+def _is_strict_breakout_enabled():
+    """Check if ff_strict_breakout flag is ON."""
+    try:
+        import feature_flags
+        return feature_flags.is_enabled('ff_strict_breakout')
+    except Exception:
+        return False
+
+
+def _check_strict_breakout(features, cfg):
+    """Evaluate 3-way strict breakout gate.
+
+    Returns (passed, strict_reasons_dict) where strict_reasons_dict has:
+        structure_pass, volume_pass, atr_pass, fail_reasons list.
+    """
+    structure_pass = _safe_bool(features.get('structure_breakout_pass'))
+    struct_dir = features.get('structure_breakout_dir')
+    volume_z = safe_float(features.get('volume_z'))
+    atr_ratio = safe_float(features.get('atr_ratio'))
+
+    vol_min = cfg.get('strict_breakout_volume_z_min', 1.0)
+    atr_min = cfg.get('strict_breakout_atr_ratio_min', 1.5)
+
+    volume_pass = volume_z >= vol_min
+    atr_pass = atr_ratio >= atr_min
+
+    fail_reasons = []
+    if not structure_pass:
+        fail_reasons.append(f'structure_breakout=False')
+    if not volume_pass:
+        fail_reasons.append(f'volume_z={volume_z:.2f} < {vol_min}')
+    if not atr_pass:
+        fail_reasons.append(f'atr_ratio={atr_ratio:.2f} < {atr_min}')
+
+    passed = structure_pass and volume_pass and atr_pass
+
+    return passed, {
+        'structure_pass': structure_pass,
+        'volume_pass': volume_pass,
+        'atr_pass': atr_pass,
+        'struct_dir': struct_dir,
+        'fail_reasons': fail_reasons,
+    }
+
+
 def _classify_raw(features, regime_ctx):
-    """Classify regime without hysteresis. Returns (class, entry_mode, confidence, reasons)."""
+    """Classify regime without hysteresis. Returns (class, entry_mode, confidence, reasons, extra)."""
     cfg = config_v3.get_all()
 
     drift_score = safe_float(features.get('drift_score'))
@@ -80,6 +125,9 @@ def _classify_raw(features, regime_ctx):
     volume_z = safe_float(features.get('volume_z'))
 
     reasons = []
+    extra = {}  # strict breakout metadata
+
+    strict_enabled = _is_strict_breakout_enabled()
 
     # ── Priority 1: BREAKOUT ──
     is_breakout = False
@@ -87,26 +135,68 @@ def _classify_raw(features, regime_ctx):
     # health=WARN alone does NOT trigger BREAKOUT — low liquidity ≠ breakout.
     # WARN is handled separately via stage_slice reduction in risk_v3.
 
-    if breakout_confirmed:
-        is_breakout = True
-        reasons.append('breakout_confirmed=True')
+    if strict_enabled:
+        # ── Strict Breakout: 3-way gate ──
+        strict_passed, strict_info = _check_strict_breakout(features, cfg)
+        extra['breakout_strict'] = strict_passed
+        extra['structure_pass'] = strict_info['structure_pass']
+        extra['volume_pass'] = strict_info['volume_pass']
+        extra['atr_pass'] = strict_info['atr_pass']
+        extra['strict_reasons'] = strict_info['fail_reasons']
 
-    if adx >= cfg['adx_breakout_min']:
-        # Need at least 1 auxiliary confirmation
-        aux_count = 0
-        if bbw_ratio >= cfg['breakout_bb_expand_min']:
-            aux_count += 1
-            reasons.append(f'bbw_ratio={bbw_ratio:.2f} >= {cfg["breakout_bb_expand_min"]}')
-        if volume_z >= cfg['breakout_volume_z_min']:
-            aux_count += 1
-            reasons.append(f'volume_z={volume_z:.2f} >= {cfg["breakout_volume_z_min"]}')
-        if aux_count >= 1:
+        if strict_passed:
             is_breakout = True
-            reasons.append(f'ADX={adx:.1f} >= {cfg["adx_breakout_min"]}')
+            reasons.append('strict_breakout: structure+volume+atr triple pass')
+        elif breakout_confirmed or drift_direction in ('UP', 'DOWN'):
+            # Demote to DRIFT — absorb false breakout
+            demote_dir = strict_info.get('struct_dir') or drift_direction
+            if demote_dir in ('UP', 'DOWN'):
+                regime_class = 'DRIFT_UP' if demote_dir == 'UP' else 'DRIFT_DOWN'
+            else:
+                regime_class = 'DRIFT_UP'  # default to UP if ambiguous
+            conf = min(65, 50 + int(adx * 0.5))
+            reasons.append(f'strict_breakout DEMOTE: {strict_info["fail_reasons"]}')
+            if breakout_confirmed:
+                reasons.append('breakout_confirmed=True but strict gate failed')
+            extra['breakout_strict'] = False
+            return (regime_class, 'DriftFollow', conf, reasons, extra)
+
+        # ADX+auxiliary path still available (already 2-way confirmed)
+        if not is_breakout and adx >= cfg['adx_breakout_min']:
+            aux_count = 0
+            if bbw_ratio >= cfg['breakout_bb_expand_min']:
+                aux_count += 1
+                reasons.append(f'bbw_ratio={bbw_ratio:.2f} >= {cfg["breakout_bb_expand_min"]}')
+            if volume_z >= cfg['breakout_volume_z_min']:
+                aux_count += 1
+                reasons.append(f'volume_z={volume_z:.2f} >= {cfg["breakout_volume_z_min"]}')
+            if aux_count >= 1:
+                is_breakout = True
+                reasons.append(f'ADX={adx:.1f} >= {cfg["adx_breakout_min"]} (ADX+aux path)')
+    else:
+        # ── Legacy mode: breakout_confirmed → immediate BREAKOUT ──
+        extra['breakout_strict'] = False
+        extra['strict_reasons'] = []
+
+        if breakout_confirmed:
+            is_breakout = True
+            reasons.append('breakout_confirmed=True')
+
+        if adx >= cfg['adx_breakout_min']:
+            aux_count = 0
+            if bbw_ratio >= cfg['breakout_bb_expand_min']:
+                aux_count += 1
+                reasons.append(f'bbw_ratio={bbw_ratio:.2f} >= {cfg["breakout_bb_expand_min"]}')
+            if volume_z >= cfg['breakout_volume_z_min']:
+                aux_count += 1
+                reasons.append(f'volume_z={volume_z:.2f} >= {cfg["breakout_volume_z_min"]}')
+            if aux_count >= 1:
+                is_breakout = True
+                reasons.append(f'ADX={adx:.1f} >= {cfg["adx_breakout_min"]}')
 
     if is_breakout:
         conf = min(90, 50 + int(adx))
-        return ('BREAKOUT', 'BreakoutTrend', conf, reasons)
+        return ('BREAKOUT', 'BreakoutTrend', conf, reasons, extra)
 
     # ── Priority 2: DRIFT_UP / DRIFT_DOWN ──
     if drift_score >= cfg['drift_trend_min'] and drift_direction in ('UP', 'DOWN'):
@@ -115,7 +205,7 @@ def _classify_raw(features, regime_ctx):
             conf = min(80, 50 + int(drift_score * 10000))
             reasons.append(f'drift={drift_score:.4f} >= {cfg["drift_trend_min"]}')
             reasons.append(f'drift_dir={drift_direction}')
-            return (regime_class, 'DriftFollow', conf, reasons)
+            return (regime_class, 'DriftFollow', conf, reasons, extra)
 
     # ── Priority 3: STATIC_RANGE ──
     # health=WARN does not disqualify STATIC_RANGE — low liquidity alone
@@ -127,16 +217,16 @@ def _classify_raw(features, regime_ctx):
         reasons.append(f'ADX={adx:.1f} <= {cfg["adx_range_max"]}')
         if health == 'WARN':
             reasons.append('health=WARN (risk_v3 will reduce slice)')
-        return ('STATIC_RANGE', 'MeanRev', conf, reasons)
+        return ('STATIC_RANGE', 'MeanRev', conf, reasons, extra)
 
     # ── Fallback ──
     if drift_score > cfg['drift_static_max'] and drift_direction in ('UP', 'DOWN'):
         regime_class = 'DRIFT_UP' if drift_direction == 'UP' else 'DRIFT_DOWN'
         reasons.append(f'fallback: drift={drift_score:.4f} > static_max')
-        return (regime_class, 'DriftFollow', 45, reasons)
+        return (regime_class, 'DriftFollow', 45, reasons, extra)
 
     reasons.append('fallback: STATIC_RANGE (conservative default)')
-    return ('STATIC_RANGE', 'MeanRev', 40, reasons)
+    return ('STATIC_RANGE', 'MeanRev', 40, reasons, extra)
 
 
 def _apply_hysteresis(raw_class):
@@ -208,7 +298,7 @@ def classify(features, regime_ctx, prev_state=None):
         if not regime_ctx:
             regime_ctx = {}
 
-        raw_class, entry_mode, confidence, reasons = _classify_raw(features, regime_ctx)
+        raw_class, entry_mode, confidence, reasons, extra = _classify_raw(features, regime_ctx)
 
         # Apply hysteresis
         effective_class = _apply_hysteresis(raw_class)
@@ -223,13 +313,17 @@ def classify(features, regime_ctx, prev_state=None):
                 entry_mode = 'MeanRev'
             reasons.append(f'hysteresis hold: raw={raw_class} → effective={effective_class}')
 
-        return {
+        result = {
             'regime_class': effective_class,
             'entry_mode': entry_mode,
             'confidence': confidence,
             'reasons': reasons,
             'raw_class': raw_class,
         }
+        # Merge strict breakout metadata
+        if extra:
+            result.update(extra)
+        return result
     except Exception as e:
         _log(f'classify FAIL-OPEN: {e}')
         return {
@@ -238,4 +332,6 @@ def classify(features, regime_ctx, prev_state=None):
             'confidence': 30,
             'reasons': [f'FAIL-OPEN: {e}'],
             'raw_class': 'STATIC_RANGE',
+            'breakout_strict': False,
+            'strict_reasons': [],
         }

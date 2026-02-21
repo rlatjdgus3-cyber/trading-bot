@@ -365,6 +365,75 @@ def _check_stop_loss_cooldown(cur, symbol):
     return (True, '', 0)
 
 
+def _check_loss_streak_cooldown(cur):
+    """Check if loss streak cooldown blocks new entry.
+
+    ff_loss_streak_cooldown=OFF → always (True, '').
+    ON → check recent consecutive losses in execution_log.
+
+    Returns (ok: bool, reason: str).
+    """
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_loss_streak_cooldown'):
+            return (True, '')
+    except Exception:
+        return (True, '')
+
+    try:
+        from strategy_v3 import config_v3
+        trigger = config_v3.get('loss_streak_trigger', 3)
+        cooldown_sec = config_v3.get('loss_streak_cooldown_sec', 1200)
+        window_hours = config_v3.get('loss_streak_window_hours', 3)
+
+        # Query recent closed trades within the window, ordered by time desc
+        cur.execute("""
+            SELECT pnl_usdt FROM execution_log
+            WHERE action IN ('CLOSE', 'SL')
+              AND ts > now() - interval '%s hours'
+            ORDER BY ts DESC
+            LIMIT %s
+        """, (window_hours, trigger))
+        rows = cur.fetchall()
+
+        if not rows or len(rows) < trigger:
+            return (True, '')
+
+        # Count consecutive losses from most recent
+        streak = 0
+        for row in rows:
+            if row[0] is not None and float(row[0]) < 0:
+                streak += 1
+            else:
+                break
+
+        if streak >= trigger:
+            # Check if most recent loss is within cooldown window
+            cur.execute("""
+                SELECT ts FROM execution_log
+                WHERE action IN ('CLOSE', 'SL') AND pnl_usdt < 0
+                  AND ts > now() - interval '%s hours'
+                ORDER BY ts DESC LIMIT 1
+            """, (window_hours,))
+            last_loss_row = cur.fetchone()
+            if last_loss_row and last_loss_row[0]:
+                import datetime
+                now = datetime.datetime.now(datetime.timezone.utc)
+                last_loss_ts = last_loss_row[0]
+                if last_loss_ts.tzinfo is None:
+                    last_loss_ts = last_loss_ts.replace(tzinfo=datetime.timezone.utc)
+                elapsed = (now - last_loss_ts).total_seconds()
+                remaining = int(cooldown_sec - elapsed)
+                if remaining > 0:
+                    reason = f'LOSS_STREAK_COOLDOWN: {streak} consecutive losses, {remaining}s remaining'
+                    return (False, reason)
+
+        return (True, '')
+    except Exception as e:
+        _log(f'loss_streak_cooldown check error (FAIL-OPEN): {e}')
+        return (True, '')
+
+
 def should_emit_signal(cur, symbol, direction, conf, regime_ctx=None):
     """Central gate: decide if a new signal should be emitted.
     Returns (ok, reason).
@@ -393,6 +462,13 @@ def should_emit_signal(cur, symbol, direction, conf, regime_ctx=None):
         _last_suppress_reason = sl_reason
         _last_suppress_ts = now_ts
         return (False, sl_reason)
+
+    # 4. Loss streak cooldown (ff_loss_streak_cooldown)
+    (ls_ok, ls_reason) = _check_loss_streak_cooldown(cur)
+    if not ls_ok:
+        _last_suppress_reason = ls_reason
+        _last_suppress_ts = now_ts
+        return (False, ls_reason)
 
     return (True, 'OK')
 
@@ -1309,6 +1385,13 @@ def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, 
     cur.execute('SELECT stage FROM position_state WHERE symbol = %s;', (SYMBOL,))
     ps_row = cur.fetchone()
     pyramid_stage = int(ps_row[0]) if ps_row else 0
+
+    # V3 max_stage override (ff_regime_risk_v3 ON → max_stage from risk_v3)
+    if _v3_result and 'max_stage' in _v3_result:
+        v3_max = _v3_result['max_stage']
+        if pyramid_stage >= v3_max:
+            return ('BLOCKED', f'V3 max_stage reached ({pyramid_stage}/{v3_max})')
+
     (ok, reason) = safety_manager.check_pyramid_allowed(cur, pyramid_stage, regime_ctx=regime_ctx)
     if not ok:
         return ('BLOCKED', reason)
@@ -1893,6 +1976,9 @@ def _cycle():
                         'post_v3_total_score': total_score,
                         'pre_v3_dominant': pre_v3_dominant,
                     }
+                    # Propagate max_stage from regime risk v3
+                    if 'max_stage' in v3_risk_params:
+                        _v3_result['max_stage'] = v3_risk_params['max_stage']
 
                     _log(f'[V3] regime={v3_regime["regime_class"]} '
                          f'pre={pre_v3_total_score:+.0f} mod={v3_mod["modifier"]:+.0f} '

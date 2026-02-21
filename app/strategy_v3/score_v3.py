@@ -157,7 +157,16 @@ def _check_breakout_retest(features, breakout_dir, breakout_level, cfg):
     return dist <= atr_val
 
 
-def _compute_breakout_modifier(total_score, features, price, cfg):
+def _is_regime_risk_v3_enabled():
+    """Check if ff_regime_risk_v3 flag is ON."""
+    try:
+        import feature_flags
+        return feature_flags.is_enabled('ff_regime_risk_v3')
+    except Exception:
+        return False
+
+
+def _compute_breakout_modifier(total_score, features, price, cfg, v3_regime=None):
     """Compute score modifier for BREAKOUT regime."""
     modifier = 0.0
     blocked = False
@@ -196,8 +205,29 @@ def _compute_breakout_modifier(total_score, features, price, cfg):
         reasoning.append(f'breakout DOWN trend bonus: -{cfg["breakout_trend_bonus"]}')
         breakout_level = val
 
+    # 2b. Reverse direction hard block (ff_regime_risk_v3 only)
+    if _is_regime_risk_v3_enabled() and cfg.get('breakout_reverse_block', True):
+        dominant = 'LONG' if total_score >= 0 else 'SHORT'
+        if breakout_dir == 'UP' and dominant == 'SHORT':
+            blocked = True
+            block_reason = 'BREAKOUT UP + SHORT reverse block'
+            reasoning.append('reverse block: BREAKOUT UP vs SHORT')
+        elif breakout_dir == 'DOWN' and dominant == 'LONG':
+            blocked = True
+            block_reason = 'BREAKOUT DOWN + LONG reverse block'
+            reasoning.append('reverse block: BREAKOUT DOWN vs LONG')
+
+    # 2c. Impulse chase threshold block (ff_regime_risk_v3 only)
+    if _is_regime_risk_v3_enabled() and not blocked:
+        impulse = safe_float(features.get('impulse'))
+        impulse_threshold = cfg.get('impulse_chase_threshold', 1.5)
+        if impulse > impulse_threshold:
+            blocked = True
+            block_reason = f'impulse chase block: {impulse:.2f} > {impulse_threshold}'
+            reasoning.append(f'impulse chase: {impulse:.2f} > {impulse_threshold}')
+
     # 3. Retest entry mode
-    if cfg['retest_entry_enabled']:
+    if cfg['retest_entry_enabled'] and not blocked:
         if not _check_breakout_retest(features, breakout_dir, breakout_level, cfg):
             blocked = True
             block_reason = 'BREAKOUT retest pending'
@@ -261,7 +291,7 @@ def compute_modifier(total_score, features, v3_regime, price):
                 total_score, features, price, regime_class, cfg)
         elif regime_class == 'BREAKOUT':
             modifier, blocked, block_reason, reasoning = _compute_breakout_modifier(
-                total_score, features, price, cfg)
+                total_score, features, price, cfg, v3_regime=v3_regime)
         else:
             modifier, blocked, block_reason, reasoning = 0, False, '', ['unknown regime — passthrough']
 

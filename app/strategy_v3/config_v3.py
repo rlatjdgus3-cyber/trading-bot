@@ -66,6 +66,31 @@ DEFAULTS = {
     # Signal Debounce
     'signal_debounce_sec': 300,
     'post_sl_same_dir_cooldown_sec': 600,
+
+    # Strict Breakout 3중 확인
+    'strict_breakout_n_candles': 3,
+    'strict_breakout_m_outside': 2,
+    'strict_breakout_k_dist': 0.25,
+    'strict_breakout_pct_dist': 0.0015,
+    'strict_breakout_volume_z_min': 1.0,
+    'strict_breakout_atr_ratio_min': 1.5,
+
+    # 레짐별 리스크
+    'static_range_min_sl': 0.005,
+    'static_range_max_sl': 0.009,
+    'drift_min_sl': 0.006,
+    'drift_max_sl': 0.012,
+    'breakout_min_sl': 0.008,
+    'breakout_max_sl': 0.02,
+    'breakout_atr_sl_mult': 2.0,
+    'impulse_chase_threshold': 1.5,
+    'max_stage_v3': 3,
+    'breakout_reverse_block': True,
+
+    # 연속손실 쿨다운
+    'loss_streak_trigger': 3,
+    'loss_streak_cooldown_sec': 1200,
+    'loss_streak_window_hours': 3,
 }
 
 

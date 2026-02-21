@@ -296,6 +296,81 @@ def compute_range_quality(cur, symbol='BTC/USDT:USDT', lookback=10):
         return None
 
 
+def compute_atr_ratio(cur, symbol='BTC/USDT:USDT', window=20):
+    """ATR expansion ratio: current ATR / SMA of recent ATR values.
+    Returns float (>1.0 = expanding) or None.  FAIL-OPEN."""
+    try:
+        cur.execute("""
+            SELECT atr_14 FROM indicators
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT %s
+        """, (symbol, window + 1))
+        rows = cur.fetchall()
+        if not rows or len(rows) < 5:
+            return None
+        atrs = [float(r[0]) for r in rows if r[0] is not None]
+        if len(atrs) < 5:
+            return None
+        current = atrs[0]
+        hist = atrs[1:]
+        mean_atr = sum(hist) / len(hist)
+        if mean_atr <= 0:
+            return None
+        return current / mean_atr
+    except Exception as e:
+        _log(f'compute_atr_ratio error: {e}')
+        return None
+
+
+def compute_structure_breakout(cur, vah, val, atr_val, price, symbol='BTC/USDT:USDT',
+                               n=3, m=2, k_dist=0.25, pct_dist=0.0015):
+    """Structure breakout check: M of N recent candle closes outside VA ± min_dist.
+
+    Returns (passed: bool, direction: 'UP'|'DOWN'|None, detail: dict).
+    FAIL-OPEN: (False, None, {}) on error.
+    """
+    try:
+        if vah is None or val is None or atr_val is None or price is None:
+            return (False, None, {})
+        if vah <= val or atr_val <= 0:
+            return (False, None, {})
+
+        min_dist = max(atr_val * k_dist, price * pct_dist)
+
+        cur.execute("""
+            SELECT c FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT %s
+        """, (symbol, n))
+        rows = cur.fetchall()
+        if not rows or len(rows) < n:
+            return (False, None, {})
+
+        closes = [float(r[0]) for r in rows if r[0] is not None]
+        if len(closes) < n:
+            return (False, None, {})
+
+        above_count = sum(1 for c in closes if c > vah + min_dist)
+        below_count = sum(1 for c in closes if c < val - min_dist)
+
+        detail = {
+            'above_count': above_count,
+            'below_count': below_count,
+            'min_dist': min_dist,
+            'n': n,
+            'm': m,
+        }
+
+        if above_count >= m:
+            return (True, 'UP', detail)
+        if below_count >= m:
+            return (True, 'DOWN', detail)
+        return (False, None, detail)
+    except Exception as e:
+        _log(f'compute_structure_breakout error: {e}')
+        return (False, None, {})
+
+
 def compute_spread_ok(cur, symbol='BTC/USDT:USDT', max_spread_pct=0.05):
     """Check if bid-ask spread < max_spread_pct%.
     FAIL-OPEN: returns True if data unavailable."""
@@ -352,11 +427,27 @@ def build_feature_snapshot(cur, symbol='BTC/USDT:USDT'):
     price = _get_current_price(cur, symbol)
     drift_score, drift_dir = compute_drift_score(cur, symbol)
     adx = _get_adx(cur, symbol)
+    atr_pct = compute_atr_pct(cur, symbol)
+
+    # Structure breakout computation (reuse already-fetched vah/val/atr/price)
+    atr_val = (atr_pct * price) if (atr_pct is not None and price is not None) else None
+    try:
+        from strategy_v3 import config_v3
+        sb_n = config_v3.get('strict_breakout_n_candles', 3)
+        sb_m = config_v3.get('strict_breakout_m_outside', 2)
+        sb_k = config_v3.get('strict_breakout_k_dist', 0.25)
+        sb_pct = config_v3.get('strict_breakout_pct_dist', 0.0015)
+    except Exception:
+        sb_n, sb_m, sb_k, sb_pct = 3, 2, 0.25, 0.0015
+
+    struct_pass, struct_dir, _struct_detail = compute_structure_breakout(
+        cur, vp['vah'], vp['val'], atr_val, price, symbol,
+        n=sb_n, m=sb_m, k_dist=sb_k, pct_dist=sb_pct)
 
     return {
         'symbol': symbol,
         'price': price,
-        'atr_pct': compute_atr_pct(cur, symbol),
+        'atr_pct': atr_pct,
         'bb_width': compute_bb_width(cur, symbol),
         'volume_z': compute_volume_z(cur, symbol),
         'impulse': compute_impulse(cur, symbol),
@@ -374,4 +465,8 @@ def build_feature_snapshot(cur, symbol='BTC/USDT:USDT'):
         'range_quality': compute_range_quality(cur, symbol),
         'spread_ok': compute_spread_ok(cur, symbol),
         'liquidity_ok': compute_liquidity_ok(cur, symbol),
+        # Strict breakout fields
+        'atr_ratio': compute_atr_ratio(cur, symbol),
+        'structure_breakout_pass': struct_pass,
+        'structure_breakout_dir': struct_dir,
     }

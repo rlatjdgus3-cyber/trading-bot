@@ -202,6 +202,25 @@ def _check_execution_queue_health() -> tuple:
         return (False, str(e)[:100])
 
 
+def _write_heartbeats_to_db(service_states):
+    """Write service heartbeats to service_health_log.
+
+    Called every watchdog cycle (~3min) so /debug health has fresh data
+    even without explicit /debug health calls.
+    """
+    try:
+        from db_config import get_conn
+        conn = get_conn(autocommit=True)
+        with conn.cursor() as cur:
+            for svc, state_val in service_states.items():
+                cur.execute(
+                    "INSERT INTO service_health_log (service, state) VALUES (%s, %s)",
+                    (svc, state_val))
+        conn.close()
+    except Exception as e:
+        _log(f'heartbeat DB write error (non-fatal): {e}')
+
+
 def main():
     from dotenv import load_dotenv
     load_dotenv('/root/trading-bot/app/.env')
@@ -210,11 +229,16 @@ def main():
     issues = []
     fixed = []
 
+    # 0. Collect service states for heartbeat recording
+    service_states = {}
+
     # 1. Check monitored services
     for unit, level in MONITORED_SERVICES:
         if _is_active(unit):
+            service_states[unit] = 'OK'
             continue
 
+        service_states[unit] = 'DOWN'
         _log(f'DOWN: {unit} (level={level})')
 
         if level == 'critical' and _can_restart(state, unit):
@@ -235,6 +259,7 @@ def main():
     # 2. Check monitored timers
     for timer in MONITORED_TIMERS:
         if not _is_active(timer):
+            service_states[timer] = 'DOWN'
             _log(f'TIMER DOWN: {timer}')
             # Auto-restart timers (safe)
             ok = _restart_service(timer)
@@ -242,11 +267,19 @@ def main():
                 fixed.append(timer)
             else:
                 issues.append(f'WARNING: {timer} is DOWN')
+        else:
+            service_states[timer] = 'OK'
 
     # 3. Check DB
     db_ok, db_detail = _check_db_connection()
     if not db_ok:
         issues.append(f'CRITICAL: DB connection failed: {db_detail}')
+    else:
+        service_states['db'] = 'OK'
+
+    # 3b. Record heartbeats to DB (after DB connectivity confirmed)
+    if db_ok:
+        _write_heartbeats_to_db(service_states)
 
     # 4. Check execution queue health
     eq_ok, eq_detail = _check_execution_queue_health()
