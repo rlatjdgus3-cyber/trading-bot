@@ -26,6 +26,21 @@ def make_signal_key(symbol, mode, side, stage=1):
     return f'{symbol}:{mode}:{side}:{stage_bucket}'
 
 
+def make_v3_signal_key(symbol, regime_class, side, level_bucket):
+    """V3 extended debounce key: side+regime+level_bucket.
+
+    Args:
+        symbol: e.g. 'BTC/USDT:USDT'
+        regime_class: 'STATIC_RANGE' | 'DRIFT_UP' | 'DRIFT_DOWN' | 'BREAKOUT'
+        side: 'LONG' | 'SHORT'
+        level_bucket: 'VAL' | 'POC' | 'VAH' | 'MID' | 'BREAKOUT_UP' | 'BREAKOUT_DOWN'
+
+    Returns:
+        str — dedup key for V3 signal debounce
+    """
+    return f'{symbol}:v3:{regime_class}:{side}:{level_bucket}'
+
+
 def is_duplicate(cur, signal_key, window_sec=DEFAULT_WINDOW_SEC):
     """Check if this signal key was seen within the window.
 

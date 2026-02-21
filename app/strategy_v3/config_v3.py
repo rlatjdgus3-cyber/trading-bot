@@ -1,0 +1,126 @@
+"""
+strategy_v3.config_v3 — V3 parameter loader with defaults.
+
+All V3 parameters live in config/strategy_modes.yaml → strategy_v3 section.
+This module provides fallback defaults and a typed getter.
+"""
+
+import os
+import threading
+import yaml
+
+LOG_PREFIX = '[config_v3]'
+
+_config_cache = None
+_config_lock = threading.Lock()
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                            'config', 'strategy_modes.yaml')
+
+# ── Default values (fallback when YAML key is missing) ──
+
+DEFAULTS = {
+    # Feature flag
+    'enabled': False,
+
+    # Regime classification
+    'drift_static_max': 0.0003,
+    'drift_trend_min': 0.0008,
+    'adx_range_max': 20,
+    'adx_breakout_min': 28,
+    'regime_confirm_bars': 3,
+    'regime_min_dwell_sec': 300,
+    'cooldown_after_stop_sec': 600,
+    'breakout_bb_expand_min': 1.3,
+    'breakout_volume_z_min': 1.5,
+
+    # Static Range (Mean Reversion)
+    'poc_band_atr_mult': 0.5,
+    'poc_band_va_mult': 0.15,
+    'edge_score_bonus': 25,
+    'poc_zone_penalty': 40,
+    'edge_overshoot_atr_mult': 1.5,
+    'edge_overshoot_penalty': 30,
+
+    # Drifting Range
+    'drift_aligned_bonus': 15,
+    'drift_counter_penalty': 50,
+    'retest_confirm_bars': 3,
+    'poc_support_tolerance_atr': 0.3,
+
+    # Breakout
+    'breakout_pad_atr_mult': 0.3,
+    'retest_entry_enabled': True,
+    'chase_ban_atr_mult': 2.0,
+    'chase_score_penalty': 40,
+    'breakout_trend_bonus': 25,
+
+    # Dynamic Risk
+    'atr_sl_mult': 1.5,
+    'min_sl_pct': 0.003,
+    'max_sl_pct': 0.02,
+    'tp_r_ratio': 1.2,
+    'breakout_stage_slice_mult': 0.5,
+    'sl_update_min_interval_sec': 300,
+    'sl_update_min_change_pct': 0.1,
+
+    # Signal Debounce
+    'signal_debounce_sec': 300,
+    'post_sl_same_dir_cooldown_sec': 600,
+}
+
+
+def _log(msg):
+    print(f'{LOG_PREFIX} {msg}', flush=True)
+
+
+def _load_v3_section():
+    """Load strategy_v3 section from YAML. Returns dict (empty on error)."""
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+    with _config_lock:
+        if _config_cache is not None:
+            return _config_cache
+        try:
+            with open(_CONFIG_PATH, 'r') as f:
+                full = yaml.safe_load(f) or {}
+            _config_cache = full.get('strategy_v3', {})
+            return _config_cache
+        except Exception as e:
+            _log(f'load FAIL-OPEN: {e}')
+            _config_cache = {}
+            return _config_cache
+
+
+def reload():
+    """Force-reload config (for hot reload / testing)."""
+    global _config_cache
+    with _config_lock:
+        _config_cache = None
+
+
+def get(key, default=None):
+    """Get a V3 config value with fallback chain: YAML → DEFAULTS → default arg."""
+    section = _load_v3_section()
+    if key in section:
+        return section[key]
+    if key in DEFAULTS:
+        return DEFAULTS[key]
+    return default
+
+
+def is_enabled():
+    """Check if V3 is enabled. FAIL-OPEN: returns False."""
+    try:
+        val = get('enabled', False)
+        return str(val).lower() in ('true', '1', 'on')
+    except Exception:
+        return False
+
+
+def get_all():
+    """Return merged config (DEFAULTS overridden by YAML values)."""
+    section = _load_v3_section()
+    merged = dict(DEFAULTS)
+    merged.update(section)
+    return merged

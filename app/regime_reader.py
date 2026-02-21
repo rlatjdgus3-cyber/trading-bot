@@ -326,6 +326,50 @@ def get_regime_params(regime, shock_type=None):
 
 # ── Strategy v2: YAML-based mode params ──
 
+def record_v3_stop_loss(direction):
+    """Record a stop-loss event for V3 cooldown tracking.
+
+    V3's cooldown_after_stop: 1 SL → 10min same-direction ban.
+    Complementary to existing 2-SL consecutive cooldown.
+
+    Args:
+        direction: 'LONG' or 'SHORT'
+    """
+    try:
+        from strategy_v3.config_v3 import is_enabled
+        if not is_enabled():
+            return
+        from strategy_v3.regime_v3 import record_stop_loss
+        record_stop_loss(direction)
+        _log(f'V3 SL recorded: direction={direction}')
+    except Exception as e:
+        _log(f'V3 SL record FAIL-OPEN: {e}')
+
+
+def check_v3_sl_cooldown(direction):
+    """Check if V3 post-SL cooldown is active for a given direction.
+
+    Returns (ok, reason). FAIL-OPEN: returns (True, '').
+    """
+    try:
+        from strategy_v3.config_v3 import is_enabled, get as v3_get
+        if not is_enabled():
+            return (True, '')
+        from strategy_v3.regime_v3 import get_sl_cooldown_info
+        import time as _time
+        cooldown_sec = v3_get('cooldown_after_stop_sec', 600)
+        last_sl_ts, last_sl_dir = get_sl_cooldown_info()
+        if last_sl_ts > 0 and last_sl_dir == direction:
+            elapsed = _time.time() - last_sl_ts
+            if elapsed < cooldown_sec:
+                remaining = int(cooldown_sec - elapsed)
+                return (False, f'V3 cooldown_after_stop: {direction} blocked for {remaining}s')
+        return (True, '')
+    except Exception as e:
+        _log(f'V3 SL cooldown check FAIL-OPEN: {e}')
+        return (True, '')
+
+
 def get_mode_params(mode):
     """Get mode-specific parameters from YAML config (strategy v2).
 

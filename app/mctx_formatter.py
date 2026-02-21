@@ -93,4 +93,33 @@ def format_mctx(features, regime_ctx):
     if volume_z is not None:
         lines.append(f'  volume_z: {volume_z:.2f}')
 
+    # ── Strategy V3 section ──
+    v3_regime = _get_v3_regime(features, regime_ctx)
+    if v3_regime:
+        lines.append('')
+        lines.append('  [Strategy V3]')
+        lines.append(f'  regime_class: {v3_regime.get("regime_class", "N/A")}')
+        lines.append(f'  entry_mode: {v3_regime.get("entry_mode", "N/A")}')
+        lines.append(f'  confidence: {v3_regime.get("confidence", 0)}')
+        raw = v3_regime.get('raw_class')
+        if raw and raw != v3_regime.get('regime_class'):
+            lines.append(f'  raw_class: {raw} (hysteresis active)')
+        reasons = v3_regime.get('reasons', [])
+        if reasons:
+            lines.append('  reasons:')
+            for r in reasons[:3]:
+                lines.append(f'    - {r}')
+
     return '\n'.join(lines)
+
+
+def _get_v3_regime(features, regime_ctx):
+    """Try to compute V3 regime classification. Returns dict or None."""
+    try:
+        from strategy_v3.config_v3 import is_enabled
+        if not is_enabled():
+            return None
+        from strategy_v3.regime_v3 import classify
+        return classify(features, regime_ctx)
+    except Exception:
+        return None

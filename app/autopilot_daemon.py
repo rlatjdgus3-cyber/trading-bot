@@ -49,6 +49,105 @@ _add_dedup_initialized = False
 ADD_PRICE_DEDUP_PCT = 0.1       # ±0.1% range
 ADD_PRICE_DEDUP_SEC = 600       # 10min window
 
+# ── Strategy V3 state ──
+_v3_result = None  # last V3 cycle result (for signal metadata)
+
+
+def _is_v3_enabled():
+    """Check if Strategy V3 is enabled. FAIL-OPEN: returns False."""
+    try:
+        from strategy_v3.config_v3 import is_enabled
+        return is_enabled()
+    except Exception:
+        return False
+
+
+def _v3_check_sl_cooldown(cur, symbol, direction):
+    """V3 SL cooldown: 1 SL → 10min same-direction ban (complementary to existing 2-SL cooldown).
+
+    Returns (ok, reason).
+    FAIL-OPEN: returns (True, '').
+    """
+    try:
+        from strategy_v3.config_v3 import get as v3_get
+        cooldown_sec = v3_get('cooldown_after_stop_sec', 600)
+
+        from strategy_v3.regime_v3 import get_sl_cooldown_info
+        last_sl_ts, last_sl_dir = get_sl_cooldown_info()
+
+        if last_sl_ts > 0 and last_sl_dir:
+            elapsed = time.time() - last_sl_ts
+            if elapsed < cooldown_sec and last_sl_dir == direction:
+                remaining = int(cooldown_sec - elapsed)
+                return (False, f'V3 cooldown_after_stop: {direction} blocked for {remaining}s')
+        # Also check DB for recent SL events (covers bot restarts)
+        cur.execute("""
+            SELECT direction, extract(epoch from last_fill_at) as ts
+            FROM execution_log
+            WHERE symbol = %s AND status = 'FILLED'
+              AND order_type IN ('CLOSE', 'FULL_CLOSE')
+              AND realized_pnl < 0
+              AND last_fill_at >= now() - make_interval(secs => %s)
+            ORDER BY last_fill_at DESC LIMIT 1;
+        """, (symbol, cooldown_sec))
+        row = cur.fetchone()
+        if row and row[0]:
+            sl_dir = 'LONG' if row[0].lower() == 'long' else 'SHORT'
+            if sl_dir == direction:
+                elapsed = time.time() - float(row[1])
+                if elapsed < cooldown_sec:
+                    remaining = int(cooldown_sec - elapsed)
+                    return (False, f'V3 cooldown_after_stop(DB): {direction} blocked for {remaining}s')
+    except Exception as e:
+        _log(f'V3 SL cooldown check FAIL-OPEN: {e}')
+    return (True, '')
+
+
+def _v3_check_signal_debounce(cur, symbol, v3_regime, direction, features):
+    """V3 signal debounce: side+regime+level_bucket → window check.
+
+    Returns (ok, reason).
+    FAIL-OPEN: returns (True, '').
+    """
+    try:
+        from strategy_v3.config_v3 import get as v3_get
+        from strategy.common.dedupe import is_duplicate, make_v3_signal_key
+
+        debounce_sec = v3_get('signal_debounce_sec', 300)
+        regime_class = v3_regime.get('regime_class', 'UNKNOWN')
+
+        # Determine level bucket
+        range_position = features.get('range_position') if features else None
+        if regime_class == 'BREAKOUT':
+            price = features.get('price', 0) if features else 0
+            vah = features.get('vah', 0) if features else 0
+            val = features.get('val', 0) if features else 0
+            if price and vah and price > vah:
+                level_bucket = 'BREAKOUT_UP'
+            elif price and val and price < val:
+                level_bucket = 'BREAKOUT_DOWN'
+            else:
+                level_bucket = 'MID'
+        elif range_position is not None:
+            if range_position <= 0.20:
+                level_bucket = 'VAL'
+            elif range_position >= 0.80:
+                level_bucket = 'VAH'
+            elif 0.40 <= range_position <= 0.60:
+                level_bucket = 'POC'
+            else:
+                level_bucket = 'MID'
+        else:
+            level_bucket = 'MID'
+
+        key = make_v3_signal_key(symbol, regime_class, direction, level_bucket)
+        if is_duplicate(cur, key, window_sec=debounce_sec):
+            return (False, f'V3 debounce: {key} within {debounce_sec}s')
+        return (True, '')
+    except Exception as e:
+        _log(f'V3 debounce check FAIL-OPEN: {e}')
+        return (True, '')
+
 
 def _db_check_trade_switch_transition(cur):
     """Detect trade_switch ON→OFF transition via DB state.
@@ -1289,13 +1388,22 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
 
 
 def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
-                        start_stage=None, entry_pct=None, equity_limits=None):
+                        start_stage=None, entry_pct=None, equity_limits=None,
+                        v3_result=None):
     '''Insert trade_process_log entry.'''
     if equity_limits is None:
         import safety_manager
         equity_limits = safety_manager.get_equity_limits(cur)
     eq = equity_limits
-    context = scores.get('context', {})
+    context = dict(scores.get('context', {}))
+    # V3: inject regime snapshot into decision_context
+    if v3_result:
+        context['v3_regime_class'] = v3_result.get('regime_class')
+        context['v3_entry_mode'] = v3_result.get('entry_mode')
+        context['v3_score_modifier'] = v3_result.get('score_modifier')
+        context['v3_reasoning'] = v3_result.get('reasoning', [])[:3]
+        context['v3_sl_pct'] = v3_result.get('sl_pct')
+        context['v3_tp_pct'] = v3_result.get('tp_pct')
     try:
         cur.execute("""
             INSERT INTO trade_process_log
@@ -1702,6 +1810,73 @@ def _cycle():
                 _log(f'REGIME VETO: 진입 차단 (flow_bias={regime_ctx.get("flow_bias")})')
                 return
 
+            # ── STRATEGY V3: regime switching + chase suppression ──
+            global _v3_result
+            _v3_result = None
+            if _is_v3_enabled():
+                try:
+                    from strategy.common.features import build_feature_snapshot
+                    from strategy_v3.regime_v3 import classify as v3_classify
+                    from strategy_v3.score_v3 import compute_modifier as v3_score_mod
+                    from strategy_v3.risk_v3 import compute_risk as v3_risk
+
+                    v3_features = build_feature_snapshot(cur)
+                    v3_regime = v3_classify(v3_features, regime_ctx)
+
+                    v3_price = v3_features.get('price', 0) if v3_features else 0
+                    total_score = scores.get('unified', {}).get('total_score', 0) if scores.get('unified') else 0
+                    # Fallback: derive total_score from long_score
+                    if total_score == 0:
+                        ls = scores.get('long_score', 50)
+                        total_score = (ls - 50) * 2
+
+                    v3_mod = v3_score_mod(total_score, v3_features, v3_regime, v3_price)
+
+                    if v3_mod['entry_blocked']:
+                        _log(f'[V3] BLOCKED: {v3_mod["block_reason"]} '
+                             f'(regime={v3_regime["regime_class"]} mode={v3_regime["entry_mode"]})')
+                        return
+
+                    # Apply score modification
+                    total_score = max(-100, min(100, total_score + v3_mod['modifier']))
+                    new_long_score = int(max(0, min(100, 50 + total_score / 2)))
+                    new_short_score = 100 - new_long_score
+                    new_confidence = abs(new_long_score - new_short_score)
+                    new_dominant = 'LONG' if new_long_score >= new_short_score else 'SHORT'
+
+                    # Override scores
+                    scores = dict(scores)
+                    scores['long_score'] = new_long_score
+                    scores['short_score'] = new_short_score
+                    scores['confidence'] = new_confidence
+                    scores['dominant_side'] = new_dominant
+                    confidence = new_confidence
+                    dominant = new_dominant
+
+                    # Compute risk overrides
+                    v3_risk_params = v3_risk(v3_features, v3_regime)
+
+                    # Store V3 result for signal metadata
+                    _v3_result = {
+                        'regime_class': v3_regime['regime_class'],
+                        'entry_mode': v3_regime['entry_mode'],
+                        'raw_class': v3_regime.get('raw_class'),
+                        'v3_confidence': v3_regime['confidence'],
+                        'score_modifier': v3_mod['modifier'],
+                        'reasoning': v3_mod['reasoning'][:5],
+                        'sl_pct': v3_risk_params['sl_pct'],
+                        'tp_pct': v3_risk_params['tp_pct'],
+                        'stage_slice_mult': v3_risk_params['stage_slice_mult'],
+                    }
+
+                    if v3_mod['modifier'] != 0:
+                        _log(f'[V3] regime={v3_regime["regime_class"]} mod={v3_mod["modifier"]:+.0f} '
+                             f'L={new_long_score} S={new_short_score} conf={new_confidence} '
+                             f'side={new_dominant}')
+                except Exception as e:
+                    _log(f'[V3] error (FAIL-OPEN, using original scores): {e}')
+                    _v3_result = None
+
             # ── STRATEGY V2: early gate check + 3-mode routing ──
             if STRATEGY_V2_ENABLED != 'off':
                 v2_result = None
@@ -1892,6 +2067,25 @@ def _cycle():
                         f'📊 ADD {decision}: {add_reason}', msg_type='add_blocked')
                 return
 
+            # ── V3: SL cooldown + signal debounce (before emission gate) ──
+            if _is_v3_enabled():
+                v3_sl_ok, v3_sl_reason = _v3_check_sl_cooldown(cur, SYMBOL, dominant)
+                if not v3_sl_ok:
+                    _log(f'[V3] {v3_sl_reason}')
+                    return
+
+                if _v3_result:
+                    try:
+                        from strategy.common.features import build_feature_snapshot
+                        v3_feat = build_feature_snapshot(cur)
+                    except Exception:
+                        v3_feat = None
+                    v3_db_ok, v3_db_reason = _v3_check_signal_debounce(
+                        cur, SYMBOL, _v3_result, dominant, v3_feat)
+                    if not v3_db_ok:
+                        _log(f'[V3] {v3_db_reason}')
+                        return
+
             # ── v3: Central signal emission gate ──
             (emit_ok, emit_reason) = should_emit_signal(cur, SYMBOL, dominant, confidence, regime_ctx=regime_ctx)
             if not emit_ok:
@@ -1910,13 +2104,42 @@ def _cycle():
             if signal_id:
                 # Record emission for cooldown tracking
                 _record_signal_emission(cur, SYMBOL, dominant, regime_ctx=regime_ctx)
+
+                # V3: record debounce key after successful signal creation
+                if _is_v3_enabled() and _v3_result:
+                    try:
+                        from strategy.common.dedupe import record_signal, make_v3_signal_key
+                        from strategy.common.features import build_feature_snapshot
+                        v3_feat = build_feature_snapshot(cur)
+                        rp = v3_feat.get('range_position') if v3_feat else None
+                        rc = _v3_result.get('regime_class', 'UNKNOWN')
+                        if rc == 'BREAKOUT':
+                            lb = 'BREAKOUT_UP' if dominant == 'LONG' else 'BREAKOUT_DOWN'
+                        elif rp is not None:
+                            if rp <= 0.20:
+                                lb = 'VAL'
+                            elif rp >= 0.80:
+                                lb = 'VAH'
+                            elif 0.40 <= rp <= 0.60:
+                                lb = 'POC'
+                            else:
+                                lb = 'MID'
+                        else:
+                            lb = 'MID'
+                        v3_key = make_v3_signal_key(SYMBOL, rc, dominant, lb)
+                        record_signal(cur, v3_key)
+                    except Exception as e:
+                        _log(f'[V3] debounce record FAIL-OPEN: {e}')
+
                 _log_trade_process(cur, signal_id, scores, 'autopilot', start_stage, entry_pct,
-                                    equity_limits=eq)
+                                    equity_limits=eq, v3_result=_v3_result)
                 _notify_telegram(
                     f'[Autopilot] {dominant} 진입 신호 생성\n'
                     f'- L={scores.get("long_score")} S={scores.get("short_score")} conf={confidence}\n'
                     f'- start_stage={start_stage} (FORCED=1) entry={entry_pct}%\n'
-                    f'- signal_id={signal_id}')
+                    f'- signal_id={signal_id}'
+                    + (f'\n- [V3] {_v3_result["regime_class"]}/{_v3_result["entry_mode"]} '
+                       f'mod={_v3_result["score_modifier"]:+.0f}' if _v3_result else ''))
                 _log(f'signal created: {dominant} id={signal_id} stage={start_stage} (FORCED=1)')
     except Exception:
         traceback.print_exc()
