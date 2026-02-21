@@ -4989,11 +4989,12 @@ def _trade_history(_text=None):
             otype, dirn, qty, price, pnl, fee, reason, regime, ts_kr = r
             pnl_str = f'{float(pnl):+.4f}' if pnl is not None else '-'
             fee_str = f'{float(fee):.4f}' if fee is not None else '-'
+            price_str = f'@{float(price):.0f}' if price is not None else '@-'
             regime_str = f' [{regime}]' if regime else ''
             reason_str = f' ({reason})' if reason else ''
             lines.append(
                 f'  {ts_kr} {otype} {dirn} qty={qty} '
-                f'@{float(price):.0f} PnL={pnl_str} fee={fee_str}'
+                f'{price_str} PnL={pnl_str} fee={fee_str}'
                 f'{regime_str}{reason_str}'
             )
         return '\n'.join(lines)
@@ -5035,9 +5036,11 @@ def _pnl_recent(_text=None):
         losses = [p for p in pnls if p <= 0]
         total_pnl = sum(pnls)
         total_fee = sum(fees)
+        total_wins = sum(wins)
+        total_losses = sum(losses)
         win_rate = len(wins) / len(pnls) * 100 if pnls else 0
-        avg_win = sum(wins) / len(wins) if wins else 0
-        avg_loss = sum(losses) / len(losses) if losses else 0
+        avg_win = total_wins / len(wins) if wins else 0
+        avg_loss = total_losses / len(losses) if losses else 0
         lines = [
             f'PnL 요약 (최근 {len(pnls)}건)\n',
             f'  총 PnL: {total_pnl:+.4f} USDT',
@@ -5046,8 +5049,8 @@ def _pnl_recent(_text=None):
             f'  승: {len(wins)}건 | 패: {len(losses)}건 | 승률: {win_rate:.1f}%',
             f'  평균 수익: {avg_win:+.4f} | 평균 손실: {avg_loss:+.4f}',
         ]
-        if wins and losses:
-            profit_factor = abs(sum(wins) / sum(losses)) if sum(losses) != 0 else float('inf')
+        if wins and losses and total_losses != 0:
+            profit_factor = abs(total_wins / total_losses)
             lines.append(f'  Profit Factor: {profit_factor:.2f}')
         return '\n'.join(lines)
     except Exception as e:
@@ -5072,6 +5075,7 @@ def _bundle(_text=None):
                 pos_text = _position_exch()
                 sections.append(f'=== EXCHANGE POSITION ===\n{pos_text}')
             except Exception as e:
+                _log(f'bundle EXCHANGE POSITION error: {e}')
                 sections.append(f'=== EXCHANGE POSITION ===\n오류: {e}')
 
             # === ACTIVE ORDERS ===
@@ -5079,6 +5083,7 @@ def _bundle(_text=None):
                 orders_text = _orders_exch()
                 sections.append(f'=== ACTIVE ORDERS ===\n{orders_text}')
             except Exception as e:
+                _log(f'bundle ACTIVE ORDERS error: {e}')
                 sections.append(f'=== ACTIVE ORDERS ===\n오류: {e}')
 
             # === INTERNAL STATE ===
@@ -5098,6 +5103,7 @@ def _bundle(_text=None):
                 sections.append('=== INTERNAL STATE ===\n' + '\n'.join(ps_lines) if ps_lines
                                 else '=== INTERNAL STATE ===\nposition_state 비어있음')
             except Exception as e:
+                _log(f'bundle INTERNAL STATE error: {e}')
                 sections.append(f'=== INTERNAL STATE ===\n오류: {e}')
 
             # === GATE / THROTTLE ===
@@ -5114,6 +5120,7 @@ def _bundle(_text=None):
                 gate_lines.append(f'  safety_gate: {"PASS" if ok else "BLOCKED"} ({reason})')
                 sections.append('=== GATE / THROTTLE ===\n' + '\n'.join(gate_lines))
             except Exception as e:
+                _log(f'bundle GATE/THROTTLE error: {e}')
                 sections.append(f'=== GATE / THROTTLE ===\n오류: {e}')
 
             # === MCTX ===
@@ -5121,6 +5128,7 @@ def _bundle(_text=None):
                 mctx_text = _mctx_status()
                 sections.append(f'=== MCTX ===\n{mctx_text}')
             except Exception as e:
+                _log(f'bundle MCTX error: {e}')
                 sections.append(f'=== MCTX ===\n오류: {e}')
 
             # === RECENT 20 TRADES ===
@@ -5137,15 +5145,17 @@ def _bundle(_text=None):
                 trade_lines = []
                 for r in trade_rows:
                     pnl_s = f'{float(r[4]):+.4f}' if r[4] is not None else '-'
+                    price_s = f'@{float(r[3]):.0f}' if r[3] is not None else '@-'
                     regime_s = f'[{r[7]}]' if r[7] else ''
                     reason_s = f'({r[6]})' if r[6] else ''
                     trade_lines.append(
-                        f'  {r[8]} {r[0]} {r[1]} qty={r[2]} @{float(r[3]):.0f} '
+                        f'  {r[8]} {r[0]} {r[1]} qty={r[2]} {price_s} '
                         f'PnL={pnl_s} {regime_s}{reason_s}'
                     )
                 sections.append('=== RECENT 20 TRADES ===\n' +
                                 ('\n'.join(trade_lines) if trade_lines else '체결 없음'))
             except Exception as e:
+                _log(f'bundle RECENT TRADES error: {e}')
                 sections.append(f'=== RECENT 20 TRADES ===\n오류: {e}')
 
             # === RECENT REJECTIONS ===
@@ -5164,6 +5174,7 @@ def _bundle(_text=None):
                 sections.append('=== RECENT REJECTIONS ===\n' +
                                 ('\n'.join(rej_lines) if rej_lines else '거부 없음'))
             except Exception as e:
+                _log(f'bundle RECENT REJECTIONS error: {e}')
                 sections.append(f'=== RECENT REJECTIONS ===\n오류: {e}')
 
         return '\n\n'.join(sections)

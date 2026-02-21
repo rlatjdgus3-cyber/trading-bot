@@ -249,10 +249,10 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
           AND close_reason IS NOT NULL
         ORDER BY ts DESC LIMIT %s;
     """, (max_consec_stops,))
-    recent_reasons = [r[0] for r in cur.fetchall()]
+    recent_reasons = [r[0] for r in cur.fetchall() if r[0]]
     consec_stops = 0
     for r in recent_reasons:
-        if 'stop' in r.lower():
+        if r and 'stop' in r.lower():
             consec_stops += 1
         else:
             break

@@ -447,8 +447,8 @@ def _build_decision_history(cur):
             if datetime.now(timezone.utc) - exec_ts < timedelta(minutes=30):
                 history['just_closed'] = True
                 history['closed_direction'] = last_exec.get('direction')
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f'just_closed detection error: {e}')
 
     try:
         locked, _ = event_lock.check_hold_suppress(SYMBOL)
@@ -1408,8 +1408,8 @@ def _check_range_split_tp(ctx, regime_params, regime_ctx, upnl_pct, side, price)
                         LIMIT 1;
                     """, (SYMBOL, open_row[0]))
                     tp1_taken = cur_tp.fetchone() is not None
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f'TP1 duplicate check error (FAIL-OPEN): {e}')
         finally:
             if conn_tp:
                 try:
@@ -1734,8 +1734,8 @@ def _decide(ctx=None):
             import regime_reader
             regime_params = regime_reader.get_regime_params(
                 regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f'regime_params load error: {e}')
     # ── V3 dynamic TP check (ATR-based, runs before regime TP) ──
     v3_tp_result = _check_v3_take_profit(ctx, regime_ctx)
     if v3_tp_result:
@@ -2034,8 +2034,8 @@ def _sync_position_state(cur=None, pos=None, upnl_pct=None):
                     SET peak_upnl_pct = GREATEST(COALESCE(peak_upnl_pct, 0), %s)
                     WHERE symbol = %s;
                 """, (upnl_pct, SYMBOL))
-            except Exception:
-                pass  # column may not exist yet
+            except Exception as e:
+                _log(f'peak_upnl_pct update error: {e}')
 
 
 def _log_decision(cur=None, ctx=None, action=None, reason=None,
@@ -2599,8 +2599,8 @@ def _cycle():
                             UPDATE position_state SET peak_upnl_pct = 0
                             WHERE symbol = %s;
                         """, (SYMBOL,))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log(f'peak_upnl_pct reset error: {e}')
             elif action == 'REVERSE':
                 _enqueue_reverse(
                     cur, pos,
