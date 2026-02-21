@@ -1869,10 +1869,10 @@ def _cycle():
                         'stage_slice_mult': v3_risk_params['stage_slice_mult'],
                     }
 
-                    if v3_mod['modifier'] != 0:
-                        _log(f'[V3] regime={v3_regime["regime_class"]} mod={v3_mod["modifier"]:+.0f} '
-                             f'L={new_long_score} S={new_short_score} conf={new_confidence} '
-                             f'side={new_dominant}')
+                    _log(f'[V3] regime={v3_regime["regime_class"]} mode={v3_regime["entry_mode"]} '
+                         f'mod={v3_mod["modifier"]:+.0f} '
+                         f'L={new_long_score} S={new_short_score} conf={new_confidence} '
+                         f'side={new_dominant}')
                 except Exception as e:
                     _log(f'[V3] error (FAIL-OPEN, using original scores): {e}')
                     _v3_result = None

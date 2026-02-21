@@ -104,9 +104,8 @@ def _classify_raw(features, regime_ctx):
     # ── Priority 1: BREAKOUT ──
     is_breakout = False
 
-    if health == 'WARN':
-        is_breakout = True
-        reasons.append(f'health=WARN (spread/liquidity)')
+    # health=WARN alone does NOT trigger BREAKOUT — low liquidity ≠ breakout.
+    # WARN is handled separately via stage_slice reduction in risk_v3.
 
     if breakout_confirmed:
         is_breakout = True
@@ -139,12 +138,15 @@ def _classify_raw(features, regime_ctx):
             return (regime_class, 'DriftFollow', conf, reasons)
 
     # ── Priority 3: STATIC_RANGE ──
+    # health=WARN does not disqualify STATIC_RANGE — low liquidity alone
+    # is not a regime change; risk_v3 handles it via stage_slice reduction.
     if (drift_score <= cfg['drift_static_max']
-            and adx <= cfg['adx_range_max']
-            and health == 'OK'):
+            and adx <= cfg['adx_range_max']):
         conf = min(85, 60 + int((cfg['adx_range_max'] - adx) * 2))
         reasons.append(f'drift={drift_score:.4f} <= {cfg["drift_static_max"]}')
         reasons.append(f'ADX={adx:.1f} <= {cfg["adx_range_max"]}')
+        if health == 'WARN':
+            reasons.append('health=WARN (risk_v3 will reduce slice)')
         return ('STATIC_RANGE', 'MeanRev', conf, reasons)
 
     # ── Fallback ──
