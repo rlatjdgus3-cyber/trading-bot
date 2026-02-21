@@ -16,7 +16,7 @@ FAIL-OPEN: any error → STATIC_RANGE (most conservative).
 """
 
 import time
-from strategy_v3 import config_v3
+from strategy_v3 import config_v3, safe_float, compute_health
 
 LOG_PREFIX = '[regime_v3]'
 
@@ -59,15 +59,6 @@ def get_sl_cooldown_info():
     return _v3_state['last_sl_ts'], _v3_state['last_sl_direction']
 
 
-def _safe_float(val, default=0.0):
-    if val is None:
-        return default
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
-
-
 def _safe_bool(val, default=False):
     if val is None:
         return default
@@ -76,28 +67,17 @@ def _safe_bool(val, default=False):
     return default
 
 
-def _compute_health(features):
-    """Compute health status from spread_ok and liquidity_ok."""
-    spread_ok = features.get('spread_ok', True)
-    liquidity_ok = features.get('liquidity_ok', True)
-    if spread_ok is None:
-        spread_ok = True
-    if liquidity_ok is None:
-        liquidity_ok = True
-    return 'OK' if (spread_ok and liquidity_ok) else 'WARN'
-
-
 def _classify_raw(features, regime_ctx):
     """Classify regime without hysteresis. Returns (class, entry_mode, confidence, reasons)."""
     cfg = config_v3.get_all()
 
-    drift_score = _safe_float(features.get('drift_score'))
+    drift_score = safe_float(features.get('drift_score'))
     drift_direction = features.get('drift_direction', 'NONE')
-    adx = _safe_float(features.get('adx') or (regime_ctx.get('adx_14') if regime_ctx else None))
-    health = _compute_health(features)
+    adx = safe_float(features.get('adx') or (regime_ctx.get('adx_14') if regime_ctx else None))
+    health = compute_health(features)
     breakout_confirmed = _safe_bool(regime_ctx.get('breakout_confirmed') if regime_ctx else None)
-    bbw_ratio = _safe_float(regime_ctx.get('bbw_ratio') if regime_ctx else None)
-    volume_z = _safe_float(features.get('volume_z'))
+    bbw_ratio = safe_float(regime_ctx.get('bbw_ratio') if regime_ctx else None)
+    volume_z = safe_float(features.get('volume_z'))
 
     reasons = []
 

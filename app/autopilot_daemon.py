@@ -51,6 +51,7 @@ ADD_PRICE_DEDUP_SEC = 600       # 10min window
 
 # ── Strategy V3 state ──
 _v3_result = None  # last V3 cycle result (for signal metadata)
+_v3_features = None  # last V3 feature snapshot (reused within cycle)
 
 
 def _is_v3_enabled():
@@ -1811,8 +1812,9 @@ def _cycle():
                 return
 
             # ── STRATEGY V3: regime switching + chase suppression ──
-            global _v3_result
+            global _v3_result, _v3_features
             _v3_result = None
+            _v3_features = None
             if _is_v3_enabled():
                 try:
                     from strategy.common.features import build_feature_snapshot
@@ -1821,6 +1823,7 @@ def _cycle():
                     from strategy_v3.risk_v3 import compute_risk as v3_risk
 
                     v3_features = build_feature_snapshot(cur)
+                    _v3_features = v3_features  # cache for reuse in debounce
                     v3_regime = v3_classify(v3_features, regime_ctx)
 
                     v3_price = v3_features.get('price', 0) if v3_features else 0
@@ -2075,13 +2078,8 @@ def _cycle():
                     return
 
                 if _v3_result:
-                    try:
-                        from strategy.common.features import build_feature_snapshot
-                        v3_feat = build_feature_snapshot(cur)
-                    except Exception:
-                        v3_feat = None
                     v3_db_ok, v3_db_reason = _v3_check_signal_debounce(
-                        cur, SYMBOL, _v3_result, dominant, v3_feat)
+                        cur, SYMBOL, _v3_result, dominant, _v3_features)
                     if not v3_db_ok:
                         _log(f'[V3] {v3_db_reason}')
                         return
@@ -2109,9 +2107,7 @@ def _cycle():
                 if _is_v3_enabled() and _v3_result:
                     try:
                         from strategy.common.dedupe import record_signal, make_v3_signal_key
-                        from strategy.common.features import build_feature_snapshot
-                        v3_feat = build_feature_snapshot(cur)
-                        rp = v3_feat.get('range_position') if v3_feat else None
+                        rp = _v3_features.get('range_position') if _v3_features else None
                         rc = _v3_result.get('regime_class', 'UNKNOWN')
                         if rc == 'BREAKOUT':
                             lb = 'BREAKOUT_UP' if dominant == 'LONG' else 'BREAKOUT_DOWN'

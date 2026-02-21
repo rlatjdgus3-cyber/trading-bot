@@ -7,7 +7,7 @@ on top of the existing score_engine total_score.
 FAIL-OPEN: any error → modifier=0, entry_blocked=False.
 """
 
-from strategy_v3 import config_v3
+from strategy_v3 import config_v3, safe_float
 
 LOG_PREFIX = '[score_v3]'
 
@@ -16,15 +16,6 @@ MIN_CONFIDENCE = 35  # match autopilot_daemon
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
-
-
-def _safe_float(val, default=0.0):
-    if val is None:
-        return default
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
 
 
 def _clamp(val, lo, hi):
@@ -38,12 +29,12 @@ def _compute_static_range_modifier(total_score, features, price, cfg):
     block_reason = ''
     reasoning = []
 
-    atr_pct = _safe_float(features.get('atr_pct'), 0.005)
+    atr_pct = safe_float(features.get('atr_pct'), 0.005)
     atr_val = atr_pct * price
 
-    vah = _safe_float(features.get('vah'))
-    val = _safe_float(features.get('val'))
-    poc = _safe_float(features.get('poc'))
+    vah = safe_float(features.get('vah'))
+    val = safe_float(features.get('val'))
+    poc = safe_float(features.get('poc'))
     range_position = features.get('range_position')
 
     if not vah or not val or vah <= val:
@@ -111,9 +102,9 @@ def _compute_drift_modifier(total_score, features, price, regime_class, cfg):
     reasoning = []
 
     dominant = 'LONG' if total_score >= 0 else 'SHORT'
-    atr_pct = _safe_float(features.get('atr_pct'), 0.005)
+    atr_pct = safe_float(features.get('atr_pct'), 0.005)
     atr_val = atr_pct * price
-    poc = _safe_float(features.get('poc'))
+    poc = safe_float(features.get('poc'))
 
     # 1. Drift alignment check
     if regime_class == 'DRIFT_UP' and dominant == 'LONG':
@@ -151,18 +142,18 @@ def _check_breakout_retest(features, breakout_dir, breakout_level, cfg):
     """Check if a breakout retest has occurred.
 
     Simplified check: price must have returned close to breakout_level
-    after the initial breakout (range_position near 0 or 1).
+    after the initial breakout (within 1 ATR of the level).
     """
-    atr_pct = _safe_float(features.get('atr_pct'), 0.005)
-    price = _safe_float(features.get('price'))
+    atr_pct = safe_float(features.get('atr_pct'), 0.005)
+    price = safe_float(features.get('price'))
     if not price or not breakout_level:
         return True  # FAIL-OPEN
 
     atr_val = atr_pct * price
-    pad = cfg['breakout_pad_atr_mult'] * atr_val
+    if atr_val <= 0:
+        return True  # FAIL-OPEN
 
     dist = abs(price - breakout_level)
-    # Retest = price returned within 1 ATR of breakout level
     return dist <= atr_val
 
 
@@ -173,10 +164,10 @@ def _compute_breakout_modifier(total_score, features, price, cfg):
     block_reason = ''
     reasoning = []
 
-    atr_pct = _safe_float(features.get('atr_pct'), 0.005)
+    atr_pct = safe_float(features.get('atr_pct'), 0.005)
     atr_val = atr_pct * price
-    vah = _safe_float(features.get('vah'))
-    val = _safe_float(features.get('val'))
+    vah = safe_float(features.get('vah'))
+    val = safe_float(features.get('val'))
 
     if not vah or not val or vah <= val or atr_val <= 0:
         reasoning.append('VA/ATR data unavailable — no modifier')
