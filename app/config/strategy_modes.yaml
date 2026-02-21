@@ -105,6 +105,6 @@ strategy_v3:
 
 # ── Feature Flags (default OFF = FAIL-CLOSED) ──
 feature_flags:
-  ff_order_backoff_v2: false
-  ff_watchdog_warn_not_down: false
-  ff_snapshot_root_cause: false
+  ff_order_backoff_v2: true
+  ff_watchdog_warn_not_down: true
+  ff_snapshot_root_cause: true
