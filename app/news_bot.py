@@ -765,11 +765,15 @@ def main():
                     continue
 
                 except psycopg2.IntegrityError as ie:
-                    # URL duplicate → normal (ON CONFLICT handles), non-URL → alert
-                    if 'url' not in str(ie).lower():
+                    # URL/title+source duplicate → normal, skip silently
+                    ie_str = str(ie).lower()
+                    is_known_dup = 'idx_news_title_source_uniq' in ie_str or 'url' in ie_str
+                    if is_known_dup:
+                        log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
+                    else:
                         log(f"[news_bot] IntegrityError (skip): {ie}")
                         _send_error_alert(source, title, ie)
-                    db_errors += 1
+                        db_errors += 1
                     continue
 
                 except Exception as ex:
