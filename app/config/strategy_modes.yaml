@@ -134,6 +134,6 @@ feature_flags:
   ff_watchdog_warn_not_down: true
   ff_snapshot_root_cause: true
   ff_bundle_cmd: true
-  ff_strict_breakout: false
+  ff_strict_breakout: true
   ff_regime_risk_v3: false
   ff_loss_streak_cooldown: false
