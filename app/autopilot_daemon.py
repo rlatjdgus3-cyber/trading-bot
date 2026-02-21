@@ -390,7 +390,7 @@ def _check_loss_streak_cooldown(cur):
         cur.execute("""
             SELECT pnl_usdt FROM execution_log
             WHERE action IN ('CLOSE', 'SL')
-              AND ts > now() - interval '%s hours'
+              AND ts > now() - make_interval(hours => %s)
             ORDER BY ts DESC
             LIMIT %s
         """, (window_hours, trigger))
@@ -412,7 +412,7 @@ def _check_loss_streak_cooldown(cur):
             cur.execute("""
                 SELECT ts FROM execution_log
                 WHERE action IN ('CLOSE', 'SL') AND pnl_usdt < 0
-                  AND ts > now() - interval '%s hours'
+                  AND ts > now() - make_interval(hours => %s)
                 ORDER BY ts DESC LIMIT 1
             """, (window_hours,))
             last_loss_row = cur.fetchone()
@@ -1937,9 +1937,9 @@ def _cycle():
 
                     v3_mod = v3_score_mod(total_score, v3_features, v3_regime, v3_price)
 
-                    if v3_mod['entry_blocked']:
-                        _log(f'[V3] BLOCKED: {v3_mod["block_reason"]} '
-                             f'(regime={v3_regime["regime_class"]} mode={v3_regime["entry_mode"]})')
+                    if v3_mod.get('entry_blocked'):
+                        _log(f'[V3] BLOCKED: {v3_mod.get("block_reason", "")} '
+                             f'(regime={v3_regime.get("regime_class", "?")} mode={v3_regime.get("entry_mode", "?")})')
                         return
 
                     # Apply score modification
@@ -1963,15 +1963,15 @@ def _cycle():
 
                     # Store V3 result for signal metadata (including comparison fields)
                     _v3_result = {
-                        'regime_class': v3_regime['regime_class'],
-                        'entry_mode': v3_regime['entry_mode'],
+                        'regime_class': v3_regime.get('regime_class', 'STATIC_RANGE'),
+                        'entry_mode': v3_regime.get('entry_mode', 'MeanRev'),
                         'raw_class': v3_regime.get('raw_class'),
-                        'v3_confidence': v3_regime['confidence'],
-                        'score_modifier': v3_mod['modifier'],
-                        'reasoning': v3_mod['reasoning'][:5],
-                        'sl_pct': v3_risk_params['sl_pct'],
-                        'tp_pct': v3_risk_params['tp_pct'],
-                        'stage_slice_mult': v3_risk_params['stage_slice_mult'],
+                        'v3_confidence': v3_regime.get('confidence', 0),
+                        'score_modifier': v3_mod.get('modifier', 0),
+                        'reasoning': v3_mod.get('reasoning', [])[:5],
+                        'sl_pct': v3_risk_params.get('sl_pct', 0.006),
+                        'tp_pct': v3_risk_params.get('tp_pct', 0.0072),
+                        'stage_slice_mult': v3_risk_params.get('stage_slice_mult', 1.0),
                         'pre_v3_total_score': pre_v3_total_score,
                         'post_v3_total_score': total_score,
                         'pre_v3_dominant': pre_v3_dominant,
@@ -1980,8 +1980,8 @@ def _cycle():
                     if 'max_stage' in v3_risk_params:
                         _v3_result['max_stage'] = v3_risk_params['max_stage']
 
-                    _log(f'[V3] regime={v3_regime["regime_class"]} '
-                         f'pre={pre_v3_total_score:+.0f} mod={v3_mod["modifier"]:+.0f} '
+                    _log(f'[V3] regime={v3_regime.get("regime_class", "?")} '
+                         f'pre={pre_v3_total_score:+.0f} mod={v3_mod.get("modifier", 0):+.0f} '
                          f'post={total_score:+.0f} side={new_dominant}')
                 except Exception as e:
                     _log(f'[V3] error (FAIL-OPEN, using original scores): {e}')

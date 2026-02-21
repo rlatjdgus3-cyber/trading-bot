@@ -37,7 +37,7 @@ def _compute_static_range_modifier(total_score, features, price, cfg):
     poc = safe_float(features.get('poc'))
     range_position = features.get('range_position')
 
-    if not vah or not val or vah <= val:
+    if vah <= 0 or val <= 0 or vah <= val:
         reasoning.append('VA data unavailable — no modifier')
         return modifier, blocked, block_reason, reasoning
 
@@ -146,7 +146,7 @@ def _check_breakout_retest(features, breakout_dir, breakout_level, cfg):
     """
     atr_pct = safe_float(features.get('atr_pct'), 0.005)
     price = safe_float(features.get('price'))
-    if not price or not breakout_level:
+    if price <= 0 or breakout_level is None or breakout_level <= 0:
         return True  # FAIL-OPEN
 
     atr_val = atr_pct * price
@@ -178,7 +178,7 @@ def _compute_breakout_modifier(total_score, features, price, cfg, v3_regime=None
     vah = safe_float(features.get('vah'))
     val = safe_float(features.get('val'))
 
-    if not vah or not val or vah <= val or atr_val <= 0:
+    if vah <= 0 or val <= 0 or vah <= val or atr_val <= 0:
         reasoning.append('VA/ATR data unavailable — no modifier')
         return modifier, blocked, block_reason, reasoning
 

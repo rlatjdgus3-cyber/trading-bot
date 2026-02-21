@@ -208,6 +208,7 @@ def _write_heartbeats_to_db(service_states):
     Called every watchdog cycle (~3min) so /debug health has fresh data
     even without explicit /debug health calls.
     """
+    conn = None
     try:
         from db_config import get_conn
         conn = get_conn(autocommit=True)
@@ -216,9 +217,14 @@ def _write_heartbeats_to_db(service_states):
                 cur.execute(
                     "INSERT INTO service_health_log (service, state) VALUES (%s, %s)",
                     (svc, state_val))
-        conn.close()
     except Exception as e:
         _log(f'heartbeat DB write error (non-fatal): {e}')
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def main():
