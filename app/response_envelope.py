@@ -645,6 +645,31 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
     return '\n'.join(sections)
 
 
+def _compute_root_cause(switch_status, gate_status, wait_reason):
+    """Compute single-line ROOT_CAUSE for /snapshot display."""
+    # 1. Trade switch OFF
+    if switch_status and not switch_status.get('enabled', True):
+        return 'ROOT_CAUSE: TRADE_SWITCH_OFF'
+    # 2. Gate blocked
+    if gate_status:
+        ok, reason = gate_status
+        if not ok:
+            return f'ROOT_CAUSE: GATE_BLOCKED | {reason}'
+    # 3. Throttle / entry lock
+    try:
+        import order_throttle
+        ts = order_throttle.get_throttle_status()
+        if ts.get('entry_locked'):
+            lock_reason = ts.get('lock_reason', '?')
+            expires = ts.get('lock_expires_str', '?')
+            return f'ROOT_CAUSE: THROTTLED_{lock_reason} | NEXT_OK_AT: {expires}'
+        if ts.get('hourly_count', 0) >= ts.get('hourly_limit', 12):
+            return 'ROOT_CAUSE: THROTTLED_1H_LIMIT'
+    except Exception:
+        pass
+    return 'ROOT_CAUSE: NONE (READY)'
+
+
 def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wait_reason,
                     capital_info=None, zone_check=None):
     """Format composite snapshot card with optional capital/leverage/zone info."""
@@ -785,6 +810,14 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
     else:
         gate_str = 'N/A'
     sections.append(f'[GATE] Safety: {gate_str}')
+
+    # 5.1 ROOT_CAUSE (ff_snapshot_root_cause)
+    try:
+        import feature_flags
+        if feature_flags.is_enabled('ff_snapshot_root_cause'):
+            sections.append(_compute_root_cause(switch_status, gate_status, wait_reason))
+    except Exception:
+        pass
 
     # 5.5 [ZONE_CHECK] Zone & Filter Status
     if zone_check:

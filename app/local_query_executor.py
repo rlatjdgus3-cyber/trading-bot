@@ -107,6 +107,7 @@ def execute(query_type=None, original_text=None):
         'debug_backfill_ack': _debug_backfill_ack,
         'debug_gate_details': _debug_gate_details,
         'debug_order_throttle': _debug_order_throttle,
+        'debug_ai_models': _debug_ai_models,
         'reconcile': _reconcile,
         'mctx_status': _mctx_status,
         'mode_params': _mode_params,
@@ -215,8 +216,7 @@ def _log_service_health(states):
             for svc, state in states.items():
                 cur.execute("""
                     INSERT INTO service_health_log (service, state)
-                    VALUES (%s, %s)
-                    ON CONFLICT DO NOTHING;
+                    VALUES (%s, %s);
                 """, (svc, state))
     except Exception:
         pass  # DB 미생성 시 무시
@@ -2023,8 +2023,10 @@ def _debug_router(_text=None):
     try:
         import claude_gate
         gate_state = claude_gate._load_state()
-        lines.append(f'claude_gate: calls={gate_state.get("daily_calls", 0)} '
-                     f'cost=${gate_state.get("daily_cost", 0):.4f}')
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cg_calls = gate_state.get('daily_calls', {}).get(today, 0)
+        cg_cost = gate_state.get('daily_cost', {}).get(today, 0.0)
+        lines.append(f'claude_gate: calls={cg_calls} cost=${cg_cost:.4f}')
     except Exception:
         pass
     return '\n'.join(lines)
@@ -3572,6 +3574,12 @@ def _debug_state(_text=None):
                      f'(APPROVAL_REQUIRED={ncc.APPROVAL_REQUIRED})')
     except Exception:
         lines.append(f'  news_classifier: import failed')
+    try:
+        import feature_flags
+        for _ff_name, _ff_val in feature_flags.get_all().items():
+            lines.append(f'  {_ff_name}: {_ff_val}')
+    except Exception:
+        lines.append(f'  feature_flags: import failed')
 
     # state_mode from telegram_cmd_poller
     lines.append('')
@@ -4721,6 +4729,90 @@ def _debug_order_throttle(_text=None):
                 conn.close()
             except Exception:
                 pass
+
+
+def _debug_ai_models(_text=None):
+    """AI/LLM model configuration and last-call info."""
+    from datetime import datetime, timezone
+    lines = ['\U0001f9e0 AI 구성', '━━━━━━━━━━━━━━━━━━']
+
+    # ── chat / router model (OpenAI) ──
+    openai_model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+    lines.append(f'chat_model: {openai_model}')
+
+    # ── analysis model (Claude) ──
+    try:
+        import claude_gate
+        lines.append(f'analysis_model: {claude_gate.CLAUDE_MODEL}')
+    except Exception:
+        lines.append('analysis_model: unknown')
+
+    # ── news model ──
+    lines.append(f'news_model: {openai_model}')
+
+    # ── comparison / fallback ──
+    try:
+        import openclo
+        anthropic_model = getattr(openclo, 'ANTHROPIC_MODEL', 'none')
+        lines.append(f'comparison_model: {anthropic_model}')
+    except Exception:
+        lines.append('comparison_model: none')
+    lines.append(f'fallback_model: {openai_model}')
+
+    # ── parameters ──
+    try:
+        import gpt_router
+        lines.append(f'temperature: {gpt_router.TEMPERATURE}')
+        lines.append(f'max_tokens: {gpt_router.MAX_TOKENS}')
+    except Exception:
+        lines.append('temperature: unknown')
+        lines.append('max_tokens: unknown')
+
+    # ── provider type ──
+    providers = []
+    if os.getenv('OPENAI_API_KEY', ''):
+        providers.append('openai')
+    if os.getenv('ANTHROPIC_API_KEY', ''):
+        providers.append('anthropic')
+    lines.append(f'provider_type: {", ".join(providers) if providers else "none"}')
+
+    # ── routing policy ──
+    lines.append('routing_policy: local-first')
+
+    # ── budget ──
+    try:
+        import gpt_router as _gr
+        gr_state = _gr._load_state()
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        gpt_calls = gr_state.get('daily_calls', {}).get(today, 0)
+        lines.append(f'gpt_budget: {gpt_calls}/{_gr.DAILY_BUDGET_LIMIT}')
+    except Exception:
+        lines.append('gpt_budget: unknown')
+
+    try:
+        import claude_gate as _cg
+        cg_state = _cg._load_state()
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        claude_calls = cg_state.get('daily_calls', {}).get(today, 0)
+        claude_cost = cg_state.get('daily_cost', {}).get(today, 0.0)
+        lines.append(f'claude_budget: {claude_calls}/{_cg.DAILY_CALL_LIMIT} '
+                     f'(${claude_cost:.4f}/${_cg.DAILY_COST_LIMIT})')
+    except Exception:
+        lines.append('claude_budget: unknown')
+
+    # ── last LLM call ──
+    try:
+        import telegram_cmd_poller as _tcp
+        ds = _tcp._last_debug_state
+        model = ds.get('model_used', 'none')
+        ts = ds.get('decision_ts', '')
+        lines.append(f'last_llm_call_model: {model}')
+        lines.append(f'last_llm_call_ts: {ts + " UTC" if ts else "N/A"}')
+    except Exception:
+        lines.append('last_llm_call_model: unknown')
+        lines.append('last_llm_call_ts: unknown')
+
+    return '\n'.join(lines)
 
 
 def _reconcile(_text=None):

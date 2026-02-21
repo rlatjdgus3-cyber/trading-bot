@@ -217,8 +217,7 @@ def _enqueue_gap_backfills(cur, gaps_1m, gaps_5m):
                  f'Not auto-backfilling.')
             cur.execute("""
                 INSERT INTO backfill_job_runs (job_name, status, metadata)
-                VALUES ('candles_1m_gap', 'ARCHIVE_REQUIRED', %s::jsonb)
-                ON CONFLICT DO NOTHING;
+                VALUES ('candles_1m_gap', 'ARCHIVE_REQUIRED', %s::jsonb);
             """, (json.dumps({
                 'gap_start': gap_start,
                 'gap_end': gap_end,
@@ -246,8 +245,7 @@ def _enqueue_gap_backfills(cur, gaps_1m, gaps_5m):
                  f'Not auto-backfilling.')
             cur.execute("""
                 INSERT INTO backfill_job_runs (job_name, status, metadata)
-                VALUES ('ohlcv_5m_gap', 'ARCHIVE_REQUIRED', %s::jsonb)
-                ON CONFLICT DO NOTHING;
+                VALUES ('ohlcv_5m_gap', 'ARCHIVE_REQUIRED', %s::jsonb);
             """, (json.dumps({
                 'gap_start': gap_start,
                 'gap_end': gap_end,

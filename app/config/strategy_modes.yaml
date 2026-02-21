@@ -102,3 +102,9 @@ strategy_v3:
   # Signal Debounce
   signal_debounce_sec: 300
   post_sl_same_dir_cooldown_sec: 600
+
+# ── Feature Flags (default OFF = FAIL-CLOSED) ──
+feature_flags:
+  ff_order_backoff_v2: false
+  ff_watchdog_warn_not_down: false
+  ff_snapshot_root_cause: false

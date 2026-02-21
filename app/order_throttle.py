@@ -322,26 +322,53 @@ def handle_rejection(cur, error_code, reject_reason):
         if (error_code == 10006
                 or '한도 초과' in (reject_reason or '')
                 or 'rate limit' in reason_lower):
-            # Exponential backoff: escalate stage
-            stage = _state['throttle_backoff_stage']
-            if stage < len(THROTTLE_BACKOFF_STAGES):
-                lockout = THROTTLE_BACKOFF_STAGES[stage]
-                _state['throttle_backoff_stage'] = stage + 1
+            # ff_order_backoff_v2: window-based lockout instead of exponential
+            _use_window_backoff = False
+            try:
+                import feature_flags
+                _use_window_backoff = feature_flags.is_enabled('ff_order_backoff_v2')
+            except Exception:
+                pass
+            if _use_window_backoff and _state['recent_attempts']:
+                _prune_old_attempts(time.time())
+                if _state['recent_attempts']:
+                    oldest = min(_state['recent_attempts'])
+                    lockout = max(60, oldest + 3600 - time.time())
+                else:
+                    lockout = 60
+                _state['entry_lock_until'] = time.time() + lockout
+                _state['entry_lock_reason'] = 'RATE_LIMIT_HOUR_WINDOW'
+                _state['network_consecutive'] = 0
+                _log(f'RATE_LIMIT_HOUR_WINDOW: locked for {lockout:.0f}s (window-based)')
             else:
-                lockout = THROTTLE_BACKOFF_STAGES[-1]
-            _state['entry_lock_until'] = time.time() + lockout
-            _state['entry_lock_reason'] = f'RATE_LIMIT_HIT (stage {stage})'
-            _state['network_consecutive'] = 0
-            _log(f'RATE_LIMIT_HIT: locked for {lockout}s (backoff stage {stage})')
+                # Exponential backoff: escalate stage
+                stage = _state['throttle_backoff_stage']
+                if stage < len(THROTTLE_BACKOFF_STAGES):
+                    lockout = THROTTLE_BACKOFF_STAGES[stage]
+                    _state['throttle_backoff_stage'] = stage + 1
+                else:
+                    lockout = THROTTLE_BACKOFF_STAGES[-1]
+                _state['entry_lock_until'] = time.time() + lockout
+                _state['entry_lock_reason'] = f'RATE_LIMIT_HIT (stage {stage})'
+                _state['network_consecutive'] = 0
+                _log(f'RATE_LIMIT_HIT: locked for {lockout}s (backoff stage {stage})')
             return
 
         # 2. Min qty — FIX #5: proper parenthesization
+        # TODO(ff_min_qty_autofix): 향후 잔고 기반 자동 수량 보정 구현
         if (('최소' in (reject_reason or '') and '수량' in (reject_reason or ''))
                 or ('min' in reason_lower and ('qty' in reason_lower or 'notional' in reason_lower))):
-            _state['entry_lock_until'] = time.time() + 60
+            _min_qty_cooldown = 60
+            try:
+                import feature_flags
+                if feature_flags.is_enabled('ff_order_backoff_v2'):
+                    _min_qty_cooldown = 900  # 15min — 잔고 문제는 60s에 해결 안 됨
+            except Exception:
+                pass
+            _state['entry_lock_until'] = time.time() + _min_qty_cooldown
             _state['entry_lock_reason'] = 'MIN_QTY'
             _state['network_consecutive'] = 0
-            _log(f'MIN_QTY: locked for 60s')
+            _log(f'MIN_QTY: locked for {_min_qty_cooldown}s')
             return
 
         # 3. DB error (ON CONFLICT etc)

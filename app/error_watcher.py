@@ -248,6 +248,17 @@ def _db_should_send_alert(key, cooldown_sec):
         return (True, 0)  # DB unavailable → fail-open
 
 
+def _check_process_alive(unit):
+    """Check if systemd unit is active. FAIL-OPEN: returns False on error."""
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', unit],
+            capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() == 'active'
+    except Exception:
+        return False
+
+
 def main():
     env = load_env()
     token = env.get('TELEGRAM_BOT_TOKEN', '')
@@ -308,10 +319,25 @@ def main():
             if not should_send:
                 continue  # Dedup — skip send entirely
 
-            # Severity: trade_switch OFF = WARN, others = CRITICAL
+            # Severity: trade_switch OFF = WARN, others = CRITICAL (or WARN if alive)
             is_trade_switch = (alert_key == TRADE_SWITCH_KEY)
-            icon = '⚠' if is_trade_switch else '🚨'
-            label = '상태 알림' if is_trade_switch else '장애 감지'
+            if is_trade_switch:
+                icon = '⚠'
+                label = '상태 알림'
+            else:
+                _use_warn = False
+                try:
+                    import feature_flags
+                    if feature_flags.is_enabled('ff_watchdog_warn_not_down'):
+                        _use_warn = _check_process_alive(unit)
+                except Exception:
+                    pass
+                if _use_warn:
+                    icon = '⚠'
+                    label = '경고'
+                else:
+                    icon = '🚨'
+                    label = '장애 감지'
 
             cause_text = '\n'.join(f"  • {c[:200]}" for c in unique_causes)
             msg = f"{icon} {svc_name} {label}\n{cause_text}"
