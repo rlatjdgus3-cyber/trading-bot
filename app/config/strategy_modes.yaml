@@ -56,7 +56,7 @@ mode_c_shock_breakout:
 
 # ── Strategy V3: Regime Switching + Chase Entry Suppression ──
 strategy_v3:
-  enabled: false   # feature flag — true로 변경 시 V3 활성화
+  enabled: true    # feature flag — V3 활성화됨
 
   # 레짐 분류
   drift_static_max: 0.0003
