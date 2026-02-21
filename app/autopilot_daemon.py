@@ -311,8 +311,8 @@ def _is_in_repeat_cooldown(cur, symbol, direction, cooldown_sec=None, regime_ctx
             elapsed = row[0]
             if elapsed < cooldown_sec:
                 return (True, cooldown_sec - elapsed)
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f'repeat_cooldown legacy check error (FAIL-OPEN): {e}')
     # 2. Composite signal_key check (same zone+bucket within 5min)
     if regime_ctx:
         try:
@@ -328,8 +328,8 @@ def _is_in_repeat_cooldown(cur, symbol, direction, cooldown_sec=None, regime_ctx
                 bucket_cooldown = 300  # 5min bucket
                 if elapsed < bucket_cooldown:
                     return (True, bucket_cooldown - elapsed)
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f'repeat_cooldown composite check error (FAIL-OPEN): {e}')
     return (False, 0)
 
 
@@ -817,8 +817,8 @@ def _get_bb_data(cur):
                 'bb_lower': float(row[1]),
                 'bb_mid': float(row[2]),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f'BB data fetch error: {e}')
     return {}
 
 
@@ -1353,6 +1353,12 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
     usdt_amount = min(usdt_amount, eq['operating_cap'])
     if usdt_amount < 5:
         return 0
+    # Determine regime_tag for execution tracking
+    _regime_tag = None
+    if _v3_result:
+        _regime_tag = _v3_result.get('regime_class')
+    elif regime_ctx and regime_ctx.get('available'):
+        _regime_tag = regime_ctx.get('regime', 'UNKNOWN')
     meta = {
         'direction': side,
         'qty': usdt_amount,
@@ -1363,7 +1369,8 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
         'short_score': scores.get('short_score'),
         'confidence': scores.get('confidence'),
         'start_stage': start_stage,
-        'entry_pct': entry_pct}
+        'entry_pct': entry_pct,
+        'regime_tag': _regime_tag}
     cur.execute("""
         INSERT INTO signals_action_v3 (
             ts, symbol, tf, strategy, signal, action, price, meta, created_at_unix, processed, stage
@@ -1397,7 +1404,7 @@ def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
         equity_limits = safety_manager.get_equity_limits(cur)
     eq = equity_limits
     context = dict(scores.get('context', {}))
-    # V3: inject regime snapshot into decision_context
+    # V3: inject regime snapshot + comparison into decision_context
     if v3_result:
         context['v3_regime_class'] = v3_result.get('regime_class')
         context['v3_entry_mode'] = v3_result.get('entry_mode')
@@ -1405,6 +1412,9 @@ def _log_trade_process(cur, signal_id=None, scores=None, source='autopilot',
         context['v3_reasoning'] = v3_result.get('reasoning', [])[:3]
         context['v3_sl_pct'] = v3_result.get('sl_pct')
         context['v3_tp_pct'] = v3_result.get('tp_pct')
+        context['v3_pre_total_score'] = v3_result.get('pre_v3_total_score')
+        context['v3_post_total_score'] = v3_result.get('post_v3_total_score')
+        context['v3_pre_dominant'] = v3_result.get('pre_v3_dominant')
     try:
         cur.execute("""
             INSERT INTO trade_process_log
@@ -1507,8 +1517,8 @@ def _run_strategy_v2(cur, scores, regime_ctx):
                 'ts': row[0], 'o': float(row[1]), 'h': float(row[2]),
                 'l': float(row[3]), 'c': float(row[4]), 'v': float(row[5]),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f'candle fetch error (non-fatal): {e}')
 
     try:
         cur.execute("""
@@ -1526,8 +1536,8 @@ def _run_strategy_v2(cur, scores, regime_ctx):
                 'bb_dn': float(ind_row[4]) if ind_row[4] else None,
                 'vwap': float(ind_row[5]) if ind_row[5] else None,
             }
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f'indicator fetch error (non-fatal): {e}')
 
     # 6. Build context and call mode strategy
     ctx = {
@@ -1610,6 +1620,11 @@ def _run_strategy_v2(cur, scores, regime_ctx):
     meta['strategy_v2'] = True
     meta['mode'] = mode
     meta['drift_submode'] = drift_submode
+    # regime_tag for execution_log tracking
+    if _v3_result:
+        meta['regime_tag'] = _v3_result.get('regime_class')
+    elif regime_ctx and regime_ctx.get('available'):
+        meta['regime_tag'] = regime_ctx.get('regime', 'UNKNOWN')
 
     if action == 'EXIT' and position:
         # Enqueue CLOSE via execution_queue
@@ -1833,6 +1848,10 @@ def _cycle():
                         ls = scores.get('long_score', 50)
                         total_score = (ls - 50) * 2
 
+                    # ── V3 comparison snapshot (pre-modification) ──
+                    pre_v3_total_score = total_score
+                    pre_v3_dominant = dominant
+
                     v3_mod = v3_score_mod(total_score, v3_features, v3_regime, v3_price)
 
                     if v3_mod['entry_blocked']:
@@ -1859,7 +1878,7 @@ def _cycle():
                     # Compute risk overrides
                     v3_risk_params = v3_risk(v3_features, v3_regime)
 
-                    # Store V3 result for signal metadata
+                    # Store V3 result for signal metadata (including comparison fields)
                     _v3_result = {
                         'regime_class': v3_regime['regime_class'],
                         'entry_mode': v3_regime['entry_mode'],
@@ -1870,12 +1889,14 @@ def _cycle():
                         'sl_pct': v3_risk_params['sl_pct'],
                         'tp_pct': v3_risk_params['tp_pct'],
                         'stage_slice_mult': v3_risk_params['stage_slice_mult'],
+                        'pre_v3_total_score': pre_v3_total_score,
+                        'post_v3_total_score': total_score,
+                        'pre_v3_dominant': pre_v3_dominant,
                     }
 
-                    _log(f'[V3] regime={v3_regime["regime_class"]} mode={v3_regime["entry_mode"]} '
-                         f'mod={v3_mod["modifier"]:+.0f} '
-                         f'L={new_long_score} S={new_short_score} conf={new_confidence} '
-                         f'side={new_dominant}')
+                    _log(f'[V3] regime={v3_regime["regime_class"]} '
+                         f'pre={pre_v3_total_score:+.0f} mod={v3_mod["modifier"]:+.0f} '
+                         f'post={total_score:+.0f} side={new_dominant}')
                 except Exception as e:
                     _log(f'[V3] error (FAIL-OPEN, using original scores): {e}')
                     _v3_result = None
@@ -1912,8 +1933,8 @@ def _cycle():
                 if recon_status == 'MISMATCH':
                     _log(f'RECONCILE MISMATCH: entries blocked — {recon_result.get("detail", "") if isinstance(recon_result, dict) else ""}')
                     return
-            except Exception:
-                pass  # FAIL-OPEN: reconcile failure does not block
+            except Exception as e:
+                _log(f'RECONCILE check error (FAIL-OPEN): {e}')
 
             # Check existing position
             cur.execute('SELECT side, total_qty FROM position_state WHERE symbol = %s;', (SYMBOL,))
@@ -2051,14 +2072,21 @@ def _cycle():
                         if not ok:
                             _log(f'ADD safety block: {reason}')
                         else:
+                            _add_meta = {}
+                            if _v3_result:
+                                _add_meta['regime_tag'] = _v3_result.get('regime_class')
+                            elif regime_ctx and regime_ctx.get('available'):
+                                _add_meta['regime_tag'] = regime_ctx.get('regime', 'UNKNOWN')
                             cur.execute("""
                                 INSERT INTO execution_queue
                                     (symbol, action_type, direction, target_usdt,
-                                     source, reason, priority, expire_at)
+                                     source, reason, priority, expire_at, meta)
                                 VALUES (%s, 'ADD', %s, %s,
-                                        'autopilot', %s, 4, now() + interval '5 minutes')
+                                        'autopilot', %s, 4, now() + interval '5 minutes',
+                                        %s::jsonb)
                                 RETURNING id;
-                            """, (SYMBOL, direction, add_usdt, add_reason))
+                            """, (SYMBOL, direction, add_usdt, add_reason,
+                                  json.dumps(_add_meta, default=str)))
                             eq_row = cur.fetchone()
                             _log(f'ADD enqueued: eq_id={eq_row[0] if eq_row else None}')
                             _last_add_price = current_price if current_price > 0 else 0

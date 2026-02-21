@@ -141,6 +141,9 @@ HELP_TEXT = (
     "  /fact — 4섹션 팩트 요약 (거래소+주문+전략+실행상태)\n"
     "  /mctx — 시장 환경(MCTX) 레짐/flow/ADX 상태\n"
     "  /mode — 현재 모드 파라미터 (TP/SL/레버리지/필터)\n"
+    "  /bundle — 종합 진단 (외부AI 복붙용)\n"
+    "  /trade_history [N] — 최근 N건 체결 (기본 10)\n"
+    "  /pnl_recent [N] — 최근 N건 PnL 요약 (기본 10)\n"
     "  /debug — 디버그 서브커맨드 메뉴\n"
     "    /debug version — 빌드/버전/환경\n"
     "    /debug router — 라우팅 디버그\n"
@@ -2094,9 +2097,11 @@ _KNOWN_SLASH_COMMANDS = [
     '/account', '/account_exch', '/position_strat', '/risk_config',
     '/snapshot', '/snap', '/fact', '/now', '/close_all', '/force',
     '/detail', '/trade', '/reconcile', '/mctx', '/mode',
+    '/bundle', '/trade_history', '/pnl_recent',
     # Korean aliases
     '/포지션', '/주문', '/잔고', '/자산', '/전략포지션', '/리스크', '/risk',
     '/스냅샷', '/팩트', '/전청산', '/서비스', '/상태', '/스코어', '/테스트', '/감사',
+    '/번들',
 ]
 
 
@@ -2183,6 +2188,8 @@ _DEBUG_SUBCMDS = {
     'gate': 'debug_gate_details',
     'order_throttle': 'debug_order_throttle',
     'throttle': 'debug_order_throttle',
+    'ai_models': 'debug_ai_models',
+    'ai': 'debug_ai_models',
 }
 
 _DEBUG_HELP = (
@@ -2211,11 +2218,12 @@ _DEBUG_HELP = (
     '  /debug state — 시스템 상태 변수\n'
     '  /debug gate_details — 서비스별 gate 상세 (dual-source)\n'
     '  /debug order_throttle — 주문 속도 제한 상태 + 60분 타임라인\n'
+    '  /debug ai_models — AI/LLM 모델 구성 + 마지막 호출 정보\n'
     '  /debug on|off — 디버그 모드 토글\n'
     '\n'
     '  aliases: reaction, coverage, backfill, dryrun, gate,\n'
     '           bf_enable, bf_start, bf_pause, bf_resume, bf_stop, bf_log,\n'
-    '           news_gap, path_sample, path_stats\n'
+    '           news_gap, path_sample, path_stats, ai\n'
 )
 
 
@@ -3049,6 +3057,21 @@ def handle_command(text: str, chat_id: int = 0) -> str:
     if t in ('/mode', '/모드'):
         return local_query_executor.execute('mode_params') + \
             _footer('mode_params', 'local', 'local')
+
+    # /bundle — 종합 진단 출력
+    if t in ('/bundle', '/번들'):
+        return local_query_executor.execute('bundle') + \
+            _footer('bundle', 'local', 'local')
+
+    # /trade_history [N] — 최근 체결 내역
+    if t == '/trade_history' or t.startswith('/trade_history '):
+        return local_query_executor.execute('trade_history', t) + \
+            _footer('trade_history', 'local', 'local')
+
+    # /pnl_recent [N] — PnL 요약
+    if t == '/pnl_recent' or t.startswith('/pnl_recent '):
+        return local_query_executor.execute('pnl_recent', t) + \
+            _footer('pnl_recent', 'local', 'local')
 
     # /close_all — 전포지션 수동 청산
     if t in ('/close_all', '/전청산'):

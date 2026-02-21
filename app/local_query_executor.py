@@ -112,7 +112,10 @@ def execute(query_type=None, original_text=None):
         'mctx_status': _mctx_status,
         'mode_params': _mode_params,
         'combined_snapshot': _combined_snapshot,
-        'mode_performance': _mode_performance}
+        'mode_performance': _mode_performance,
+        'trade_history': _trade_history,
+        'pnl_recent': _pnl_recent,
+        'bundle': _bundle}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -4949,6 +4952,223 @@ def _mode_params(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'⚠ MODE 오류: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _trade_history(_text=None):
+    """Recent trade history (execution_log). /trade_history [N] — default 10, max 50."""
+    n = 10
+    if _text:
+        parts = _text.strip().split()
+        for p in parts:
+            if p.isdigit():
+                n = min(int(p), 50)
+                break
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT order_type, direction, requested_qty, avg_fill_price,
+                       realized_pnl, fee, close_reason, regime_tag,
+                       to_char(COALESCE(last_fill_at, ts) AT TIME ZONE 'Asia/Seoul',
+                               'MM-DD HH24:MI') as ts_kr
+                FROM execution_log WHERE status = 'FILLED'
+                ORDER BY COALESCE(last_fill_at, ts) DESC LIMIT %s;
+            """, (n,))
+            rows = cur.fetchall()
+        if not rows:
+            return f'최근 체결 내역 없음 (N={n})'
+        lines = [f'최근 {len(rows)}건 체결 내역\n']
+        for r in rows:
+            otype, dirn, qty, price, pnl, fee, reason, regime, ts_kr = r
+            pnl_str = f'{float(pnl):+.4f}' if pnl is not None else '-'
+            fee_str = f'{float(fee):.4f}' if fee is not None else '-'
+            regime_str = f' [{regime}]' if regime else ''
+            reason_str = f' ({reason})' if reason else ''
+            lines.append(
+                f'  {ts_kr} {otype} {dirn} qty={qty} '
+                f'@{float(price):.0f} PnL={pnl_str} fee={fee_str}'
+                f'{regime_str}{reason_str}'
+            )
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ trade_history 오류: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _pnl_recent(_text=None):
+    """PnL summary for recent N trades. /pnl_recent [N] — default 10, max 50."""
+    n = 10
+    if _text:
+        parts = _text.strip().split()
+        for p in parts:
+            if p.isdigit():
+                n = min(int(p), 50)
+                break
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT realized_pnl, fee
+                FROM execution_log
+                WHERE status = 'FILLED' AND realized_pnl IS NOT NULL
+                ORDER BY COALESCE(last_fill_at, ts) DESC LIMIT %s;
+            """, (n,))
+            rows = cur.fetchall()
+        if not rows:
+            return f'최근 PnL 데이터 없음 (N={n})'
+        pnls = [float(r[0]) for r in rows]
+        fees = [float(r[1]) for r in rows if r[1] is not None]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        total_pnl = sum(pnls)
+        total_fee = sum(fees)
+        win_rate = len(wins) / len(pnls) * 100 if pnls else 0
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        lines = [
+            f'PnL 요약 (최근 {len(pnls)}건)\n',
+            f'  총 PnL: {total_pnl:+.4f} USDT',
+            f'  총 수수료: {total_fee:.4f} USDT',
+            f'  순 PnL: {total_pnl - total_fee:+.4f} USDT',
+            f'  승: {len(wins)}건 | 패: {len(losses)}건 | 승률: {win_rate:.1f}%',
+            f'  평균 수익: {avg_win:+.4f} | 평균 손실: {avg_loss:+.4f}',
+        ]
+        if wins and losses:
+            profit_factor = abs(sum(wins) / sum(losses)) if sum(losses) != 0 else float('inf')
+            lines.append(f'  Profit Factor: {profit_factor:.2f}')
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ pnl_recent 오류: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _bundle(_text=None):
+    """Comprehensive diagnostic bundle for external AI analysis."""
+    sections = []
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            # === EXCHANGE POSITION ===
+            try:
+                pos_text = _position_exch()
+                sections.append(f'=== EXCHANGE POSITION ===\n{pos_text}')
+            except Exception as e:
+                sections.append(f'=== EXCHANGE POSITION ===\n오류: {e}')
+
+            # === ACTIVE ORDERS ===
+            try:
+                orders_text = _orders_exch()
+                sections.append(f'=== ACTIVE ORDERS ===\n{orders_text}')
+            except Exception as e:
+                sections.append(f'=== ACTIVE ORDERS ===\n오류: {e}')
+
+            # === INTERNAL STATE ===
+            try:
+                cur.execute("""
+                    SELECT symbol, side, total_qty, avg_entry_price, stage,
+                           capital_used_usdt, plan_state, order_state, peak_upnl_pct
+                    FROM position_state LIMIT 5;
+                """)
+                ps_rows = cur.fetchall()
+                ps_lines = []
+                for r in ps_rows:
+                    ps_lines.append(
+                        f'  {r[0]}: side={r[1]} qty={r[2]} entry={r[3]} '
+                        f'stage={r[4]} cap={r[5]} plan={r[6]} order={r[7]} peak_upnl={r[8]}'
+                    )
+                sections.append('=== INTERNAL STATE ===\n' + '\n'.join(ps_lines) if ps_lines
+                                else '=== INTERNAL STATE ===\nposition_state 비어있음')
+            except Exception as e:
+                sections.append(f'=== INTERNAL STATE ===\n오류: {e}')
+
+            # === GATE / THROTTLE ===
+            try:
+                gate_lines = []
+                import order_throttle
+                ts = order_throttle.get_throttle_status()
+                gate_lines.append(f'  hourly: {ts["hourly_count"]}/{ts["hourly_limit"]}')
+                gate_lines.append(f'  10min: {ts["10min_count"]}/{ts["10min_limit"]}')
+                gate_lines.append(f'  daily: {ts["daily_count"]}/{ts["daily_limit"]}')
+                gate_lines.append(f'  locked: {ts.get("entry_locked", False)} '
+                                  f'reason: {ts.get("lock_reason", "")}')
+                import safety_manager
+                ok, reason = safety_manager.run_all_checks(cur)
+                gate_lines.append(f'  safety_gate: {"PASS" if ok else "BLOCKED"} ({reason})')
+                sections.append('=== GATE / THROTTLE ===\n' + '\n'.join(gate_lines))
+            except Exception as e:
+                sections.append(f'=== GATE / THROTTLE ===\n오류: {e}')
+
+            # === MCTX ===
+            try:
+                mctx_text = _mctx_status()
+                sections.append(f'=== MCTX ===\n{mctx_text}')
+            except Exception as e:
+                sections.append(f'=== MCTX ===\n오류: {e}')
+
+            # === RECENT 20 TRADES ===
+            try:
+                cur.execute("""
+                    SELECT order_type, direction, requested_qty, avg_fill_price,
+                           realized_pnl, fee, close_reason, regime_tag,
+                           to_char(COALESCE(last_fill_at, ts) AT TIME ZONE 'Asia/Seoul',
+                                   'MM-DD HH24:MI') as ts_kr
+                    FROM execution_log WHERE status='FILLED'
+                    ORDER BY COALESCE(last_fill_at, ts) DESC LIMIT 20;
+                """)
+                trade_rows = cur.fetchall()
+                trade_lines = []
+                for r in trade_rows:
+                    pnl_s = f'{float(r[4]):+.4f}' if r[4] is not None else '-'
+                    regime_s = f'[{r[7]}]' if r[7] else ''
+                    reason_s = f'({r[6]})' if r[6] else ''
+                    trade_lines.append(
+                        f'  {r[8]} {r[0]} {r[1]} qty={r[2]} @{float(r[3]):.0f} '
+                        f'PnL={pnl_s} {regime_s}{reason_s}'
+                    )
+                sections.append('=== RECENT 20 TRADES ===\n' +
+                                ('\n'.join(trade_lines) if trade_lines else '체결 없음'))
+            except Exception as e:
+                sections.append(f'=== RECENT 20 TRADES ===\n오류: {e}')
+
+            # === RECENT REJECTIONS ===
+            try:
+                cur.execute("""
+                    SELECT action_type, direction, outcome, reject_reason,
+                           to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI') as ts_kr
+                    FROM order_attempt_log WHERE outcome != 'ALLOWED'
+                    ORDER BY ts DESC LIMIT 10;
+                """)
+                rej_rows = cur.fetchall()
+                rej_lines = []
+                for r in rej_rows:
+                    rej_lines.append(f'  {r[4]} {r[0]} {r[1]} → {r[2]}: {r[3]}')
+                sections.append('=== RECENT REJECTIONS ===\n' +
+                                ('\n'.join(rej_lines) if rej_lines else '거부 없음'))
+            except Exception as e:
+                sections.append(f'=== RECENT REJECTIONS ===\n오류: {e}')
+
+        return '\n\n'.join(sections)
+    except Exception as e:
+        return f'⚠ bundle 오류: {e}'
     finally:
         if conn:
             try:

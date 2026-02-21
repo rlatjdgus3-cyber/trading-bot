@@ -1665,6 +1665,10 @@ def run_all():
             # PLAN state machine column + trade_switch default ON
             ensure_plan_state_column(cur)
             ensure_trade_switch_default_on(cur)
+            # execution_log regime_tag column
+            ensure_execution_log_regime_tag(cur)
+            # safety_limits max_consecutive_stops column
+            ensure_safety_limits_consecutive_stops(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -2020,6 +2024,23 @@ def ensure_plan_state_column(cur):
     except Exception as e:
         _log(f'plan_state backfill warning (non-fatal): {e}')
     _log('ensure_plan_state_column done')
+
+
+def ensure_safety_limits_consecutive_stops(cur):
+    """Add max_consecutive_stops column to safety_limits (default 6)."""
+    cur.execute("""
+        ALTER TABLE safety_limits
+        ADD COLUMN IF NOT EXISTS max_consecutive_stops INTEGER NOT NULL DEFAULT 6;
+    """)
+    _log('ensure_safety_limits_consecutive_stops done')
+
+
+def ensure_execution_log_regime_tag(cur):
+    """Add regime_tag column to execution_log for per-trade regime classification."""
+    cur.execute("""
+        ALTER TABLE execution_log ADD COLUMN IF NOT EXISTS regime_tag TEXT;
+    """)
+    _log('ensure_execution_log_regime_tag done')
 
 
 def ensure_trade_switch_default_on(cur):

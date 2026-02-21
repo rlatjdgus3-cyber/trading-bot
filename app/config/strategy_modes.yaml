@@ -108,3 +108,4 @@ feature_flags:
   ff_order_backoff_v2: true
   ff_watchdog_warn_not_down: true
   ff_snapshot_root_cause: true
+  ff_bundle_cmd: true

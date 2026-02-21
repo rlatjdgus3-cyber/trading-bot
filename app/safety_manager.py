@@ -39,7 +39,8 @@ def _load_safety_limits(cur):
                daily_loss_limit_usdt, max_pyramid_stages, add_size_min_pct,
                add_size_max_pct, circuit_breaker_window_sec, circuit_breaker_max_orders,
                add_score_threshold, trade_budget_pct, stage_slice_pct, max_stages,
-               stop_loss_pct, leverage_min, leverage_max, leverage_high_stage_max
+               stop_loss_pct, leverage_min, leverage_max, leverage_high_stage_max,
+               max_consecutive_stops
         FROM safety_limits ORDER BY id DESC LIMIT 1;
     """)
     row = cur.fetchone()
@@ -60,6 +61,7 @@ def _load_safety_limits(cur):
             'leverage_min': 3,
             'leverage_max': 8,
             'leverage_high_stage_max': 5,
+            'max_consecutive_stops': 6,
         }
     return {
         'capital_limit_usdt': float(row[0]) if row[0] is not None else 900,
@@ -79,6 +81,7 @@ def _load_safety_limits(cur):
         'leverage_min': int(row[14]) if row[14] is not None else 3,
         'leverage_max': int(row[15]) if row[15] is not None else 8,
         'leverage_high_stage_max': int(row[16]) if row[16] is not None else 5,
+        'max_consecutive_stops': int(row[17]) if len(row) > 17 and row[17] is not None else 6,
     }
 
 
@@ -239,12 +242,13 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
         return (False, f"daily loss limit ({daily_pnl:.1f} <= {limits['daily_loss_limit_usdt']})")
 
     # Consecutive stop-loss auto-halt (always active)
+    max_consec_stops = limits.get('max_consecutive_stops', 6)
     cur.execute("""
         SELECT close_reason FROM execution_log
         WHERE ts >= (now() AT TIME ZONE 'Asia/Seoul')::date AT TIME ZONE 'Asia/Seoul'
           AND close_reason IS NOT NULL
-        ORDER BY ts DESC LIMIT 3;
-    """)
+        ORDER BY ts DESC LIMIT %s;
+    """, (max_consec_stops,))
     recent_reasons = [r[0] for r in cur.fetchall()]
     consec_stops = 0
     for r in recent_reasons:
@@ -252,7 +256,7 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
             consec_stops += 1
         else:
             break
-    if consec_stops >= 3:
+    if consec_stops >= max_consec_stops:
         try:
             import trade_switch_recovery
             trade_switch_recovery.set_off_with_reason(cur, 'consecutive_stops')
