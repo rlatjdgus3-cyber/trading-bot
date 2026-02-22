@@ -284,8 +284,13 @@ def main():
         service_states['db'] = 'OK'
 
     # 3b. Record heartbeats to DB (after DB connectivity confirmed)
+    #     Normalize keys: 'candles.service' → 'candles', 'telegram_cmd_poller.timer' → 'telegram_cmd_poller'
     if db_ok:
-        _write_heartbeats_to_db(service_states)
+        normalized_states = {}
+        for unit_key, state_val in service_states.items():
+            short = unit_key.replace('.service', '').replace('.timer', '')
+            normalized_states[short] = state_val
+        _write_heartbeats_to_db(normalized_states)
 
     # 4. Check execution queue health
     eq_ok, eq_detail = _check_execution_queue_health()

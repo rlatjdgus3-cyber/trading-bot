@@ -4,7 +4,7 @@ strategy_v3.risk_v3 — Dynamic ATR-based SL, R-based TP, stage slice adjustment
 FAIL-OPEN: any error → returns default conservative params.
 """
 
-from strategy_v3 import config_v3, safe_float, compute_health
+from strategy_v3 import config_v3, safe_float, compute_market_health
 
 LOG_PREFIX = '[risk_v3]'
 
@@ -26,7 +26,7 @@ def _is_regime_risk_v3_enabled():
         return False
 
 
-def compute_risk(features, v3_regime):
+def compute_risk(features, v3_regime, loss_streak=0):
     """Compute dynamic risk parameters based on V3 regime.
 
     Args:
@@ -88,7 +88,7 @@ def compute_risk(features, v3_regime):
                 reasoning.append(f'impulse={impulse:.2f} > {impulse_threshold} → stage_slice ×0.5')
 
             # Health WARN → additional slice reduction
-            health = compute_health(features) if features else 'OK'
+            health = compute_market_health(features) if features else 'OK'
             if health == 'WARN':
                 stage_slice_mult = min(stage_slice_mult, cfg['breakout_stage_slice_mult'])
                 reasoning.append('health=WARN → stage_slice capped')
@@ -102,7 +102,7 @@ def compute_risk(features, v3_regime):
             reasoning.append(f'SL: {cfg["atr_sl_mult"]}×ATR({atr_pct:.4f})={raw_sl:.4f} → clamped {sl_pct:.4f}')
 
             # Stage slice adjustment
-            health = compute_health(features) if features else 'OK'
+            health = compute_market_health(features) if features else 'OK'
             if regime_class == 'BREAKOUT' or health == 'WARN':
                 stage_slice_mult = cfg['breakout_stage_slice_mult']
                 reasoning.append(f'stage_slice: {stage_slice_mult} (BREAKOUT/WARN)')
@@ -116,6 +116,16 @@ def compute_risk(features, v3_regime):
                 leverage_max = 5
 
             max_stage = None  # not set in legacy mode
+
+        # Loss streak → stage_slice reduction
+        if loss_streak >= 3:
+            slice_mult_3 = cfg.get('loss_streak_slice_mult_3', 0.5)
+            stage_slice_mult *= slice_mult_3
+            reasoning.append(f'loss_streak={loss_streak} → slice×{slice_mult_3}')
+        elif loss_streak >= 2:
+            slice_mult_2 = cfg.get('loss_streak_slice_mult_2', 0.7)
+            stage_slice_mult *= slice_mult_2
+            reasoning.append(f'loss_streak={loss_streak} → slice×{slice_mult_2}')
 
         # TP calculation (R-based)
         tp_pct = sl_pct * cfg['tp_r_ratio']

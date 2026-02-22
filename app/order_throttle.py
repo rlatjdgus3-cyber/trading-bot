@@ -671,6 +671,20 @@ def is_entry_blocked(cur):
         return (False, '', 0)
 
 
+def count_daily_trades_kst(cur):
+    """Count today's filled entries (KST calendar day)."""
+    try:
+        cur.execute("""
+            SELECT COUNT(*) FROM execution_log
+            WHERE status = 'FILLED'
+              AND order_type IN ('OPEN', 'ADD')
+              AND ts AT TIME ZONE 'Asia/Seoul' >= date_trunc('day', now() AT TIME ZONE 'Asia/Seoul')
+        """)
+        return cur.fetchone()[0] or 0
+    except Exception:
+        return 0
+
+
 def get_state_snapshot():
     """Return throttle state snapshot for debug display."""
     now = time.time()

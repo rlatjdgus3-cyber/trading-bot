@@ -767,7 +767,7 @@ def main():
                 except psycopg2.IntegrityError as ie:
                     # URL/title+source duplicate → normal, skip silently
                     ie_str = str(ie).lower()
-                    is_known_dup = 'idx_news_title_source_uniq' in ie_str or 'url' in ie_str
+                    is_known_dup = 'unique' in ie_str or 'duplicate' in ie_str or 'url' in ie_str
                     if is_known_dup:
                         log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
                     else:

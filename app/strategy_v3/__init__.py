@@ -11,7 +11,7 @@ def safe_float(val, default=0.0):
         return default
 
 
-def compute_health(features):
+def compute_market_health(features):
     """Compute market health from spread_ok and liquidity_ok flags."""
     spread_ok = features.get('spread_ok', True)
     liquidity_ok = features.get('liquidity_ok', True)

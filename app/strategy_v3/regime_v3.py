@@ -16,7 +16,7 @@ FAIL-OPEN: any error → STATIC_RANGE (most conservative).
 """
 
 import time
-from strategy_v3 import config_v3, safe_float, compute_health
+from strategy_v3 import config_v3, safe_float, compute_market_health
 
 LOG_PREFIX = '[regime_v3]'
 
@@ -119,7 +119,7 @@ def _classify_raw(features, regime_ctx):
     drift_score = safe_float(features.get('drift_score'))
     drift_direction = features.get('drift_direction', 'NONE')
     adx = safe_float(features.get('adx') or (regime_ctx.get('adx_14') if regime_ctx else None))
-    health = compute_health(features)
+    health = compute_market_health(features)
     breakout_confirmed = _safe_bool(regime_ctx.get('breakout_confirmed') if regime_ctx else None)
     bbw_ratio = safe_float(regime_ctx.get('bbw_ratio') if regime_ctx else None)
     volume_z = safe_float(features.get('volume_z'))

@@ -25,11 +25,15 @@ REQUIRED_SERVICES = [
     'executor',
     'indicators',
     'news_bot',
-    'pnl_watcher']
+    'pnl_watcher',
+    'live_order_executor',
+    'position_manager',
+    'fill_watcher']
 OPTIONAL_SERVICES = [
     'signal_logger',
     'vol_profile',
-    'error_watcher']
+    'error_watcher',
+    'position_watcher']
 WATCHED_SERVICES = REQUIRED_SERVICES + OPTIONAL_SERVICES
 SERVICE_NAMES_KO = {
     'candles': '캔들 수집',
@@ -39,7 +43,11 @@ SERVICE_NAMES_KO = {
     'signal_logger': '시그널 기록',
     'vol_profile': '볼륨 프로파일',
     'error_watcher': '에러 감시',
-    'pnl_watcher': '손익 감시'}
+    'pnl_watcher': '손익 감시',
+    'live_order_executor': '주문 실행기',
+    'position_manager': '포지션 관리',
+    'fill_watcher': '체결 감시',
+    'position_watcher': '포지션 감시'}
 
 def _db():
     return get_conn(autocommit=True)
@@ -297,7 +305,7 @@ def get_service_health_snapshot():
                     hb_reason = f'warmup (age={age_sec}s, rows={hb_cnt})'
                 else:
                     hb_state = 'DOWN'
-                    hb_reason = f'heartbeat_stale (age={age_sec}s, threshold={stale_threshold}s)'
+                    hb_reason = f'heartbeat_stale (age={age_sec}s, expected={expected_interval}s, threshold={stale_threshold}s)'
             else:
                 hb_reason = 'missing_expected_interval'
         else:
@@ -347,7 +355,7 @@ def get_service_health_snapshot():
         elif proc_state == 'OK' and hb_state == 'DOWN':
             # Process is alive but heartbeat stale → trust process, WARN only
             state = 'OK'
-            reason = f'WARN: {hb_reason} (process alive)'
+            reason = f'WARN: {hb_reason} (proc={proc_reason})'
         elif proc_state == 'OK':
             state = 'OK'
             reason = proc_reason
@@ -1916,14 +1924,18 @@ PRICE_TABLE_CANONICAL = {
 }
 
 SERVICE_REGISTRY = {
-    'candles':        {'expected_interval_sec': 60,  'systemctl_unit': 'candles.service'},
-    'executor':       {'expected_interval_sec': 60,  'systemctl_unit': 'dry_run_close_executor.service'},
-    'indicators':     {'expected_interval_sec': 60,  'systemctl_unit': 'indicators.service'},
-    'news_bot':       {'expected_interval_sec': 300, 'systemctl_unit': 'news_bot.service'},
-    'pnl_watcher':    {'expected_interval_sec': 60,  'systemctl_unit': 'pnl_watcher.service'},
-    'signal_logger':  {'expected_interval_sec': 120, 'systemctl_unit': 'signal_logger.service'},
-    'vol_profile':    {'expected_interval_sec': 300, 'systemctl_unit': 'vol_profile.service'},
-    'error_watcher':  {'expected_interval_sec': 300, 'systemctl_unit': 'error_watcher.service'},
+    'candles':              {'expected_interval_sec': 60,  'systemctl_unit': 'candles.service'},
+    'executor':             {'expected_interval_sec': 60,  'systemctl_unit': 'dry_run_close_executor.service'},
+    'indicators':           {'expected_interval_sec': 60,  'systemctl_unit': 'indicators.service'},
+    'news_bot':             {'expected_interval_sec': 300, 'systemctl_unit': 'news_bot.service'},
+    'pnl_watcher':          {'expected_interval_sec': 60,  'systemctl_unit': 'pnl_watcher.service'},
+    'signal_logger':        {'expected_interval_sec': 120, 'systemctl_unit': 'signal_logger.service'},
+    'vol_profile':          {'expected_interval_sec': 300, 'systemctl_unit': 'vol_profile.service'},
+    'error_watcher':        {'expected_interval_sec': 300, 'systemctl_unit': 'error_watcher.service'},
+    'live_order_executor':  {'expected_interval_sec': 180, 'systemctl_unit': 'live_order_executor.service'},
+    'position_manager':     {'expected_interval_sec': 180, 'systemctl_unit': 'position_manager.service'},
+    'fill_watcher':         {'expected_interval_sec': 180, 'systemctl_unit': 'fill_watcher.service'},
+    'position_watcher':     {'expected_interval_sec': 180, 'systemctl_unit': 'position_watcher.service'},
 }
 
 
@@ -5115,6 +5127,11 @@ def _bundle(_text=None):
                 gate_lines.append(f'  10min: {ts.get("10min_count", "?")}/{ts.get("10min_limit", "?")}')
                 gate_lines.append(f'  locked: {ts.get("entry_locked", False)} '
                                   f'reason: {ts.get("lock_reason", "")}')
+                try:
+                    daily_count = order_throttle.count_daily_trades_kst(cur)
+                    gate_lines.append(f'  daily: {daily_count}/60 (remaining: {60 - daily_count})')
+                except Exception:
+                    pass
                 import safety_manager
                 ok, reason = safety_manager.run_all_checks(cur)
                 gate_lines.append(f'  safety_gate: {"PASS" if ok else "BLOCKED"} ({reason})')
@@ -5122,6 +5139,18 @@ def _bundle(_text=None):
             except Exception as e:
                 _log(f'bundle GATE/THROTTLE error: {e}')
                 sections.append(f'=== GATE / THROTTLE ===\n오류: {e}')
+
+            # === SYSTEM HEALTH ===
+            try:
+                hs = get_service_health_snapshot()
+                req_down = hs.get('required_down', [])
+                hl = [f'  services: OK={hs.get("ok",0)} DOWN={len(hs.get("down",[]))} '
+                      f'UNKNOWN={len(hs.get("unknown",[]))}']
+                if req_down:
+                    hl.append(f'  required_down: {", ".join(req_down)}')
+                sections.append('=== SYSTEM HEALTH ===\n' + '\n'.join(hl))
+            except Exception as e:
+                sections.append(f'=== SYSTEM HEALTH ===\n  error: {e}')
 
             # === MCTX ===
             try:
@@ -5154,6 +5183,31 @@ def _bundle(_text=None):
                     )
                 sections.append('=== RECENT 20 TRADES ===\n' +
                                 ('\n'.join(trade_lines) if trade_lines else '체결 없음'))
+
+                # === PERFORMANCE SUMMARY ===
+                try:
+                    if trade_rows:
+                        wins = sum(1 for r in trade_rows if r[4] is not None and float(r[4]) > 0)
+                        losses = sum(1 for r in trade_rows if r[4] is not None and float(r[4]) < 0)
+                        total = wins + losses
+                        wr = f'{wins/total*100:.0f}%' if total > 0 else 'N/A'
+                        total_pnl = sum(float(r[4]) for r in trade_rows if r[4] is not None)
+                        streak = 0
+                        for r in trade_rows:
+                            if r[4] is None:
+                                continue  # skip OPEN/ADD (no PnL)
+                            if float(r[4]) < 0:
+                                streak += 1
+                            else:
+                                break
+                        perf_lines = [
+                            f'  recent_20: W={wins} L={losses} WR={wr} PnL={total_pnl:+.4f}',
+                            f'  current_loss_streak: {streak}',
+                        ]
+                        sections.append('=== PERFORMANCE SUMMARY ===\n' + '\n'.join(perf_lines))
+                except Exception as e:
+                    sections.append(f'=== PERFORMANCE SUMMARY ===\n  error: {e}')
+
             except Exception as e:
                 _log(f'bundle RECENT TRADES error: {e}')
                 sections.append(f'=== RECENT 20 TRADES ===\n오류: {e}')
