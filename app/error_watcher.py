@@ -349,6 +349,20 @@ def main():
 
     write_state(state)
 
+    # ── Heartbeat: record to service_health_log so /debug health sees us alive ──
+    try:
+        from db_config import get_conn as _get_conn
+        _hb_conn = _get_conn(autocommit=True)
+        try:
+            with _hb_conn.cursor() as _hb_cur:
+                _hb_cur.execute(
+                    "INSERT INTO service_health_log (service, state) VALUES (%s, %s)",
+                    ('error_watcher', 'OK'))
+        finally:
+            _hb_conn.close()
+    except Exception:
+        pass  # heartbeat failure should never block main flow
+
 
 if __name__ == '__main__':
     main()

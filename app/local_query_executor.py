@@ -1932,7 +1932,7 @@ SERVICE_REGISTRY = {
     'pnl_watcher':          {'expected_interval_sec': 60,  'systemctl_unit': 'pnl_watcher.service'},
     'signal_logger':        {'expected_interval_sec': 120, 'systemctl_unit': 'signal_logger.service'},
     'vol_profile':          {'expected_interval_sec': 300, 'systemctl_unit': 'vol_profile.service'},
-    'error_watcher':        {'expected_interval_sec': 300, 'systemctl_unit': 'error_watcher.service'},
+    'error_watcher':        {'expected_interval_sec': 180, 'systemctl_unit': 'error_watcher.service'},
     'live_order_executor':  {'expected_interval_sec': 180, 'systemctl_unit': 'live_order_executor.service'},
     'position_manager':     {'expected_interval_sec': 180, 'systemctl_unit': 'position_manager.service'},
     'fill_watcher':         {'expected_interval_sec': 180, 'systemctl_unit': 'fill_watcher.service'},
