@@ -41,7 +41,10 @@ def get_trade_switch(cur) -> bool:
 def set_trade_switch(cur, enabled: bool, off_reason=None):
     if not enabled and off_reason:
         import trade_switch_recovery
-        trade_switch_recovery.set_off_with_reason(cur, off_reason)
+        trade_switch_recovery.set_off_with_reason(cur, off_reason, changed_by='equity_guard')
+    elif enabled:
+        import trade_switch_recovery
+        trade_switch_recovery.set_on(cur, changed_by='equity_guard')
     else:
         cur.execute("INSERT INTO public.trade_switch(enabled) VALUES (%s);", (enabled,))
 

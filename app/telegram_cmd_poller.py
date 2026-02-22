@@ -2190,6 +2190,7 @@ _DEBUG_SUBCMDS = {
     'throttle': 'debug_order_throttle',
     'ai_models': 'debug_ai_models',
     'ai': 'debug_ai_models',
+    'news_health': 'debug_news_health',
 }
 
 _DEBUG_HELP = (
@@ -2219,11 +2220,21 @@ _DEBUG_HELP = (
     '  /debug gate_details — 서비스별 gate 상세 (dual-source)\n'
     '  /debug order_throttle — 주문 속도 제한 상태 + 60분 타임라인\n'
     '  /debug ai_models — AI/LLM 모델 구성 + 마지막 호출 정보\n'
+    '  /debug news_health — 뉴스 파이프라인 상태/에러 카운트\n'
     '  /debug on|off — 디버그 모드 토글\n'
     '\n'
     '  aliases: reaction, coverage, backfill, dryrun, gate,\n'
     '           bf_enable, bf_start, bf_pause, bf_resume, bf_stop, bf_log,\n'
     '           news_gap, path_sample, path_stats, ai\n'
+    '\n'
+    '━━━ 운영 점검 순서 (권장) ━━━\n'
+    '1) /debug gate_details force_refresh=true → gate_verdict PASS + required fresh\n'
+    '2) /bundle → 포지션/오더/내부상태 일치 확인\n'
+    '3) /debug news_sample --n=20 → 뉴스 파싱 정상\n'
+    '4) /debug news_filter_stats → allow_trading/allow_storage 비율\n'
+    '5) /debug news_health → 파이프라인 타임스탬프/에러카운트\n'
+    '\n'
+    'ℹ /debug health는 참고용. 매매 판단은 /debug gate_details 우선.\n'
 )
 
 
@@ -2470,14 +2481,11 @@ def _toggle_trading(parsed, text):
     try:
         with conn.cursor() as cur:
             if not enable:
-                trade_switch_recovery.set_off_with_reason(cur, 'manual', manual_ttl_minutes=30)
+                trade_switch_recovery.set_off_with_reason(cur, 'manual',
+                                                          manual_ttl_minutes=30,
+                                                          changed_by='manual')
             else:
-                trade_switch_recovery._ensure_columns(cur)
-                cur.execute(
-                    "UPDATE trade_switch SET enabled = %s, off_reason = NULL, "
-                    "manual_off_until = NULL "
-                    "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
-                    (enable,))
+                trade_switch_recovery.set_on(cur, changed_by='manual')
             if cur.rowcount == 0:
                 return "⚠️ trade_switch 레코드가 없습니다." + \
                     _footer('toggle_trading', 'error', 'local')
@@ -2636,14 +2644,11 @@ def _trade_switch_set(enable: bool) -> str:
         with conn.cursor() as cur:
             if not enable:
                 # Manual OFF with 30min TTL protection (blocks auto-recovery)
-                trade_switch_recovery.set_off_with_reason(cur, 'manual', manual_ttl_minutes=30)
+                trade_switch_recovery.set_off_with_reason(cur, 'manual',
+                                                          manual_ttl_minutes=30,
+                                                          changed_by='manual')
             else:
-                trade_switch_recovery._ensure_columns(cur)
-                cur.execute(
-                    "UPDATE trade_switch SET enabled = %s, off_reason = NULL, "
-                    "manual_off_until = NULL "
-                    "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
-                    (enable,))
+                trade_switch_recovery.set_on(cur, changed_by='manual')
             if cur.rowcount == 0:
                 return '⚠️ trade_switch 레코드가 없습니다.' + \
                     _footer('trade_switch', 'error', 'local')

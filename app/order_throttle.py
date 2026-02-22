@@ -494,11 +494,9 @@ def _auto_halt_trading(reason):
         from db_config import get_conn
         conn = get_conn(autocommit=True)
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE trade_switch
-                SET enabled = false, off_reason = %s, updated_at = now()
-                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
-            """, (reason,))
+            import trade_switch_recovery
+            trade_switch_recovery.set_off_with_reason(cur, reason,
+                                                       changed_by='order_throttle')
         _log(f'AUTO HALT: trade_switch OFF, reason={reason}')
     except Exception as e:
         _log(f'_auto_halt_trading DB error: {e}')

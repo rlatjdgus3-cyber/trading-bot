@@ -116,6 +116,7 @@ def execute(query_type=None, original_text=None):
         'debug_gate_details': _debug_gate_details,
         'debug_order_throttle': _debug_order_throttle,
         'debug_ai_models': _debug_ai_models,
+        'debug_news_health': _debug_news_health,
         'reconcile': _reconcile,
         'mctx_status': _mctx_status,
         'mode_params': _mode_params,
@@ -2210,8 +2211,9 @@ def _debug_health(_text=None):
             hb_display = 'null'
 
         is_required = svc in REQUIRED_SERVICES
+        _req_tag = '[필수]' if is_required else '[선택]'
 
-        lines.append(f'{icon} {svc}: {state}')
+        lines.append(f'{icon} {_req_tag} {svc}: {state}')
         lines.append(f'  reason={reason}')
         if expected_interval > 0:
             threshold = 2 * expected_interval
@@ -2246,8 +2248,9 @@ def _debug_health(_text=None):
     lines.insert(2, f'전체: {total} | OK: {ok_count} | DOWN: {down_count} | UNKNOWN: {unknown_count}')
     lines.insert(3, f'required: {req_ok} OK {req_down} DOWN | '
                     f'optional: {opt_ok} OK {opt_down} DOWN')
-    lines.insert(4, f'systemctl_latency: {sctl_ms:.0f}ms')
-    lines.insert(5, '')
+    lines.insert(4, f'TRADING IMPACT: required 서비스 중단={req_down > 0} (gate_details 우선 참고)')
+    lines.insert(5, f'systemctl_latency: {sctl_ms:.0f}ms')
+    lines.insert(6, '')
 
     _log_service_health(states_for_log)
     return '\n'.join(lines)
@@ -2305,10 +2308,38 @@ def _debug_gate_details(_text=None):
             except Exception as e:
                 lines.append(f'regime: error ({e})')
 
-            # Trade switch status
+            # Trade switch status (enriched 1-line)
             try:
                 sw = exchange_reader.fetch_trade_switch_status()
-                lines.append(f'trade_switch: {sw}')
+                _sw_enabled = sw.get('entry_enabled')
+                _sw_state = 'ON' if _sw_enabled else ('OFF' if _sw_enabled is False else 'UNKNOWN')
+                _sw_reason = sw.get('off_reason', '') or sw.get('reason', '')
+                _sw_by = sw.get('last_changed_by', 'unknown')
+                _sw_disable = sw.get('last_disable_ts', '')
+                _sw_recover = sw.get('last_auto_recover_ts', '')
+                try:
+                    import trade_switch_recovery
+                    _sw_settle = trade_switch_recovery._get_settlement_display()
+                except Exception:
+                    _sw_settle = '?'
+                _ff_ok = True
+                try:
+                    import feature_flags
+                    _ff_ok = feature_flags.is_enabled('ff_trade_switch_reason_line')
+                except Exception:
+                    pass
+                if _ff_ok:
+                    lines.append(
+                        f'TRADE_SWITCH: {_sw_state}'
+                        f' | reason={_sw_reason or "none"}'
+                        f' | changed_by={_sw_by}'
+                        f' | last_disable={_sw_disable or "none"}'
+                        f' | last_recover={_sw_recover or "none"}'
+                        f' | settlement={_sw_settle}')
+                    if _sw_reason == 'scheduled_settlement' and not _sw_enabled:
+                        lines.append('  → 정상 루틴 (정기 정산)')
+                else:
+                    lines.append(f'trade_switch: {sw}')
             except Exception as e:
                 lines.append(f'trade_switch: error ({e})')
 
@@ -4746,6 +4777,99 @@ def _debug_order_throttle(_text=None):
                 pass
 
 
+def _debug_news_health(_text=None):
+    """News pipeline health: timestamps, error counts, process status."""
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_news_health_command'):
+            return '⚠ ff_news_health_command OFF — 기능 비활성'
+    except Exception:
+        pass
+    import json as _json
+    from datetime import datetime, timezone
+    lines = ['\U0001fa7a 뉴스 파이프라인 상태', '━━━━━━━━━━━━━━━━━━']
+
+    # 1) Read stats file from news_bot
+    _STATS_FILE = '/tmp/news_bot_stats.json'
+    stats = {}
+    stats_stale = False
+    try:
+        with open(_STATS_FILE, 'r') as f:
+            stats = _json.load(f)
+        # Check staleness: if tick_ts > 15 min ago, flag as stale
+        tick_ts = stats.get('tick_ts', '')
+        if tick_ts:
+            try:
+                tick_dt = datetime.fromisoformat(tick_ts)
+                if tick_dt.tzinfo is None:
+                    tick_dt = tick_dt.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - tick_dt).total_seconds()
+                if age > 900:
+                    stats_stale = True
+            except Exception:
+                pass
+    except FileNotFoundError:
+        lines.append('stats_file: 없음 (news_bot 미실행 또는 첫 틱 전)')
+    except Exception as e:
+        lines.append(f'stats_file: 읽기 오류 ({e})')
+
+    if stats:
+        lines.append(f'last_fetch_ok: {stats.get("last_fetch_ok_ts", "N/A")}')
+        lines.append(f'last_insert_ok: {stats.get("last_insert_ok_ts", "N/A")}')
+        lines.append(f'parse_fail_10m: {stats.get("parse_fail_10m", 0)}')
+        lines.append(f'fetch_fail_10m: {stats.get("fetch_fail_10m", 0)}')
+        lines.append(f'duplicate_ignored_10m: {stats.get("duplicate_ignored_10m", 0)}')
+        lines.append(f'insert_ok_10m: {stats.get("insert_ok_10m", 0)}')
+        if stats.get('last_error_type'):
+            lines.append(
+                f'last_error: {stats.get("last_error_type")} ({stats.get("last_error_source", "?")})'
+                f' "{(stats.get("last_error_msg", ""))[:60]}" {stats.get("last_error_ts", "")}')
+        if stats_stale:
+            lines.append(f'⚠ stats_file 오래됨 (tick_ts={stats.get("tick_ts", "?")})')
+
+    # 2) DB: last insert + parse error count
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            try:
+                cur.execute("""
+                    SELECT MAX(ts) FROM news WHERE ts >= now() - interval '1 hour';
+                """)
+                r = cur.fetchone()
+                last_news = str(r[0])[:19] if r and r[0] else 'N/A (1h내 없음)'
+                lines.append(f'db_last_news_1h: {last_news}')
+            except Exception:
+                pass
+            try:
+                cur.execute("""
+                    SELECT COUNT(*) FROM news_raw_errors
+                    WHERE ts >= now() - interval '10 minutes';
+                """)
+                r = cur.fetchone()
+                lines.append(f'db_raw_errors_10m: {r[0] if r else 0}')
+            except Exception:
+                lines.append('db_raw_errors_10m: table 없음')
+    except Exception as e:
+        lines.append(f'db_query: error ({e})')
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # 3) Process status
+    try:
+        rc, out = _run(['systemctl', 'is-active', 'news_bot'])
+        proc_state = out.strip() if rc == 0 else 'inactive/error'
+        lines.append(f'news_bot_process: {proc_state}')
+    except Exception:
+        lines.append('news_bot_process: check failed')
+
+    return '\n'.join(lines)
+
+
 def _debug_ai_models(_text=None):
     """AI/LLM model configuration and last-call info."""
     from datetime import datetime, timezone
@@ -5117,6 +5241,31 @@ def _bundle(_text=None):
             except Exception as e:
                 _log(f'bundle INTERNAL STATE error: {e}')
                 sections.append(f'=== INTERNAL STATE ===\n오류: {e}')
+
+            # === TRADE_SWITCH ===
+            try:
+                _tsw = exchange_reader.fetch_trade_switch_status()
+                _tsw_enabled = _tsw.get('entry_enabled')
+                _tsw_state = 'ON' if _tsw_enabled else ('OFF' if _tsw_enabled is False else 'UNKNOWN')
+                _tsw_reason = _tsw.get('off_reason', '') or _tsw.get('reason', '')
+                _tsw_by = _tsw.get('last_changed_by', 'unknown')
+                _tsw_disable = _tsw.get('last_disable_ts', '')
+                _tsw_recover = _tsw.get('last_auto_recover_ts', '')
+                try:
+                    import trade_switch_recovery as _tsr
+                    _tsw_settle = _tsr._get_settlement_display()
+                except Exception:
+                    _tsw_settle = '?'
+                sections.append(
+                    f'=== TRADE_SWITCH ===\n'
+                    f'  TRADE_SWITCH: {_tsw_state}'
+                    f' | reason={_tsw_reason or "none"}'
+                    f' | changed_by={_tsw_by}'
+                    f' | last_disable={_tsw_disable or "none"}'
+                    f' | last_recover={_tsw_recover or "none"}'
+                    f' | settlement={_tsw_settle}')
+            except Exception as e:
+                sections.append(f'=== TRADE_SWITCH ===\n  error: {e}')
 
             # === GATE / THROTTLE ===
             try:

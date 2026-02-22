@@ -1,6 +1,8 @@
 """
 trade_switch_recovery.py — Auto-recovery for trade_switch.
 
+Single source of truth for all trade_switch writes (ON/OFF).
+
 Rules:
   1. trade_switch OFF + manual_off_until > now() → manual TTL protection, no recovery
   2. trade_switch OFF + safety_manager gate PASS → auto ON
@@ -11,6 +13,19 @@ import sys
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[trade_switch_recovery]'
 _columns_ensured = False
+
+# ── off_reason Standardized Values ──
+OFF_REASONS = {
+    'scheduled_settlement': '정기 정산 (17:25-17:40 KST)',
+    'consecutive_stops': '연속 손절',
+    'equity_drawdown': '자본 드로다운',
+    'panic_close': '긴급 청산',
+    'manual': '수동 OFF',
+    'error_spike': '에러 급증 (order_throttle)',
+    'rate_limit': 'API 속도 제한',
+    'safety_gate_fail': '안전 게이트 실패',
+    'unknown': '원인 미상',
+}
 
 
 def _log(msg):
@@ -55,17 +70,123 @@ def _is_settlement_window():
     return datetime.time(17, 25) <= t <= datetime.time(17, 40)
 
 
+def _get_settlement_display():
+    """Return settlement window status string for notifications."""
+    import datetime
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    now_kst = datetime.datetime.now(ZoneInfo('Asia/Seoul'))
+    t = now_kst.time()
+    if datetime.time(17, 25) <= t <= datetime.time(17, 40):
+        return '진행중 (ends ~17:40 KST)'
+    elif t < datetime.time(17, 25):
+        return '다음 예정: 17:25 KST'
+    else:
+        return '종료'
+
+
 def _ensure_columns(cur):
-    """Defensive: ensure off_reason/manual_off_until columns exist. Idempotent."""
+    """Defensive: ensure all trade_switch columns exist. Idempotent."""
     global _columns_ensured
     if _columns_ensured:
         return
     try:
         cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS off_reason TEXT DEFAULT NULL;")
         cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS manual_off_until TIMESTAMPTZ DEFAULT NULL;")
+        cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS last_changed_by TEXT DEFAULT 'unknown';")
+        cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS last_auto_recover_ts TIMESTAMPTZ DEFAULT NULL;")
+        cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS last_disable_ts TIMESTAMPTZ DEFAULT NULL;")
         _columns_ensured = True
     except Exception as e:
         _log(f'_ensure_columns warning: {e}')
+
+
+def set_on(cur, changed_by='system', auto_recovered=False):
+    """Set trade_switch ON (single source of truth).
+
+    Args:
+        cur: DB cursor
+        changed_by: 'auto_recovery', 'manual', 'equity_guard', 'scheduled_settlement', etc.
+        auto_recovered: if True, also set last_auto_recover_ts
+    """
+    _ensure_columns(cur)
+    try:
+        if auto_recovered:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = true, off_reason = NULL, manual_off_until = NULL,
+                    last_changed_by = %s, last_auto_recover_ts = now(), updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (changed_by,))
+        else:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = true, off_reason = NULL, manual_off_until = NULL,
+                    last_changed_by = %s, updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (changed_by,))
+    except Exception as e:
+        # Fallback: if new columns missing, do simple UPDATE
+        _log(f'set_on fallback (new columns missing?): {e}')
+        cur.execute("""
+            UPDATE trade_switch
+            SET enabled = true, off_reason = NULL, manual_off_until = NULL,
+                updated_at = now()
+            WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+        """)
+    _log(f'trade_switch ON: changed_by={changed_by} auto_recovered={auto_recovered}')
+
+
+def set_off_with_reason(cur, reason, manual_ttl_minutes=0, changed_by='system'):
+    """Set trade_switch OFF with off_reason and optional manual TTL.
+
+    Args:
+        cur: DB cursor
+        reason: 'consecutive_stops', 'equity_drawdown', 'scheduled_settlement',
+                'panic_close', 'manual', 'error_spike', etc.
+        manual_ttl_minutes: if > 0, set manual_off_until = now() + interval
+        changed_by: who initiated (default='system')
+    """
+    _ensure_columns(cur)
+
+    try:
+        if manual_ttl_minutes > 0:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = false, off_reason = %s,
+                    manual_off_until = now() + make_interval(mins => %s),
+                    last_changed_by = %s, last_disable_ts = now(), updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (reason, manual_ttl_minutes, changed_by))
+        else:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = false, off_reason = %s, manual_off_until = NULL,
+                    last_changed_by = %s, last_disable_ts = now(), updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (reason, changed_by))
+    except Exception as e:
+        # Fallback: if new columns missing, do simple UPDATE
+        _log(f'set_off_with_reason fallback (new columns missing?): {e}')
+        if manual_ttl_minutes > 0:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = false, off_reason = %s,
+                    manual_off_until = now() + make_interval(mins => %s),
+                    updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (reason, manual_ttl_minutes))
+        else:
+            cur.execute("""
+                UPDATE trade_switch
+                SET enabled = false, off_reason = %s, manual_off_until = NULL,
+                    updated_at = now()
+                WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
+            """, (reason,))
+
+    _log(f'trade_switch OFF: reason={reason} ttl={manual_ttl_minutes}m changed_by={changed_by}')
 
 
 def try_auto_recover(cur):
@@ -112,47 +233,19 @@ def try_auto_recover(cur):
         return (False, f'gate_blocked: {gate_reason}')
 
     # 5. Gate PASS — recover!
-    cur.execute("""
-        UPDATE trade_switch
-        SET enabled = true, off_reason = NULL, manual_off_until = NULL,
-            updated_at = now()
-        WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
-    """)
+    set_on(cur, changed_by='auto_recovery', auto_recovered=True)
+
+    # 6. Enhanced notification
+    settlement = _get_settlement_display()
+    reason_label = OFF_REASONS.get(off_reason, off_reason or 'unknown')
+    is_normal = off_reason == 'scheduled_settlement'
 
     _log(f'AUTO-RECOVERED: off_reason was {off_reason!r}')
     _notify_telegram(
-        f'✅ trade_switch 자동 복구\n'
-        f'- 이전 사유: {off_reason or "unknown"}\n'
-        f'- gate: PASS 확인')
+        f'{"✅" if is_normal else "⚠️"} trade_switch 자동 복구\n'
+        f'- 이전 사유: {off_reason or "unknown"} → "{reason_label}"'
+        f'{" (정상 정산 후 자동 복구)" if is_normal else ""}\n'
+        f'- 복구 조건: gate PASS + settlement 종료 + manual TTL 없음\n'
+        f'- settlement: {settlement}')
 
     return (True, 'auto_recovered')
-
-
-def set_off_with_reason(cur, reason, manual_ttl_minutes=0):
-    """Set trade_switch OFF with off_reason and optional manual TTL.
-
-    Args:
-        cur: DB cursor
-        reason: 'consecutive_stops', 'equity_drawdown', 'scheduled_settlement',
-                'panic_close', 'manual'
-        manual_ttl_minutes: if > 0, set manual_off_until = now() + interval
-    """
-    _ensure_columns(cur)
-
-    if manual_ttl_minutes > 0:
-        cur.execute("""
-            UPDATE trade_switch
-            SET enabled = false, off_reason = %s,
-                manual_off_until = now() + make_interval(mins => %s),
-                updated_at = now()
-            WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
-        """, (reason, manual_ttl_minutes))
-    else:
-        cur.execute("""
-            UPDATE trade_switch
-            SET enabled = false, off_reason = %s, manual_off_until = NULL,
-                updated_at = now()
-            WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);
-        """, (reason,))
-
-    _log(f'trade_switch OFF: reason={reason} ttl={manual_ttl_minutes}m')

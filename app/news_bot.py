@@ -1,4 +1,5 @@
-import os, time, json, traceback, sys, re
+import os, time, json, traceback, sys, re, html
+from collections import deque
 import feedparser
 import psycopg2
 from openai import OpenAI
@@ -218,6 +219,29 @@ _error_alert_cache = {}  # {dedup_key: (last_ts, count)}
 _ERROR_ALERT_COOLDOWN_SEC = 1800  # 30분
 _ERROR_CACHE_MAX_SIZE = 200  # max entries before pruning
 
+# ── Alert threshold (v2) ── rolling 10min error windows per error_type+source
+_ALERT_THRESHOLD_COUNT = 5
+_ALERT_WINDOW_SEC = 600  # 10 minutes
+_error_windows = {}  # {type:source -> deque of timestamps}
+_alert_sent_windows = {}  # {type:source -> last_alert_ts}
+
+# ── Stats file for /debug news_health ──
+_STATS_FILE = '/tmp/news_bot_stats.json'
+_stats = {
+    'last_fetch_ok_ts': '',
+    'last_insert_ok_ts': '',
+    'parse_fail_10m': 0,
+    'fetch_fail_10m': 0,
+    'duplicate_ignored_10m': 0,
+    'insert_ok_10m': 0,
+    'last_error_type': '',
+    'last_error_source': '',
+    'last_error_msg': '',
+    'last_error_ts': '',
+    'tick_ts': '',
+}
+_event_log = deque(maxlen=2000)  # (ts, event_type) for 10-min windowing
+
 # Telegram config cache (avoid disk read on every alert)
 _tg_config_cache = None
 
@@ -293,6 +317,112 @@ def _send_error_alert(source, title, exception, dedup_key=None):
             urllib.request.urlopen(req, timeout=10)
     except Exception:
         pass
+
+
+def _record_event(event_type):
+    """Record a timestamped event for 10-min windowed stats."""
+    _event_log.append((time.time(), event_type))
+
+
+def _count_events_10m(event_type):
+    """Count events of given type in last 10 minutes."""
+    cutoff = time.time() - 600
+    return sum(1 for ts, et in _event_log if ts >= cutoff and et == event_type)
+
+
+def _send_threshold_alert(error_type, source, count, sample_msg=''):
+    """Send aggregated alert when threshold reached (v2 alert logic)."""
+    key = f'{error_type}:{source}'
+    now = time.time()
+    last_sent = _alert_sent_windows.get(key, 0)
+    if now - last_sent < _ALERT_WINDOW_SEC:
+        return  # already sent in this window
+    _alert_sent_windows[key] = now
+
+    import urllib.parse, urllib.request
+    text = (
+        f"[news_bot] 에러 집중 발생\n"
+        f"- 유형: {error_type}\n"
+        f"- 소스: {source}\n"
+        f"- 10분내 횟수: {count}\n"
+        f"- 샘플: {sample_msg[:100]}"
+    )
+    try:
+        token, chat_id = _load_tg_config()
+        if token and chat_id:
+            url = f'https://api.telegram.org/bot{token}/sendMessage'
+            data = urllib.parse.urlencode({'chat_id': chat_id, 'text': text}).encode('utf-8')
+            req = urllib.request.Request(url, data=data, method='POST')
+            urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
+def _check_error_threshold(error_type, source, msg=''):
+    """Track error and fire alert if threshold reached in 10-min window.
+    Gated by ff_news_alert_throttle_v2; fallback to old 30-min cooldown if disabled.
+    """
+    _ff_v2 = True
+    try:
+        import feature_flags
+        _ff_v2 = feature_flags.is_enabled('ff_news_alert_throttle_v2')
+    except Exception:
+        pass
+    if not _ff_v2:
+        # Fallback to legacy: single-alert via _send_error_alert
+        _send_error_alert(source, '', Exception(f'{error_type}: {msg}'),
+                          dedup_key=f'{error_type}:{source}')
+        return
+    key = f'{error_type}:{source}'
+    now = time.time()
+    if key not in _error_windows:
+        _error_windows[key] = deque(maxlen=200)
+    _error_windows[key].append(now)
+    # Prune old entries
+    cutoff = now - _ALERT_WINDOW_SEC
+    while _error_windows[key] and _error_windows[key][0] < cutoff:
+        _error_windows[key].popleft()
+    count = len(_error_windows[key])
+    if count >= _ALERT_THRESHOLD_COUNT:
+        _send_threshold_alert(error_type, source, count, msg)
+
+
+def _record_raw_error(db, source, error_type, raw_title='', raw_url='', exception_msg=''):
+    """Insert a row into news_raw_errors for parse/fetch failure tracking."""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                INSERT INTO news_raw_errors (source, error_type, raw_title, raw_url, exception_msg)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (source, error_type, (raw_title or '')[:500],
+                  (raw_url or '')[:500], (exception_msg or '')[:500]))
+    except Exception:
+        pass  # never block main flow
+
+
+def _flush_stats():
+    """Write stats to JSON file for /debug news_health to read."""
+    from datetime import datetime, timezone
+    _stats['tick_ts'] = datetime.now(timezone.utc).isoformat()
+    _stats['parse_fail_10m'] = _count_events_10m('parse_fail')
+    _stats['fetch_fail_10m'] = _count_events_10m('fetch_fail')
+    _stats['duplicate_ignored_10m'] = _count_events_10m('duplicate_ignored')
+    _stats['insert_ok_10m'] = _count_events_10m('insert_ok')
+    try:
+        with open(_STATS_FILE, 'w') as f:
+            json.dump(_stats, f, default=str)
+    except Exception:
+        pass
+
+
+def _sanitize_title(raw_title):
+    """Strip, HTML unescape, whitespace collapse."""
+    if not raw_title:
+        return ''
+    t = html.unescape(raw_title).strip()
+    t = re.sub(r'\s+', ' ', t)
+    return t
+
 
 def log(msg):
     print(msg, flush=True)
@@ -511,6 +641,7 @@ def main():
         log("[news_bot] TICK")
         inserted = 0
         db_errors = 0
+        duplicate_ignored = 0
         circuit_break = False
         skipped_gossip = 0
         skipped_low_relevance = 0
@@ -526,18 +657,37 @@ def main():
                 feed = feedparser.parse(url, agent=FEED_AGENT)
                 entries = getattr(feed, "entries", []) or []
                 log(f"[news_bot] feed={source} entries={len(entries)}")
-            except Exception:
+                _record_event('fetch_ok')
+                _stats['last_fetch_ok_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception as _feed_err:
                 log("[news_bot] ERROR feed parse")
                 log(traceback.format_exc())
+                _record_event('fetch_fail')
+                _record_raw_error(db, source, 'feed_parse_error',
+                                  exception_msg=str(_feed_err)[:200])
+                _check_error_threshold('feed_parse', source, str(_feed_err))
                 continue
 
             # Batch URL dedup: collect all URLs first, then check DB in one query
             _feed_entries = []
             for e in entries[:20]:
-                title = getattr(e, "title", "") or ""
-                link = getattr(e, "link", "") or ""
-                if title and link:
-                    _feed_entries.append((title, link))
+                raw_title = getattr(e, "title", "") or ""
+                link = (getattr(e, "link", "") or "").strip()
+                # Input validation: sanitize title, validate link
+                title = _sanitize_title(raw_title)
+                if not title or len(title) < 3:
+                    log(f"[news_bot] DEBUG skip bad title: {raw_title[:60]!r}")
+                    _record_event('parse_fail')
+                    _record_raw_error(db, source, 'bad_title',
+                                      raw_title=raw_title, raw_url=link)
+                    continue
+                if not link or not link.startswith('http'):
+                    log(f"[news_bot] DEBUG skip bad link: {link[:60]!r}")
+                    _record_event('parse_fail')
+                    _record_raw_error(db, source, 'bad_link',
+                                      raw_title=title, raw_url=link)
+                    continue
+                _feed_entries.append((title, link))
             _existing_urls = set()
             if _feed_entries:
                 try:
@@ -733,6 +883,8 @@ def main():
                             _trading_impact_weight,
                         ))
                     inserted += 1
+                    _record_event('insert_ok')
+                    _stats['last_insert_ok_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
 
                 except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
                     db_errors += 1
@@ -759,30 +911,38 @@ def main():
                     continue
 
                 except psycopg2.DataError as de:
-                    log(f"[news_bot] DataError (skip): {de}")
-                    _send_error_alert(source, title, de)
+                    log(f"[news_bot] WARN DataError (skip): {de}")
+                    _record_event('parse_fail')
+                    _record_raw_error(db, source, 'DataError',
+                                      raw_title=title, raw_url=link,
+                                      exception_msg=str(de)[:200])
+                    _check_error_threshold('DataError', source, str(de))
                     db_errors += 1
                     continue
 
                 except psycopg2.IntegrityError as ie:
-                    # URL/title+source duplicate → normal, skip silently
-                    ie_str = str(ie).lower()
-                    is_known_dup = 'unique' in ie_str or 'duplicate' in ie_str or 'url' in ie_str
-                    if is_known_dup:
-                        log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
-                    else:
-                        log(f"[news_bot] IntegrityError (skip): {ie}")
-                        _send_error_alert(source, title, ie)
-                        db_errors += 1
+                    # ALL IntegrityErrors = duplicate = normal operation
+                    # Never send Telegram alert, never increment db_errors
+                    duplicate_ignored += 1
+                    _record_event('duplicate_ignored')
+                    log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
                     continue
 
                 except Exception as ex:
                     log(f"[news_bot] ERROR insert: {ex}")
                     log(traceback.format_exc())
+                    _record_event('parse_fail')
+                    _stats['last_error_type'] = type(ex).__name__
+                    _stats['last_error_source'] = source
+                    _stats['last_error_msg'] = str(ex)[:200]
+                    _stats['last_error_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                    _check_error_threshold(type(ex).__name__, source, str(ex))
                     db_errors += 1
                     continue
 
-        log(f"[news_bot] DONE inserted={inserted}, skipped_hard_exclude={skipped_hard_exclude}, skipped_gossip={skipped_gossip}, skipped_keyword_and={skipped_keyword_and}, skipped_low_relevance={skipped_low_relevance}, db_errors={db_errors}, sleep={NEWS_POLL_SEC}s")
+        # Flush stats file each tick
+        _flush_stats()
+        log(f"[news_bot] DONE inserted={inserted}, duplicate_ignored={duplicate_ignored}, skipped_hard_exclude={skipped_hard_exclude}, skipped_gossip={skipped_gossip}, skipped_keyword_and={skipped_keyword_and}, skipped_low_relevance={skipped_low_relevance}, db_errors={db_errors}, sleep={NEWS_POLL_SEC}s")
         time.sleep(NEWS_POLL_SEC)
 
 if __name__ == "__main__":

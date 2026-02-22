@@ -647,26 +647,55 @@ def fetch_execution_context(cur=None):
 
 
 def fetch_trade_switch_status():
-    """Return structured trade_switch status dict."""
+    """Return structured trade_switch status dict with enriched fields."""
     conn = None
     try:
         conn = _db()
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT enabled, updated_at FROM trade_switch ORDER BY id DESC LIMIT 1;")
-            row = cur.fetchone()
-            if row:
-                return {
-                    'entry_enabled': bool(row[0]),
-                    'exit_enabled': True,
-                    'updated_at': str(row[1])[:19] if row[1] else '',
-                    'reason': '' if row[0] else 'trade_switch OFF',
-                }
+            # Try enriched query first (v2 columns)
+            try:
+                cur.execute("""
+                    SELECT enabled, updated_at, off_reason, last_changed_by,
+                           last_auto_recover_ts, last_disable_ts
+                    FROM trade_switch ORDER BY id DESC LIMIT 1;
+                """)
+                row = cur.fetchone()
+                if row:
+                    return {
+                        'entry_enabled': bool(row[0]),
+                        'exit_enabled': True,
+                        'updated_at': str(row[1])[:19] if row[1] else '',
+                        'reason': '' if row[0] else (row[2] or 'trade_switch OFF'),
+                        'off_reason': row[2] or '',
+                        'last_changed_by': row[3] or 'unknown',
+                        'last_auto_recover_ts': str(row[4])[:19] if row[4] else '',
+                        'last_disable_ts': str(row[5])[:19] if row[5] else '',
+                    }
+            except Exception:
+                # Fallback: old schema without v2 columns
+                cur.execute(
+                    "SELECT enabled, updated_at FROM trade_switch ORDER BY id DESC LIMIT 1;")
+                row = cur.fetchone()
+                if row:
+                    return {
+                        'entry_enabled': bool(row[0]),
+                        'exit_enabled': True,
+                        'updated_at': str(row[1])[:19] if row[1] else '',
+                        'reason': '' if row[0] else 'trade_switch OFF',
+                        'off_reason': '',
+                        'last_changed_by': 'unknown',
+                        'last_auto_recover_ts': '',
+                        'last_disable_ts': '',
+                    }
             return {
                 'entry_enabled': None,
                 'exit_enabled': True,
                 'updated_at': '',
                 'reason': 'trade_switch 레코드 없음',
+                'off_reason': '',
+                'last_changed_by': '',
+                'last_auto_recover_ts': '',
+                'last_disable_ts': '',
             }
     except Exception as e:
         _log(f'fetch_trade_switch_status error: {e}')
@@ -675,6 +704,10 @@ def fetch_trade_switch_status():
             'exit_enabled': True,
             'updated_at': '',
             'reason': f'error: {e}',
+            'off_reason': '',
+            'last_changed_by': '',
+            'last_auto_recover_ts': '',
+            'last_disable_ts': '',
         }
     finally:
         if conn:

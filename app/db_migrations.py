@@ -1672,6 +1672,10 @@ def run_all():
             # Adaptive v2.1: state table + entry_mode column
             ensure_adaptive_layer_state(cur)
             ensure_execution_log_entry_mode(cur)
+            # trade_switch v2: last_changed_by, last_auto_recover_ts, last_disable_ts
+            ensure_trade_switch_v2_columns(cur)
+            # news_raw_errors table for parse failure tracking
+            ensure_news_raw_errors_table(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -2075,6 +2079,32 @@ def ensure_execution_log_entry_mode(cur):
         ALTER TABLE execution_log ADD COLUMN IF NOT EXISTS entry_mode TEXT;
     """)
     _log('ensure_execution_log_entry_mode done')
+
+
+def ensure_trade_switch_v2_columns(cur):
+    """Add last_changed_by, last_auto_recover_ts, last_disable_ts to trade_switch."""
+    cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS last_changed_by TEXT DEFAULT 'unknown';")
+    cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS last_auto_recover_ts TIMESTAMPTZ DEFAULT NULL;")
+    cur.execute("ALTER TABLE trade_switch ADD COLUMN IF NOT EXISTS last_disable_ts TIMESTAMPTZ DEFAULT NULL;")
+    _log('ensure_trade_switch_v2_columns done')
+
+
+def ensure_news_raw_errors_table(cur):
+    """news_raw_errors — parse/fetch failure recording for news_bot."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.news_raw_errors (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            source TEXT,
+            error_type TEXT,
+            raw_title TEXT,
+            raw_url TEXT,
+            raw_excerpt TEXT,
+            exception_msg TEXT
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_news_raw_errors_ts ON news_raw_errors(ts DESC);")
+    _log('ensure_news_raw_errors_table done')
 
 
 if __name__ == '__main__':

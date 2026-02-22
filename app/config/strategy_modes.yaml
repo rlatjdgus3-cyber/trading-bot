@@ -177,3 +177,7 @@ feature_flags:
   ff_regime_risk_v3: true
   ff_loss_streak_cooldown: true
   ff_adaptive_layers: true
+  ff_trade_switch_reason_line: true
+  ff_news_alert_throttle_v2: true
+  ff_news_health_command: true
+  ff_news_upsert_enabled: true

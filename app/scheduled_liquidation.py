@@ -360,15 +360,12 @@ def _sync_position_state(cur):
 def set_trade_switch(enabled):
     """Update trade_switch table with off_reason for auto-recovery."""
     def _do(conn, cur):
+        import trade_switch_recovery
         if not enabled:
-            import trade_switch_recovery
-            trade_switch_recovery.set_off_with_reason(cur, 'scheduled_settlement')
+            trade_switch_recovery.set_off_with_reason(cur, 'scheduled_settlement',
+                                                       changed_by='scheduled_settlement')
         else:
-            cur.execute(
-                "UPDATE trade_switch SET enabled=%s, off_reason=NULL, "
-                "manual_off_until=NULL, updated_at=NOW() "
-                "WHERE id = (SELECT id FROM trade_switch ORDER BY id DESC LIMIT 1);",
-                (enabled,))
+            trade_switch_recovery.set_on(cur, changed_by='scheduled_settlement')
     _db_with_retry(_do)
 
 
