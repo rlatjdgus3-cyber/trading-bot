@@ -372,6 +372,7 @@ def compute_modifier(total_score, features, v3_regime, price, regime_ctx=None):
                 direction = 'LONG' if total_score >= 0 else 'SHORT'
                 l2 = compute_layer2(entry_mode, direction, regime_class,
                                     features, regime_ctx or {}, cfg)
+                _log(f'L2 check: mode={entry_mode} dir={direction} blocked={l2.get("l2_meanrev_blocked")}')
                 if l2.get('l2_meanrev_blocked'):
                     dryrun = _is_adaptive_dryrun()
                     reason_str = l2.get('l2_block_reason', 'L2 MeanRev blocked')
