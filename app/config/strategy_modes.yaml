@@ -145,7 +145,7 @@ strategy_v3:
   loss_streak_slice_mult_3: 0.5
 
   # Adaptive Layers v2.1
-  adaptive_dryrun: true
+  adaptive_dryrun: false
   adaptive_l1_streak_penalty_3: 0.70
   adaptive_l1_cooldown_5_sec: 7200
   adaptive_l1_global_wr_trades: 20
@@ -176,4 +176,4 @@ feature_flags:
   ff_strict_breakout: true
   ff_regime_risk_v3: true
   ff_loss_streak_cooldown: true
-  ff_adaptive_layers: false
+  ff_adaptive_layers: true
