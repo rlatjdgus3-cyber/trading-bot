@@ -57,10 +57,10 @@ def check_shock(cur):
 
         # Fetch recent 1m candles from market_ohlcv
         cur.execute("""
-            SELECT open_time, open, high, low, close
-            FROM market_ohlcv
-            WHERE symbol = %s AND timeframe = '1m'
-            ORDER BY open_time DESC
+            SELECT ts, o, h, l, c
+            FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC
             LIMIT %s;
         """, (SYMBOL, lookback + 10))  # extra for ATR calc
         rows = cur.fetchall()

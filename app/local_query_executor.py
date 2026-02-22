@@ -5568,13 +5568,15 @@ def _debug_risk_snapshot(_text=None):
                 # 7. Adaptive layers summary
                 try:
                     from strategy_v3 import adaptive_v3
-                    state = adaptive_v3._get_state()
+                    state = adaptive_v3._state
                     lines.append(f"\nAdaptive State:")
-                    for k in ('combined_penalty', 'l1_cooldown_active',
-                              'l1_global_wr_block', 'l2_meanrev_blocked',
-                              'l3_add_blocked', 'l4_entry_blocked'):
+                    for k in ('global_wr_penalty_active', 'mode_cooldowns',
+                              'anti_paralysis_stage', 'warn_since_ts'):
                         if k in state:
-                            lines.append(f"  {k}: {state[k]}")
+                            val = state[k]
+                            if isinstance(val, dict) and not val:
+                                val = '{}'
+                            lines.append(f"  {k}: {val}")
                 except Exception as e:
                     lines.append(f"\nAdaptive: error ({e})")
 

@@ -412,17 +412,15 @@ def check_add_upnl_gate(cur, symbol='BTC/USDT:USDT'):
         if entry <= 0:
             return (True, 0.0, 'invalid entry')
 
-        import exchange_reader
-        bal = exchange_reader.fetch_ticker_price(symbol)
-        price = bal if isinstance(bal, (int, float)) else 0
-        if price <= 0:
-            # Fallback: try market_data_cache
-            cur.execute("""
-                SELECT price FROM market_data_cache
-                WHERE symbol = %s ORDER BY ts DESC LIMIT 1;
-            """, (symbol,))
-            prow = cur.fetchone()
-            price = float(prow[0]) if prow and prow[0] else 0
+        # Get current price from market_ohlcv (most reliable DB source)
+        price = 0
+        cur.execute("""
+            SELECT c FROM market_ohlcv
+            WHERE symbol = %s
+            ORDER BY ts DESC LIMIT 1;
+        """, (symbol,))
+        prow = cur.fetchone()
+        price = float(prow[0]) if prow and prow[0] else 0
         if price <= 0:
             return (True, 0.0, 'price unavailable (FAIL-OPEN)')
 
