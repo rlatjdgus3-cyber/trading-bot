@@ -320,6 +320,30 @@ def compute_total(cur=None, exchange=None):
         news_evt_result = news_event_scorer.compute(cur)
         news_event_score = news_evt_result.get('score', 0)
 
+        # P2-D: News freshness check — stale news (> 1h) → score=0
+        try:
+            cur.execute("""
+                SELECT max(ts) FROM news
+                WHERE ts >= now() - interval '2 hours';
+            """)
+            _nrow = cur.fetchone()
+            _latest_news_ts = _nrow[0] if _nrow and _nrow[0] else None
+            if _latest_news_ts is None:
+                _log('news_freshness: no news in 2h → news_event_score=0')
+                news_event_score = 0
+                news_evt_result['freshness_override'] = 'stale_2h'
+            else:
+                import datetime
+                _age = datetime.datetime.now(datetime.timezone.utc) - _latest_news_ts.replace(
+                    tzinfo=datetime.timezone.utc) if _latest_news_ts.tzinfo is None else \
+                    datetime.datetime.now(datetime.timezone.utc) - _latest_news_ts
+                if _age.total_seconds() > 3600:
+                    _log(f'news_freshness: latest news {_age.total_seconds()/60:.0f}m old → score=0')
+                    news_event_score = 0
+                    news_evt_result['freshness_override'] = f'stale_{_age.total_seconds()/60:.0f}m'
+        except Exception as _nf_err:
+            _log(f'news_freshness check error (FAIL-OPEN): {_nf_err}')
+
         # ── BTC-QQQ regime correlation → dynamic NEWS_EVENT weight ──
         btc_qqq_regime = None
         try:

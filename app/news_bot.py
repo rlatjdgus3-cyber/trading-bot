@@ -687,286 +687,299 @@ def main():
                 _check_error_threshold('feed_parse', source, str(_feed_err))
                 continue
 
-            # Batch URL dedup: collect all URLs first, then check DB in one query
-            _feed_entries = []
-            for e in entries[:20]:
-                raw_title = getattr(e, "title", "") or ""
-                link = (getattr(e, "link", "") or "").strip()
-                # Input validation: sanitize title, validate link
-                title = _sanitize_title(raw_title)
-                if not title or len(title) < 3:
-                    log(f"[news_bot] DEBUG skip bad title: {raw_title[:60]!r}")
-                    _record_event('parse_fail')
-                    _record_raw_error(db, source, 'bad_title',
-                                      raw_title=raw_title, raw_url=link)
-                    continue
-                if not link or not link.startswith('http'):
-                    log(f"[news_bot] DEBUG skip bad link: {link[:60]!r}")
-                    _record_event('parse_fail')
-                    _record_raw_error(db, source, 'bad_link',
-                                      raw_title=title, raw_url=link)
-                    continue
-                _feed_entries.append((title, link))
-            _existing_urls = set()
-            if _feed_entries:
-                try:
-                    _all_urls = [link for _, link in _feed_entries]
-                    with db.cursor() as cur:
-                        cur.execute("SELECT url FROM public.news WHERE url = ANY(%s)", (_all_urls,))
-                        _existing_urls = {r[0] for r in cur.fetchall()}
-                except Exception:
-                    pass  # fallback: treat all as new
-
-            for title, link in _feed_entries:
-                if link in _existing_urls:
-                    continue
-
-                try:
-
-                    # 2) 하드 제외 패턴 (GPT 호출 전)
-                    if _is_hard_excluded(title):
-                        skipped_hard_exclude += 1
+            # P2-B: per-feed circuit breaker — isolate each feed's entry processing
+            try:
+                # Batch URL dedup: collect all URLs first, then check DB in one query
+                _feed_entries = []
+                for e in entries[:20]:
+                    raw_title = getattr(e, "title", None)
+                    link = (getattr(e, "link", "") or "").strip()
+                    # Input validation: sanitize title, validate link
+                    title = _sanitize_title(raw_title)
+                    # P2-B: title validation — skip None, empty, too short, or >200 chars
+                    if not title or len(title) < 3 or len(title) > 200:
+                        log(f"[news_bot] DEBUG skip bad title (len={len(title) if title else 0}): {(raw_title or '')[:60]!r}")
+                        _record_event('parse_fail')
+                        _record_raw_error(db, source, 'bad_title',
+                                          raw_title=(raw_title or '')[:200], raw_url=link)
                         continue
-
-                    # 3) 가십/노이즈 하드 필터 (GPT 호출 전)
-                    if _is_gossip(title):
-                        skipped_gossip += 1
+                    if not link or not link.startswith('http'):
+                        log(f"[news_bot] DEBUG skip bad link: {link[:60]!r}")
+                        _record_event('parse_fail')
+                        _record_raw_error(db, source, 'bad_link',
+                                          raw_title=title, raw_url=link)
                         continue
-
-                    # 4) 소스 티어
-                    source_tier = _get_source_tier(source)
-
-                    # 5) AND-기반 키워드 체크 (crypto 피드는 바이패스)
-                    if not worth_llm(title, active_keywords, source):
-                        skipped_keyword_and += 1
-                        continue
-
-                    # 6) GPT 분류
-                    impact, direction, summary, title_ko, relevance = 0, "neutral", "", "", "MED"
-                    tier, rel_score = "UNKNOWN", 0.0
-                    topic_class, asset_relevance = "noise", "NONE"
-                    if client:
-                        try:
-                            impact, direction, summary, title_ko, relevance, tier, rel_score, topic_class, asset_relevance = llm_analyze(client, title)
-                        except Exception as llm_err:
-                            log(f"[news_bot] LLM error: {llm_err}")
-
-                    # 7) 소스 가중치 기반 티어 캡 (weight < 0.6 → TIER3)
-                    _DENY_THRESHOLD = 0.60
+                    _feed_entries.append((title, link))
+                _existing_urls = set()
+                if _feed_entries:
                     try:
-                        _sw = _ncc.get_source_weight(source)
-                        _DENY_THRESHOLD = _ncc.DENY_SOURCE_WEIGHT_THRESHOLD
+                        _all_urls = [link for _, link in _feed_entries]
+                        with db.cursor() as cur:
+                            cur.execute("SELECT url FROM public.news WHERE url = ANY(%s)", (_all_urls,))
+                            _existing_urls = {r[0] for r in cur.fetchall()}
                     except Exception:
-                        _sw = 0.55 if source_tier == 'REFERENCE_ONLY' else 0.70
-                    if _sw < _DENY_THRESHOLD and tier in ('TIER1', 'TIER2'):
-                        tier = 'TIER3'
+                        pass  # fallback: treat all as new
 
-                    # 8) 유효 티어 가드
-                    valid_tiers = {'TIER1', 'TIER2', 'TIER3', 'TIERX'}
-                    if tier not in valid_tiers:
-                        tier = 'UNKNOWN'
+                for title, link in _feed_entries:
+                    if link in _existing_urls:
+                        continue
 
-                    # 9) exclusion_reason — v2 three-condition deny
-                    exclusion_reason = None
-                    _low_tier = tier in ('TIER3', 'TIERX')
-                    _low_rel = (rel_score > 0 and rel_score < 0.55) or relevance in ('GOSSIP', 'LOW')
-                    _low_src = _sw < _DENY_THRESHOLD  # from step 7
-
-                    if tier == 'TIERX':
-                        exclusion_reason = 'TIERX: noise/column/stock_pick'
-                    elif _low_tier and _low_rel and _low_src:
-                        exclusion_reason = f'triple_low: tier={tier} rel={rel_score:.2f} w={_sw:.2f}'
-
-                    # 제외된 뉴스도 DB에 저장 (추적용), 카운터 증가
-                    if exclusion_reason:
-                        skipped_low_relevance += 1
-
-                    kw = extract_keywords(title, active_keywords)
-
-                    # 9.5) Shadow classifier — preview_classify (two-tier allow)
-                    allow_storage = False
-                    allow_trading = False
-                    _shadow = {}
                     try:
-                        _shadow = _ncc.preview_classify(
-                            title, source, impact,
-                            summary=summary or '', title_ko=title_ko or '')
-                        # If GPT returned generic/noise topic, use shadow's detailed classification
-                        _shadow_topic_preview = _shadow.get('topic_class_preview', 'unclassified')
-                        if _shadow_topic_preview not in ('unclassified', '', None):
-                            if topic_class in ('noise', 'macro', '', None):
-                                # Normalize shadow enum → GPT enum for consistency
-                                topic_class = _SHADOW_TO_GPT_CATEGORY.get(
-                                    _shadow_topic_preview, _shadow_topic_preview)
-                        # If GPT didn't assign tier, use shadow
-                        if tier in ('UNKNOWN', None) and _shadow.get('tier_preview'):
-                            tier = _shadow['tier_preview']
-                        # If relevance_score is missing, use shadow
-                        if (not rel_score or rel_score <= 0) and _shadow.get('relevance_score_preview'):
-                            rel_score = _shadow['relevance_score_preview']
-                        # Two-tier allow decisions
-                        allow_storage = _shadow.get('allow_for_storage', False)
-                        allow_trading = _shadow.get('allow_for_trading', False)
-                    except Exception:
-                        pass  # shadow classifier failure should never block insertion
 
-                    # 9.6) Scandal confirmation gate
-                    _shadow_topic = _shadow.get('topic_class_preview', '')
-                    _scandal_topic = _shadow_topic if _shadow_topic == 'US_SCANDAL_LEGAL' else (
-                        topic_class if topic_class == 'US_SCANDAL_LEGAL' else '')
-                    if _scandal_topic == 'US_SCANDAL_LEGAL':
-                        _scandal_cur = None
-                        try:
+                        # 2) 하드 제외 패턴 (GPT 호출 전)
+                        if _is_hard_excluded(title):
+                            skipped_hard_exclude += 1
+                            continue
+
+                        # 3) 가십/노이즈 하드 필터 (GPT 호출 전)
+                        if _is_gossip(title):
+                            skipped_gossip += 1
+                            continue
+
+                        # 4) 소스 티어
+                        source_tier = _get_source_tier(source)
+
+                        # 5) AND-기반 키워드 체크 (crypto 피드는 바이패스)
+                        if not worth_llm(title, active_keywords, source):
+                            skipped_keyword_and += 1
+                            continue
+
+                        # 6) GPT 분류
+                        impact, direction, summary, title_ko, relevance = 0, "neutral", "", "", "MED"
+                        tier, rel_score = "UNKNOWN", 0.0
+                        topic_class, asset_relevance = "noise", "NONE"
+                        if client:
                             try:
-                                _scandal_cur = db.cursor()
-                            except Exception:
-                                pass
-                            _scandal = _ncc.scandal_confirmation_check(
-                                'US_SCANDAL_LEGAL', title, source, impact,
-                                db_cursor=_scandal_cur)
-                            if not _scandal['confirmed']:
-                                allow_trading = False
-                                exclusion_reason = exclusion_reason or f"scandal_unconfirmed: {_scandal['reason']}"
-                            if _scandal.get('impact_cap') and impact > _scandal['impact_cap']:
-                                impact = _scandal['impact_cap']
+                                impact, direction, summary, title_ko, relevance, tier, rel_score, topic_class, asset_relevance = llm_analyze(client, title)
+                            except Exception as llm_err:
+                                log(f"[news_bot] LLM error: {llm_err}")
+
+                        # 7) 소스 가중치 기반 티어 캡 (weight < 0.6 → TIER3)
+                        _DENY_THRESHOLD = 0.60
+                        try:
+                            _sw = _ncc.get_source_weight(source)
+                            _DENY_THRESHOLD = _ncc.DENY_SOURCE_WEIGHT_THRESHOLD
                         except Exception:
-                            pass
-                        finally:
-                            if _scandal_cur:
+                            _sw = 0.55 if source_tier == 'REFERENCE_ONLY' else 0.70
+                        if _sw < _DENY_THRESHOLD and tier in ('TIER1', 'TIER2'):
+                            tier = 'TIER3'
+
+                        # 8) 유효 티어 가드
+                        valid_tiers = {'TIER1', 'TIER2', 'TIER3', 'TIERX'}
+                        if tier not in valid_tiers:
+                            tier = 'UNKNOWN'
+
+                        # 9) exclusion_reason — v2 three-condition deny
+                        exclusion_reason = None
+                        _low_tier = tier in ('TIER3', 'TIERX')
+                        _low_rel = (rel_score > 0 and rel_score < 0.55) or relevance in ('GOSSIP', 'LOW')
+                        _low_src = _sw < _DENY_THRESHOLD  # from step 7
+
+                        if tier == 'TIERX':
+                            exclusion_reason = 'TIERX: noise/column/stock_pick'
+                        elif _low_tier and _low_rel and _low_src:
+                            exclusion_reason = f'triple_low: tier={tier} rel={rel_score:.2f} w={_sw:.2f}'
+
+                        # 제외된 뉴스도 DB에 저장 (추적용), 카운터 증가
+                        if exclusion_reason:
+                            skipped_low_relevance += 1
+
+                        kw = extract_keywords(title, active_keywords)
+
+                        # 9.5) Shadow classifier — preview_classify (two-tier allow)
+                        allow_storage = False
+                        allow_trading = False
+                        _shadow = {}
+                        try:
+                            _shadow = _ncc.preview_classify(
+                                title, source, impact,
+                                summary=summary or '', title_ko=title_ko or '')
+                            # If GPT returned generic/noise topic, use shadow's detailed classification
+                            _shadow_topic_preview = _shadow.get('topic_class_preview', 'unclassified')
+                            if _shadow_topic_preview not in ('unclassified', '', None):
+                                if topic_class in ('noise', 'macro', '', None):
+                                    # Normalize shadow enum → GPT enum for consistency
+                                    topic_class = _SHADOW_TO_GPT_CATEGORY.get(
+                                        _shadow_topic_preview, _shadow_topic_preview)
+                            # If GPT didn't assign tier, use shadow
+                            if tier in ('UNKNOWN', None) and _shadow.get('tier_preview'):
+                                tier = _shadow['tier_preview']
+                            # If relevance_score is missing, use shadow
+                            if (not rel_score or rel_score <= 0) and _shadow.get('relevance_score_preview'):
+                                rel_score = _shadow['relevance_score_preview']
+                            # Two-tier allow decisions
+                            allow_storage = _shadow.get('allow_for_storage', False)
+                            allow_trading = _shadow.get('allow_for_trading', False)
+                        except Exception:
+                            pass  # shadow classifier failure should never block insertion
+
+                        # 9.6) Scandal confirmation gate
+                        _shadow_topic = _shadow.get('topic_class_preview', '')
+                        _scandal_topic = _shadow_topic if _shadow_topic == 'US_SCANDAL_LEGAL' else (
+                            topic_class if topic_class == 'US_SCANDAL_LEGAL' else '')
+                        if _scandal_topic == 'US_SCANDAL_LEGAL':
+                            _scandal_cur = None
+                            try:
                                 try:
-                                    _scandal_cur.close()
+                                    _scandal_cur = db.cursor()
                                 except Exception:
                                     pass
+                                _scandal = _ncc.scandal_confirmation_check(
+                                    'US_SCANDAL_LEGAL', title, source, impact,
+                                    db_cursor=_scandal_cur)
+                                if not _scandal['confirmed']:
+                                    allow_trading = False
+                                    exclusion_reason = exclusion_reason or f"scandal_unconfirmed: {_scandal['reason']}"
+                                if _scandal.get('impact_cap') and impact > _scandal['impact_cap']:
+                                    impact = _scandal['impact_cap']
+                            except Exception:
+                                pass
+                            finally:
+                                if _scandal_cur:
+                                    try:
+                                        _scandal_cur.close()
+                                    except Exception:
+                                        pass
 
-                    # 9.7) BTC keyword fallback for still-unclassified items
-                    if topic_class in ('unclassified', 'noise', '', None):
-                        _btc_kws = {'bitcoin', 'btc', 'crypto', 'cryptocurrency',
-                                    'blockchain', 'halving', 'mining', 'defi', 'exchange'}
-                        title_lower = (title or '').lower()
-                        if any(kw in title_lower for kw in _btc_kws):
-                            topic_class = 'CRYPTO_GENERAL'
-                            if not allow_storage:
-                                allow_storage = True
+                        # 9.7) BTC keyword fallback for still-unclassified items
+                        if topic_class in ('unclassified', 'noise', '', None):
+                            _btc_kws = {'bitcoin', 'btc', 'crypto', 'cryptocurrency',
+                                        'blockchain', 'halving', 'mining', 'defi', 'exchange'}
+                            title_lower = (title or '').lower()
+                            if any(kw in title_lower for kw in _btc_kws):
+                                topic_class = 'CRYPTO_GENERAL'
+                                if not allow_storage:
+                                    allow_storage = True
 
-                    # 10) Compute trading_impact_weight = source_weight * relevance_score
-                    try:
-                        _src_w = _ncc.get_source_weight(source)
-                        _trading_impact_weight = round(_src_w * (rel_score or 0), 4)
-                    except Exception:
-                        _trading_impact_weight = 0
+                        # 10) Compute trading_impact_weight = source_weight * relevance_score
+                        try:
+                            _src_w = _ncc.get_source_weight(source)
+                            _trading_impact_weight = round(_src_w * (rel_score or 0), 4)
+                        except Exception:
+                            _trading_impact_weight = 0
 
-                    # 11) DB INSERT (tier, relevance_score, source_tier, exclusion_reason, topic_class, asset_relevance, allow_storage, allow_trading, trading_impact_weight)
-                    with db.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO public.news(source, title, url, summary, impact_score,
-                                                    keywords, title_ko, tier, relevance_score,
-                                                    source_tier, exclusion_reason,
-                                                    topic_class, asset_relevance,
-                                                    allow_storage, allow_trading,
-                                                    trading_impact_weight)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (url) DO UPDATE SET
-                                summary = EXCLUDED.summary,
-                                impact_score = EXCLUDED.impact_score,
-                                keywords = EXCLUDED.keywords,
-                                title_ko = EXCLUDED.title_ko,
-                                tier = EXCLUDED.tier,
-                                relevance_score = EXCLUDED.relevance_score,
-                                source_tier = EXCLUDED.source_tier,
-                                exclusion_reason = EXCLUDED.exclusion_reason,
-                                topic_class = EXCLUDED.topic_class,
-                                asset_relevance = EXCLUDED.asset_relevance,
-                                allow_storage = EXCLUDED.allow_storage,
-                                allow_trading = EXCLUDED.allow_trading,
-                                trading_impact_weight = EXCLUDED.trading_impact_weight
-                            WHERE EXCLUDED.impact_score >= COALESCE(news.impact_score, 0)
-                               OR news.tier IS NULL
-                               OR news.topic_class IS NULL
-                               OR news.topic_class IN ('macro', 'crypto', 'noise', 'unclassified')
-                        """, (
-                            source,
-                            title,
-                            link,
-                            summary if summary else f"[{direction}]",
-                            int(impact),
-                            kw if kw else None,
-                            title_ko if title_ko else None,
-                            tier,
-                            rel_score if rel_score > 0 else None,
-                            source_tier,
-                            exclusion_reason,
-                            topic_class,
-                            asset_relevance,
-                            allow_storage,
-                            allow_trading,
-                            _trading_impact_weight,
-                        ))
-                    inserted += 1
-                    _record_event('insert_ok')
-                    _stats['last_insert_ok_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                        # 11) DB INSERT (tier, relevance_score, source_tier, exclusion_reason, topic_class, asset_relevance, allow_storage, allow_trading, trading_impact_weight)
+                        with db.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO public.news(source, title, url, summary, impact_score,
+                                                        keywords, title_ko, tier, relevance_score,
+                                                        source_tier, exclusion_reason,
+                                                        topic_class, asset_relevance,
+                                                        allow_storage, allow_trading,
+                                                        trading_impact_weight)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (url) DO UPDATE SET
+                                    summary = EXCLUDED.summary,
+                                    impact_score = EXCLUDED.impact_score,
+                                    keywords = EXCLUDED.keywords,
+                                    title_ko = EXCLUDED.title_ko,
+                                    tier = EXCLUDED.tier,
+                                    relevance_score = EXCLUDED.relevance_score,
+                                    source_tier = EXCLUDED.source_tier,
+                                    exclusion_reason = EXCLUDED.exclusion_reason,
+                                    topic_class = EXCLUDED.topic_class,
+                                    asset_relevance = EXCLUDED.asset_relevance,
+                                    allow_storage = EXCLUDED.allow_storage,
+                                    allow_trading = EXCLUDED.allow_trading,
+                                    trading_impact_weight = EXCLUDED.trading_impact_weight
+                                WHERE EXCLUDED.impact_score >= COALESCE(news.impact_score, 0)
+                                   OR news.tier IS NULL
+                                   OR news.topic_class IS NULL
+                                   OR news.topic_class IN ('macro', 'crypto', 'noise', 'unclassified')
+                            """, (
+                                source,
+                                title,
+                                link,
+                                summary if summary else f"[{direction}]",
+                                int(impact),
+                                kw if kw else None,
+                                title_ko if title_ko else None,
+                                tier,
+                                rel_score if rel_score > 0 else None,
+                                source_tier,
+                                exclusion_reason,
+                                topic_class,
+                                asset_relevance,
+                                allow_storage,
+                                allow_trading,
+                                _trading_impact_weight,
+                            ))
+                        inserted += 1
+                        _record_event('insert_ok')
+                        _stats['last_insert_ok_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
 
-                except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
-                    db_errors += 1
-                    if db_errors <= 1:
-                        log(f"[news_bot] DB 커넥션 오류: {db_err}")
-                        _send_error_alert(source, title, db_err)
-                    try:
-                        db.close()
-                    except Exception:
-                        pass
-                    try:
-                        db = get_conn(autocommit=True)
-                        log("[news_bot] DB 재연결 성공")
-                    except Exception as re_err:
-                        log(f"[news_bot] DB 재연결 실패: {re_err}")
-                        break
-                    # Circuit breaker: too many consecutive DB errors
-                    if db_errors >= MAX_CONSECUTIVE_DB_ERRORS:
-                        backoff = min(MAX_BACKOFF_SEC, BACKOFF_BASE_SEC * (2 ** min(db_errors - MAX_CONSECUTIVE_DB_ERRORS, 5)))
-                        log(f"[news_bot] 서킷브레이커 발동: 연속 DB 오류 {db_errors}회, {backoff}초 대기")
-                        time.sleep(backoff)
-                        circuit_break = True
-                        break
-                    continue
-
-                except psycopg2.DataError as de:
-                    log(f"[news_bot] WARN DataError (skip): {de}")
-                    _record_event('parse_fail')
-                    _record_raw_error(db, source, 'DataError',
-                                      raw_title=title, raw_url=link,
-                                      exception_msg=str(de)[:200])
-                    _check_error_threshold('DataError', source, str(de))
-                    db_errors += 1
-                    continue
-
-                except psycopg2.IntegrityError as ie:
-                    # UniqueViolation (23505) = duplicate = normal operation
-                    if ie.pgcode == '23505':
-                        duplicate_ignored += 1
-                        _record_event('duplicate_ignored')
-                        log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
-                    else:
-                        # Other IntegrityErrors (check constraint, FK, etc.) = real error
-                        log(f"[news_bot] WARN IntegrityError (pgcode={ie.pgcode}): {ie}")
-                        _record_event('parse_fail')
-                        _record_raw_error(db, source, f'IntegrityError_{ie.pgcode}',
-                                          raw_title=title, raw_url=link,
-                                          exception_msg=str(ie)[:200])
-                        _check_error_threshold('IntegrityError', source, str(ie))
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
                         db_errors += 1
-                    continue
+                        if db_errors <= 1:
+                            log(f"[news_bot] DB 커넥션 오류: {db_err}")
+                            _send_error_alert(source, title, db_err)
+                        try:
+                            db.close()
+                        except Exception:
+                            pass
+                        try:
+                            db = get_conn(autocommit=True)
+                            log("[news_bot] DB 재연결 성공")
+                        except Exception as re_err:
+                            log(f"[news_bot] DB 재연결 실패: {re_err}")
+                            break
+                        # Circuit breaker: too many consecutive DB errors
+                        if db_errors >= MAX_CONSECUTIVE_DB_ERRORS:
+                            backoff = min(MAX_BACKOFF_SEC, BACKOFF_BASE_SEC * (2 ** min(db_errors - MAX_CONSECUTIVE_DB_ERRORS, 5)))
+                            log(f"[news_bot] 서킷브레이커 발동: 연속 DB 오류 {db_errors}회, {backoff}초 대기")
+                            time.sleep(backoff)
+                            circuit_break = True
+                            break
+                        continue
 
-                except Exception as ex:
-                    log(f"[news_bot] ERROR insert: {ex}")
-                    log(traceback.format_exc())
-                    _record_event('parse_fail')
-                    _stats['last_error_type'] = type(ex).__name__
-                    _stats['last_error_source'] = source
-                    _stats['last_error_msg'] = str(ex)[:200]
-                    _stats['last_error_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                    _check_error_threshold(type(ex).__name__, source, str(ex))
-                    db_errors += 1
-                    continue
+                    except psycopg2.DataError as de:
+                        log(f"[news_bot] WARN DataError (skip): {de}")
+                        _record_event('parse_fail')
+                        _record_raw_error(db, source, 'DataError',
+                                          raw_title=title, raw_url=link,
+                                          exception_msg=str(de)[:200])
+                        _check_error_threshold('DataError', source, str(de))
+                        db_errors += 1
+                        continue
+
+                    except psycopg2.IntegrityError as ie:
+                        # P2-B verified: UniqueViolation (23505) → pass (no retry)
+                        if ie.pgcode == '23505':
+                            duplicate_ignored += 1
+                            _record_event('duplicate_ignored')
+                            log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
+                        else:
+                            # Other IntegrityErrors (check constraint, FK, etc.) = real error
+                            log(f"[news_bot] WARN IntegrityError (pgcode={ie.pgcode}): {ie}")
+                            _record_event('parse_fail')
+                            _record_raw_error(db, source, f'IntegrityError_{ie.pgcode}',
+                                              raw_title=title, raw_url=link,
+                                              exception_msg=str(ie)[:200])
+                            _check_error_threshold('IntegrityError', source, str(ie))
+                            db_errors += 1
+                        continue
+
+                    except Exception as ex:
+                        log(f"[news_bot] ERROR insert: {ex}")
+                        log(traceback.format_exc())
+                        _record_event('parse_fail')
+                        _stats['last_error_type'] = type(ex).__name__
+                        _stats['last_error_source'] = source
+                        _stats['last_error_msg'] = str(ex)[:200]
+                        _stats['last_error_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                        _check_error_threshold(type(ex).__name__, source, str(ex))
+                        db_errors += 1
+                        continue
+
+            except Exception as _feed_proc_err:
+                # P2-B: per-feed circuit breaker — one feed failure doesn't kill the tick
+                log(f"[news_bot] ERROR processing feed={source}: {_feed_proc_err}")
+                log(traceback.format_exc())
+                _record_event('feed_proc_fail')
+                _record_raw_error(db, source, 'feed_proc_error',
+                                  exception_msg=str(_feed_proc_err)[:200])
+                _check_error_threshold('feed_proc', source, str(_feed_proc_err))
+                continue
 
         # Flush stats file each tick
         _flush_stats()

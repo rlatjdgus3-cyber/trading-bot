@@ -2097,7 +2097,7 @@ _KNOWN_SLASH_COMMANDS = [
     '/account', '/account_exch', '/position_strat', '/risk_config',
     '/snapshot', '/snap', '/fact', '/now', '/close_all', '/force',
     '/detail', '/trade', '/reconcile', '/mctx', '/mode',
-    '/bundle', '/trade_history', '/pnl_recent',
+    '/bundle', '/trade_history', '/pnl_recent', '/supervisor',
     # Korean aliases
     '/포지션', '/주문', '/잔고', '/자산', '/전략포지션', '/리스크', '/risk',
     '/스냅샷', '/팩트', '/전청산', '/서비스', '/상태', '/스코어', '/테스트', '/감사',
@@ -2191,6 +2191,11 @@ _DEBUG_SUBCMDS = {
     'ai_models': 'debug_ai_models',
     'ai': 'debug_ai_models',
     'news_health': 'debug_news_health',
+    # P0-6: Risk debug commands
+    'stop_orders': 'debug_stop_orders',
+    'stops': 'debug_stop_orders',
+    'risk_snapshot': 'debug_risk_snapshot',
+    'risk': 'debug_risk_snapshot',
 }
 
 _DEBUG_HELP = (
@@ -2221,18 +2226,21 @@ _DEBUG_HELP = (
     '  /debug order_throttle — 주문 속도 제한 상태 + 60분 타임라인\n'
     '  /debug ai_models — AI/LLM 모델 구성 + 마지막 호출 정보\n'
     '  /debug news_health — 뉴스 파이프라인 상태/에러 카운트\n'
+    '  /debug stop_orders — 서버사이드 스탑 주문 상태\n'
+    '  /debug risk_snapshot — 리스크 종합 스냅샷\n'
     '  /debug on|off — 디버그 모드 토글\n'
     '\n'
     '  aliases: reaction, coverage, backfill, dryrun, gate,\n'
     '           bf_enable, bf_start, bf_pause, bf_resume, bf_stop, bf_log,\n'
-    '           news_gap, path_sample, path_stats, ai\n'
+    '           news_gap, path_sample, path_stats, ai, stops, risk\n'
     '\n'
     '━━━ 운영 점검 순서 (권장) ━━━\n'
     '1) /debug gate_details force_refresh=true → gate_verdict PASS + required fresh\n'
-    '2) /bundle → 포지션/오더/내부상태 일치 확인\n'
-    '3) /debug news_sample --n=20 → 뉴스 파싱 정상\n'
-    '4) /debug news_filter_stats → allow_trading/allow_storage 비율\n'
-    '5) /debug news_health → 파이프라인 타임스탬프/에러카운트\n'
+    '2) /debug stop_orders → 서버 스탑 SYNCED/MISSING 확인\n'
+    '3) /debug risk_snapshot → 리스크 상태 종합 확인\n'
+    '4) /bundle → 포지션/오더/내부상태 일치 확인\n'
+    '5) /debug news_sample --n=20 → 뉴스 파싱 정상\n'
+    '6) /debug news_health → 파이프라인 타임스탬프/에러카운트\n'
     '\n'
     'ℹ /debug health는 참고용. 매매 판단은 /debug gate_details 우선.\n'
 )
@@ -3161,6 +3169,15 @@ def handle_command(text: str, chat_id: int = 0) -> str:
     # ── Phase 0.7: /trade arm|disarm|auto_apply commands ──
     if t.startswith('/trade ') or t == '/trade':
         return _handle_trade_arm_command(t, chat_id)
+
+    # P3: /supervisor command
+    if t.startswith('/supervisor') or t == '/supervisor':
+        try:
+            import strategy_supervisor
+            return strategy_supervisor.handle_supervisor_command(t) + \
+                _footer('supervisor', 'local', 'local')
+        except Exception as e:
+            return f'⚠ supervisor error: {e}' + _footer('supervisor', 'local', 'local')
 
     # INVARIANT: "/" 로 시작하는 미인식 명령은 chat_agent로 보내지 않음
     if t.startswith('/'):

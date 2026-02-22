@@ -167,6 +167,22 @@ strategy_v3:
   adaptive_anti_paralysis_hours_1: 24
   adaptive_anti_paralysis_hours_2: 36
 
+  # P0-1: SL basis conversion
+  sl_basis: UPNL_PCT           # PRICE_PCT | UPNL_PCT | EQUITY_PCT
+  server_stop_offset_pct: 0.1  # P0-2: server stop 0.1% wider than Python SL
+
+  # P0-4: Shock Guard
+  shock_guard_threshold_pct: 1.5
+  shock_guard_atr_mult: 2.5
+  shock_guard_freeze_sec: 300
+  shock_guard_lookback_candles: 3
+
+  # P1-1: per-mode L1 cooldown (seconds)
+  adaptive_l1_cooldown_5_sec_StaticRange: 7200
+  adaptive_l1_cooldown_5_sec_MeanReversion: 7200
+  adaptive_l1_cooldown_5_sec_TrendFollow: 3600
+  adaptive_l1_cooldown_5_sec_Breakout: 3600
+
 # ── Feature Flags (default OFF = FAIL-CLOSED) ──
 feature_flags:
   ff_order_backoff_v2: true
@@ -181,3 +197,16 @@ feature_flags:
   ff_news_alert_throttle_v2: true
   ff_news_health_command: true
   ff_news_upsert_enabled: true
+  # P0 feature flags
+  ff_sl_basis_conversion: false     # P0-1: SL PRICE→UPNL 전환 (shadow 후 true)
+  ff_server_stop_orders: false      # P0-2: 서버사이드 스탑 주문
+  ff_loss_zone_add_block: true      # P0-3: 손실 중 ADD 차단 (즉시 ON)
+  ff_shock_guard: false             # P0-4: 1m 급변 방어
+  ff_health_entry_gate: true        # P0-5: Health 기반 진입 게이트 (즉시 ON)
+  ff_debug_risk_commands: true      # P0-6: 리스크 디버그 커맨드 (즉시 ON)
+  # P1 feature flags
+  ff_l2_strict_short: false         # P1-2: MeanRev SHORT 강화
+  # P3 feature flags
+  ff_strategy_supervisor: false     # P3-1: 6h 감독 리포트
+  ff_config_versioning: false       # P3-2: 설정 버저닝
+  ff_auto_apply_conservative: false # P3-3: 보수적 자동 적용

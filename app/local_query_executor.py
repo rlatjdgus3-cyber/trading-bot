@@ -124,7 +124,9 @@ def execute(query_type=None, original_text=None):
         'mode_performance': _mode_performance,
         'trade_history': _trade_history,
         'pnl_recent': _pnl_recent,
-        'bundle': _bundle}
+        'bundle': _bundle,
+        'debug_stop_orders': _debug_stop_orders,
+        'debug_risk_snapshot': _debug_risk_snapshot}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -3469,19 +3471,11 @@ def _debug_state(_text=None):
     try:
         conn = _db()
         with conn.cursor() as cur:
-            # trade_switch
+            # trade_switch (P2-A: enhanced format)
             try:
-                cur.execute("""
-                    SELECT enabled, updated_at
-                    FROM trade_switch
-                    ORDER BY id DESC LIMIT 1;
-                """)
-                row = cur.fetchone()
-                if row:
-                    lines.append(f'trade_switch: enabled={row[0]} '
-                                 f'updated_at={str(row[1])[:19] if row[1] else "-"}')
-                else:
-                    lines.append('trade_switch: 레코드 없음')
+                import trade_switch_recovery
+                ts_line = trade_switch_recovery.format_trade_status(cur)
+                lines.append(ts_line)
             except Exception as e:
                 lines.append(f'trade_switch: 조회 실패 ({e})')
 
@@ -5389,3 +5383,221 @@ def _bundle(_text=None):
                 conn.close()
             except Exception:
                 pass
+
+
+def _debug_stop_orders(_text=None):
+    """P0-6: /debug stop_orders — server-side stop order status."""
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_debug_risk_commands'):
+            return 'ff_debug_risk_commands OFF'
+
+        lines = ['=== SERVER STOP ORDERS ===']
+
+        # In-memory state from ServerStopManager
+        try:
+            import server_stop_manager
+            mgr = server_stop_manager.get_manager()
+            status = mgr.get_status()
+            lines.append(f"FF enabled: {status.get('ff_enabled', False)}")
+            lines.append(f"Last order: {status.get('last_order_id', 'NONE')}")
+            lines.append(f"Stop price: {status.get('last_stop_price', 'N/A')}")
+            lines.append(f"Version: {status.get('version', 0)}")
+            last_v = status.get('last_verify_ts', 0)
+            if last_v:
+                import time as _t
+                age = _t.time() - last_v
+                lines.append(f"Last verify: {age:.0f}s ago")
+            else:
+                lines.append("Last verify: never")
+        except Exception as e:
+            lines.append(f"Manager state: error ({e})")
+
+        # DB records
+        conn = None
+        try:
+            conn = _db()
+            with conn.cursor() as cur:
+                # Position info for comparison
+                cur.execute("""
+                    SELECT side, avg_entry_price FROM position_state
+                    WHERE symbol = %s AND side IS NOT NULL;
+                """, (SYMBOL,))
+                pos_row = cur.fetchone()
+                if pos_row:
+                    lines.append(f"\nPosition: {pos_row[0]} @ {pos_row[1]}")
+                else:
+                    lines.append("\nPosition: NONE")
+
+                # Recent stop orders
+                cur.execute("""
+                    SELECT order_id, side, qty, stop_price, status, updated_at
+                    FROM server_stop_orders
+                    WHERE symbol = %s
+                    ORDER BY ts DESC LIMIT 5;
+                """, (SYMBOL,))
+                rows = cur.fetchall()
+                if rows:
+                    lines.append("\n--- Recent DB Records ---")
+                    for r in rows:
+                        state = 'SYNCED' if r[4] == 'ACTIVE' else r[4]
+                        lines.append(f"  {r[0][:12]}.. | {r[1]} {r[2]} @ {r[3]} | {state} | {r[5]}")
+                else:
+                    lines.append("\nDB records: NONE")
+
+                # Exchange live stops
+                try:
+                    import server_stop_manager as ssm_mod
+                    mgr2 = ssm_mod.get_manager()
+                    ex = mgr2._ex()
+                    live_stops = ex.fetch_open_orders(SYMBOL, params={
+                        'orderFilter': 'StopOrder'})
+                    lines.append(f"\n--- Exchange Live Stops ({len(live_stops)}) ---")
+                    for o in live_stops:
+                        oid = o.get('id', '?')
+                        tp = o.get('info', {}).get('triggerPrice', '?')
+                        qty = o.get('amount', '?')
+                        sd = o.get('side', '?')
+                        lines.append(f"  {oid[:12]}.. | {sd} {qty} trigger={tp}")
+                except Exception as e:
+                    lines.append(f"\nExchange query: error ({e})")
+        except Exception as e:
+            lines.append(f"\nDB query error: {e}")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ stop_orders 오류: {e}'
+
+
+def _debug_risk_snapshot(_text=None):
+    """P0-6: /debug risk_snapshot — comprehensive risk state overview."""
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_debug_risk_commands'):
+            return 'ff_debug_risk_commands OFF'
+
+        lines = ['=== RISK SNAPSHOT ===']
+        conn = None
+        try:
+            conn = _db()
+            with conn.cursor() as cur:
+                # 1. Position + entry
+                cur.execute("""
+                    SELECT side, total_qty, avg_entry_price, stage,
+                           capital_used_usdt, peak_upnl_pct
+                    FROM position_state WHERE symbol = %s;
+                """, (SYMBOL,))
+                ps = cur.fetchone()
+                if ps and ps[0]:
+                    lines.append(f"Position: {ps[0]} qty={ps[1]} entry={ps[2]} "
+                                 f"stage={ps[3]} cap={ps[4]} peak={ps[5]}")
+                else:
+                    lines.append("Position: NONE")
+
+                # 2. SL basis + current SL
+                try:
+                    from strategy_v3 import config_v3
+                    cfg = config_v3.get_all()
+                    sl_basis = cfg.get('sl_basis', 'PRICE_PCT')
+                    lines.append(f"\nSL basis: {sl_basis}")
+                    lines.append(f"FF sl_basis_conversion: "
+                                 f"{feature_flags.is_enabled('ff_sl_basis_conversion')}")
+                except Exception as e:
+                    lines.append(f"\nSL config: error ({e})")
+
+                # 3. Shock guard status
+                try:
+                    import shock_guard
+                    sg = shock_guard.get_shock_status()
+                    frozen_str = f"FROZEN ({sg['remaining_sec']}s)" if sg['frozen'] else 'CLEAR'
+                    lines.append(f"\nShock Guard: {frozen_str}")
+                    lines.append(f"  FF enabled: {sg['ff_enabled']}")
+                    if sg['last_shock_pct']:
+                        lines.append(f"  Last shock: {sg['last_shock_pct']:.2f}%")
+                except Exception as e:
+                    lines.append(f"\nShock Guard: error ({e})")
+
+                # 4. Health score + entry gate
+                try:
+                    import health_scorer
+                    score, components = health_scorer.compute_health_score(cur)
+                    mult, mode = health_scorer.get_risk_multiplier(score)
+                    lines.append(f"\nHealth: score={score} mode={mode} mult={mult}")
+                    for k, v in components.items():
+                        lines.append(f"  {k}: {v}")
+
+                    import safety_manager
+                    can_enter, h_mode, h_score, h_reason = \
+                        safety_manager.check_health_entry_gate(cur)
+                    lines.append(f"Entry gate: {'PASS' if can_enter else 'BLOCKED'} — {h_reason}")
+                except Exception as e:
+                    lines.append(f"\nHealth: error ({e})")
+
+                # 5. ADD allowed?
+                try:
+                    import safety_manager
+                    allowed, upnl, reason = safety_manager.check_add_upnl_gate(cur, SYMBOL)
+                    lines.append(f"\nADD gate: {'ALLOWED' if allowed else 'BLOCKED'} "
+                                 f"(uPnL={upnl:.2f}%) — {reason}")
+                    lines.append(f"FF loss_zone_add_block: "
+                                 f"{feature_flags.is_enabled('ff_loss_zone_add_block')}")
+                except Exception as e:
+                    lines.append(f"\nADD gate: error ({e})")
+
+                # 6. Leverage + margin info
+                try:
+                    import exchange_reader
+                    bal = exchange_reader.fetch_balance()
+                    equity = bal.get('total', 0)
+                    lines.append(f"\nEquity: {equity:.2f} USDT")
+
+                    import safety_manager
+                    eq = safety_manager.get_equity_limits(cur)
+                    lines.append(f"Operating cap: {eq['operating_cap']:.2f}")
+                    lines.append(f"Slice: {eq['slice_usdt']:.2f}")
+                    lines.append(f"Leverage range: {eq.get('leverage_min', 3)}-{eq.get('leverage_max', 8)}")
+                except Exception as e:
+                    lines.append(f"\nEquity: error ({e})")
+
+                # 7. Adaptive layers summary
+                try:
+                    from strategy_v3 import adaptive_v3
+                    state = adaptive_v3._get_state()
+                    lines.append(f"\nAdaptive State:")
+                    for k in ('combined_penalty', 'l1_cooldown_active',
+                              'l1_global_wr_block', 'l2_meanrev_blocked',
+                              'l3_add_blocked', 'l4_entry_blocked'):
+                        if k in state:
+                            lines.append(f"  {k}: {state[k]}")
+                except Exception as e:
+                    lines.append(f"\nAdaptive: error ({e})")
+
+                # 8. Server stop status
+                try:
+                    import server_stop_manager
+                    mgr = server_stop_manager.get_manager()
+                    st = mgr.get_status()
+                    stop_str = f"@ {st['last_stop_price']}" if st.get('last_stop_price') else 'NONE'
+                    lines.append(f"\nServer Stop: {stop_str} "
+                                 f"(ff={st.get('ff_enabled', False)})")
+                except Exception as e:
+                    lines.append(f"\nServer Stop: error ({e})")
+
+        except Exception as e:
+            lines.append(f"\nDB error: {e}")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'⚠ risk_snapshot 오류: {e}'

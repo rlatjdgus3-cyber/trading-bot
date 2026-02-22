@@ -265,3 +265,52 @@ def try_auto_recover(cur):
         f'- settlement: {settlement}')
 
     return (True, 'auto_recovered')
+
+
+def format_trade_status(cur):
+    """P2-A: Format trade_switch status as one-line summary.
+
+    Returns: str like
+      TRADE: ON | reason: - | auto_recovered: false | settlement: 종료
+    or
+      TRADE: OFF | reason: consecutive_stops (연속 손절) | by: equity_guard | auto_recover: 17:42 KST
+    """
+    try:
+        cur.execute("""
+            SELECT enabled, off_reason, last_changed_by,
+                   manual_off_until, last_auto_recover_ts, last_disable_ts
+            FROM trade_switch ORDER BY id DESC LIMIT 1;
+        """)
+        row = cur.fetchone()
+        if not row:
+            return 'TRADE: UNKNOWN (no row)'
+
+        enabled = row[0]
+        off_reason = row[1] or '-'
+        changed_by = row[2] or '-'
+        manual_off_until = row[3]
+        last_auto_recover = row[4]
+        last_disable = row[5]
+
+        settlement = _get_settlement_display()
+
+        if enabled:
+            auto_rec_str = 'true' if last_auto_recover else 'false'
+            return (f'TRADE: ON | reason: - | auto_recovered: {auto_rec_str} '
+                    f'| settlement: {settlement}')
+        else:
+            reason_label = OFF_REASONS.get(off_reason, off_reason)
+            recover_str = '-'
+            if manual_off_until:
+                import datetime
+                try:
+                    import pytz
+                    kst = pytz.timezone('Asia/Seoul')
+                    kst_time = manual_off_until.astimezone(kst)
+                    recover_str = kst_time.strftime('%H:%M KST')
+                except Exception:
+                    recover_str = str(manual_off_until)[:16]
+            return (f'TRADE: OFF | reason: {off_reason} ({reason_label}) '
+                    f'| by: {changed_by} | auto_recover: {recover_str}')
+    except Exception as e:
+        return f'TRADE: ERROR ({e})'

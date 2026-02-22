@@ -132,11 +132,19 @@ def compute_risk(features, v3_regime, loss_streak=0):
         reasoning.append(f'TP: SL({sl_pct:.4f})×{cfg["tp_r_ratio"]}R = {tp_pct:.4f}')
         reasoning.append(f'leverage_max: {leverage_max}')
 
+        # P0-1: sl_basis info for downstream consumers
+        sl_basis = 'PRICE_PCT'
+        try:
+            sl_basis = cfg.get('sl_basis', 'PRICE_PCT')
+        except Exception:
+            pass
+
         result = {
             'sl_pct': sl_pct,
             'tp_pct': tp_pct,
             'stage_slice_mult': stage_slice_mult,
             'leverage_max': leverage_max,
+            'sl_basis': sl_basis,
             'reasoning': reasoning,
         }
         if max_stage is not None:

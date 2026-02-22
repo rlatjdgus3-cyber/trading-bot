@@ -1676,6 +1676,14 @@ def run_all():
             ensure_trade_switch_v2_columns(cur)
             # news_raw_errors table for parse failure tracking
             ensure_news_raw_errors_table(cur)
+            # P0-2: Server-side stop orders
+            ensure_server_stop_orders(cur)
+            # P0-4: Shock guard events
+            ensure_shock_guard_events(cur)
+            # P3: Strategy supervisor + config versioning
+            ensure_supervisor_reports(cur)
+            ensure_strategy_config_versions(cur)
+            ensure_strategy_change_proposals(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -2105,6 +2113,110 @@ def ensure_news_raw_errors_table(cur):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_news_raw_errors_ts ON news_raw_errors(ts DESC);")
     _log('ensure_news_raw_errors_table done')
+
+
+# ── P0-2: Server-side stop orders ──
+def ensure_server_stop_orders(cur):
+    """server_stop_orders — tracks exchange-side conditional stop orders."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.server_stop_orders (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            order_id TEXT,
+            client_order_id TEXT,
+            side TEXT NOT NULL,
+            qty NUMERIC NOT NULL,
+            stop_price NUMERIC NOT NULL,
+            sl_basis TEXT DEFAULT 'PRICE_PCT',
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            cancel_reason TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_server_stop_orders_symbol_status ON server_stop_orders(symbol, status);")
+    _log('ensure_server_stop_orders done')
+
+
+# ── P0-4: Shock guard events ──
+def ensure_shock_guard_events(cur):
+    """shock_guard_events — 1m rapid move detection log."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.shock_guard_events (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            price_change_pct NUMERIC NOT NULL,
+            atr_1m NUMERIC,
+            atr_mult_used NUMERIC,
+            freeze_until TIMESTAMPTZ NOT NULL,
+            trigger_type TEXT,
+            candle_data JSONB
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_shock_guard_events_ts ON shock_guard_events(ts DESC);")
+    _log('ensure_shock_guard_events done')
+
+
+# ── P3: Strategy supervisor tables ──
+def ensure_supervisor_reports(cur):
+    """supervisor_reports — periodic strategy analysis reports."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.supervisor_reports (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            report_type TEXT NOT NULL DEFAULT '6h',
+            period_start TIMESTAMPTZ,
+            period_end TIMESTAMPTZ,
+            trades_count INT,
+            win_rate NUMERIC,
+            total_pnl NUMERIC,
+            max_drawdown NUMERIC,
+            mode_breakdown JSONB,
+            worst_trades JSONB,
+            recommendations JSONB,
+            patch_proposals JSONB,
+            full_report TEXT
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_supervisor_reports_ts ON supervisor_reports(ts DESC);")
+    _log('ensure_supervisor_reports done')
+
+
+def ensure_strategy_config_versions(cur):
+    """strategy_config_versions — config snapshot versioning."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.strategy_config_versions (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            config_hash TEXT NOT NULL,
+            config_snapshot JSONB NOT NULL,
+            changed_by TEXT DEFAULT 'system',
+            change_reason TEXT,
+            change_diff JSONB
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_config_versions_ts ON strategy_config_versions(ts DESC);")
+    _log('ensure_strategy_config_versions done')
+
+
+def ensure_strategy_change_proposals(cur):
+    """strategy_change_proposals — proposed config changes from supervisor."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.strategy_change_proposals (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            proposed_by TEXT DEFAULT 'supervisor',
+            change_type TEXT,
+            proposal JSONB NOT NULL,
+            reasoning TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            applied_at TIMESTAMPTZ,
+            rollback_at TIMESTAMPTZ
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_status ON strategy_change_proposals(status);")
+    _log('ensure_strategy_change_proposals done')
 
 
 if __name__ == '__main__':

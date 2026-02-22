@@ -307,7 +307,10 @@ def compute_layer1(cur, entry_mode, cfg):
         # 1A. Entry-mode specific streak
         streak = _query_mode_loss_streak(cur, entry_mode)
         streak_penalty_3 = float(cfg.get('adaptive_l1_streak_penalty_3', 0.70))
-        cooldown_5_sec = int(cfg.get('adaptive_l1_cooldown_5_sec', 7200))
+        # P1-1: per-mode cooldown (fallback to global cooldown_5_sec)
+        mode_cooldown_key = f'adaptive_l1_cooldown_5_sec_{entry_mode}'
+        cooldown_5_sec = int(cfg.get(mode_cooldown_key,
+                                     cfg.get('adaptive_l1_cooldown_5_sec', 7200)))
 
         if streak >= 5:
             # 5+ streak: cooldown
@@ -408,11 +411,12 @@ def _check_anti_paralysis(cur, cfg, result):
             result['l1_effective_add_conf_min'] = 0
 
         elif effective_no_trade >= hours_1 * 3600 and health_ok:
-            # Partial reset
+            # Partial reset — exploratory entry with min size + tight stop
             if _state['anti_paralysis_stage'] < 1:
                 _state['anti_paralysis_stage'] = 1
                 _state['anti_paralysis_reset_ts'] = now
-                _log('[L1] Anti-Paralysis: PARTIAL RESET (24h no trade)')
+                _log('[L1] Anti-Paralysis: PARTIAL RESET (24h no trade) '
+                     '— exploratory: min_size + tight stop')
             # Ease penalties
             _state['mode_cooldowns'] = {}
             result['l1_cooldown_active'] = False
@@ -420,6 +424,10 @@ def _check_anti_paralysis(cur, cfg, result):
                 result['l1_penalty'] = 0.85
             if result['l1_global_wr_block']:
                 result['l1_effective_threshold_add'] = 5  # halved from 10
+            # P1-1: Exploratory entry conditions (min size + tight stop)
+            result['l1_anti_paralysis_mode'] = True
+            result['l1_exploratory_slice_mult'] = 0.5  # half size
+            result['l1_exploratory_sl_tighten'] = 0.7  # 30% tighter SL
         else:
             # Reset anti-paralysis counter if trade happened
             if _state['anti_paralysis_stage'] > 0 and last_trade_ts > _state['anti_paralysis_reset_ts']:
@@ -522,6 +530,33 @@ def compute_layer2(entry_mode, direction, regime_class, features, regime_ctx, cf
                     f'hard-block: drift=NONE + flow_bias={flow_bias:.2f}>0 '
                     f'+ impulse={impulse:.2f}>{impulse_threshold}')
                 return result
+
+        # P1-2: Strict SHORT protection (ff_l2_strict_short)
+        try:
+            import feature_flags
+            if (feature_flags.is_enabled('ff_l2_strict_short')
+                    and entry_mode == 'MeanRev' and direction == 'SHORT'):
+                from strategy_v3 import safe_float as sf2
+                impulse2 = sf2(features.get('impulse'))
+                drift_dir = features.get('drift_direction', 'NONE')
+
+                # Condition: impulse <= 0 → MeanRev SHORT blocked
+                if impulse2 <= 0:
+                    result['l2_meanrev_blocked'] = True
+                    result['l2_block_reason'] = (
+                        f'strict_short: impulse={impulse2:.2f}<=0 → '
+                        f'MeanRev SHORT blocked (no momentum)')
+                    return result
+
+                # Condition: drift=NONE + impulse > 1.5 → MeanRev SHORT blocked
+                if drift_dir == 'NONE' and impulse2 > 1.5:
+                    result['l2_meanrev_blocked'] = True
+                    result['l2_block_reason'] = (
+                        f'strict_short: drift=NONE + impulse={impulse2:.2f}>1.5 → '
+                        f'MeanRev SHORT blocked')
+                    return result
+        except Exception as e2:
+            _log(f'L2 strict_short FAIL-OPEN: {e2}')
 
     except Exception as e:
         _log(f'L2 FAIL-OPEN: {e}')

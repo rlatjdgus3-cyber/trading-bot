@@ -178,6 +178,13 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
     if limits is None:
         limits = _load_safety_limits(cur)
 
+    # P0-5: Health entry gate (진입/ADD 차단, EXIT 허용)
+    if not emergency and not manual_override:
+        can_enter, h_mode, h_score, h_reason = check_health_entry_gate(cur)
+        if not can_enter:
+            _log(f'Health entry gate BLOCKED: {h_reason}')
+            return (False, f'Health 진입차단: {h_reason}')
+
     # Service health check (신규 포지션 차단)
     # Uses health scorer for degraded-mode sizing; critical errors still fully block.
     if not emergency and not manual_override:
@@ -360,6 +367,76 @@ def check_trade_budget(cur, add_pct):
     if current_pct + add_pct > TRADE_BUDGET_PCT:
         return (False, f'budget would exceed {TRADE_BUDGET_PCT}% ({current_pct + add_pct:.0f}%)')
     return (True, 'ok')
+
+
+def check_health_entry_gate(cur):
+    """P0-5: health_scorer 기반 진입 게이트.
+    WARN/EXIT_ONLY/BLOCKED → 진입/ADD 차단, EXIT 허용.
+    Returns: (can_enter: bool, mode: str, score: int, reason: str)
+    """
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_health_entry_gate'):
+            return (True, 'FULL', 100, 'ff_health_entry_gate OFF')
+
+        import health_scorer
+        score, components = health_scorer.compute_health_score(cur)
+        multiplier, mode = health_scorer.get_risk_multiplier(score)
+
+        if mode in ('EXIT_ONLY', 'BLOCKED'):
+            return (False, mode, score,
+                    f'Health {mode} (score={score}): 진입/ADD 차단')
+        if mode == 'HALF' and score < 60:
+            return (False, mode, score,
+                    f'Health HALF (score={score}<60): 진입/ADD 차단')
+        return (True, mode, score, f'Health {mode} (score={score})')
+    except Exception as e:
+        _log(f'check_health_entry_gate FAIL-OPEN: {e}')
+        return (True, 'FULL', 100, f'FAIL-OPEN: {e}')
+
+
+def check_add_upnl_gate(cur, symbol='BTC/USDT:USDT'):
+    """P0-3: uPnL < 0이면 ADD 무조건 차단. EXIT/REDUCE/CLOSE는 항상 허용.
+    Returns: (allowed: bool, upnl_pct: float, reason: str)
+    """
+    try:
+        cur.execute("""
+            SELECT side, avg_entry_price FROM position_state
+            WHERE symbol = %s AND side IS NOT NULL;
+        """, (symbol,))
+        row = cur.fetchone()
+        if not row or not row[0] or not row[1]:
+            return (True, 0.0, 'no position')
+        side = row[0]
+        entry = float(row[1])
+        if entry <= 0:
+            return (True, 0.0, 'invalid entry')
+
+        import exchange_reader
+        bal = exchange_reader.fetch_ticker_price(symbol)
+        price = bal if isinstance(bal, (int, float)) else 0
+        if price <= 0:
+            # Fallback: try market_data_cache
+            cur.execute("""
+                SELECT price FROM market_data_cache
+                WHERE symbol = %s ORDER BY ts DESC LIMIT 1;
+            """, (symbol,))
+            prow = cur.fetchone()
+            price = float(prow[0]) if prow and prow[0] else 0
+        if price <= 0:
+            return (True, 0.0, 'price unavailable (FAIL-OPEN)')
+
+        if side == 'long':
+            upnl_pct = (price - entry) / entry * 100
+        else:
+            upnl_pct = (entry - price) / entry * 100
+
+        if upnl_pct < 0:
+            return (False, upnl_pct, f'ADD HARD-BLOCK: 손실구간 ({upnl_pct:.2f}%)')
+        return (True, upnl_pct, 'profit zone')
+    except Exception as e:
+        _log(f'check_add_upnl_gate FAIL-OPEN: {e}')
+        return (True, 0.0, f'FAIL-OPEN: {e}')
 
 
 def get_add_score_threshold(cur, limits=None):

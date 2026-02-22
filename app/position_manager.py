@@ -87,6 +87,65 @@ _claude_result_consumed = True
 ASYNC_CLAUDE_RESULT_MAX_AGE_SEC = 60  # 결과 유효 시간
 
 
+def _compute_sl_check(side, entry, price, sl_pct, leverage=5):
+    """Compute SL distance with basis conversion support.
+
+    When ff_sl_basis_conversion is ON:
+      - PRICE_PCT (legacy): sl_dist = (price - entry) / entry * 100
+      - UPNL_PCT: sl_dist = price_move_pct * leverage (margin-based loss %)
+      - Threshold is compared as-is against sl_pct
+
+    Returns: (sl_dist: float, hit: bool, basis: str, shadow_log: dict|None)
+    """
+    import feature_flags as _ff
+    from strategy_v3 import config_v3
+
+    if side == 'long':
+        price_move_pct = (price - entry) / entry * 100
+    else:
+        price_move_pct = (entry - price) / entry * 100
+
+    # Legacy (PRICE_PCT) — always computed
+    legacy_dist = price_move_pct
+    legacy_hit = legacy_dist <= -sl_pct
+
+    if not _ff.is_enabled('ff_sl_basis_conversion'):
+        return (legacy_dist, legacy_hit, 'PRICE_PCT', None)
+
+    cfg = config_v3.get_all()
+    sl_basis = cfg.get('sl_basis', 'PRICE_PCT').upper()
+
+    if sl_basis == 'UPNL_PCT':
+        # Margin-based: price_move * leverage = actual margin loss %
+        margin_dist = price_move_pct * leverage
+        # Convert sl_pct to UPNL threshold: sl_pct * leverage
+        upnl_threshold = sl_pct * leverage
+        hit = margin_dist <= -upnl_threshold
+        shadow_log = {
+            'basis': 'UPNL_PCT',
+            'price_move_pct': round(price_move_pct, 4),
+            'margin_dist': round(margin_dist, 4),
+            'upnl_threshold': round(upnl_threshold, 4),
+            'legacy_dist': round(legacy_dist, 4),
+            'legacy_hit': legacy_hit,
+            'upnl_hit': hit,
+            'leverage': leverage,
+        }
+        _log(f'SL[UPNL_PCT] margin={margin_dist:.2f}% vs -{upnl_threshold:.2f}% '
+             f'| legacy={legacy_dist:.2f}% vs -{sl_pct:.2f}% '
+             f'| hit={hit} legacy_hit={legacy_hit}')
+        return (margin_dist, hit, 'UPNL_PCT', shadow_log)
+    elif sl_basis == 'EQUITY_PCT':
+        # Future: same as UPNL_PCT for now
+        margin_dist = price_move_pct * leverage
+        upnl_threshold = sl_pct * leverage
+        hit = margin_dist <= -upnl_threshold
+        return (margin_dist, hit, 'EQUITY_PCT', None)
+    else:
+        # Default: PRICE_PCT
+        return (legacy_dist, legacy_hit, 'PRICE_PCT', None)
+
+
 def _get_exchange():
     global _exchange
     if _exchange is not None:
@@ -1770,11 +1829,6 @@ def _decide(ctx=None):
 
     # Stop-loss check
     if atr and atr > 0 and entry and entry > 0:
-        if side == 'long':
-            sl_dist = (price - entry) / entry * 100
-        else:
-            sl_dist = (entry - price) / entry * 100
-
         # Stage-based stop-loss tightening (v2.1)
         sl_base = scores.get('dynamic_stop_loss_pct', 2.0)
         # Regime SL clamping: use the tighter of dynamic SL and regime SL
@@ -1792,9 +1846,15 @@ def _decide(ctx=None):
         if be_sl_active:
             sl_pct = min(sl_pct, fee_buffer_pct)
 
-        if sl_dist <= -sl_pct:
+        # P0-1: SL basis conversion (PRICE_PCT / UPNL_PCT)
+        _leverage = ctx.get('leverage', 5)
+        sl_dist, sl_hit, sl_basis, sl_shadow = _compute_sl_check(
+            side, entry, price, sl_pct, leverage=_leverage)
+
+        if sl_hit:
             be_tag = ' [BE trail]' if be_sl_active else ''
-            return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%){be_tag}')
+            basis_tag = f' [{sl_basis}]' if sl_basis != 'PRICE_PCT' else ''
+            return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%){be_tag}{basis_tag}')
 
     # Reversal / Close check (v3.0: total_score based)
     if side == 'long' and total_score <= -25:
@@ -1827,6 +1887,17 @@ def _decide(ctx=None):
             regime_ctx.get('regime', 'UNKNOWN'), regime_ctx.get('shock_type'))
     if regime_stage_max == 0:
         return ('HOLD', f'REGIME VETO: ADD 차단 ({regime_ctx.get("regime")})')
+
+    # P0-3: Hard ADD block in loss zone (unconditional when ff enabled)
+    import feature_flags as _ff
+    if _ff.is_enabled('ff_loss_zone_add_block'):
+        if entry and entry > 0:
+            if side == 'long':
+                _upnl = (price - entry) / entry * 100
+            else:
+                _upnl = (entry - price) / entry * 100
+            if _upnl < 0:
+                return ('HOLD', f'ADD HARD-BLOCK: 손실구간 ({_upnl:.2f}%)')
 
     # Profit-zone-only ADD (loss-zone averaging forbidden)
     if entry and entry > 0:
@@ -2533,9 +2604,47 @@ def _cycle():
                 # DEFAULT: score_engine only, no Claude call
                 _log(f'DEFAULT mode, score_engine only')
 
+            # P0-4: Shock guard check (1m rapid move defense)
+            try:
+                import shock_guard
+                _shock_detected, _shock_detail = shock_guard.check_shock(cur)
+                if _shock_detected:
+                    _log(f'SHOCK GUARD: freeze active — {_shock_detail.get("trigger_type", "?")}')
+            except Exception as _sg_err:
+                _log(f'shock_guard check error (FAIL-OPEN): {_sg_err}')
+
             # Run decision engine (DEFAULT mode)
             (action, reason) = _decide(ctx)
             _log(f'decision: {action} - {reason}')
+
+            # P0-4: Shock guard freeze — block ENTRY/ADD actions, allow EXIT
+            try:
+                import shock_guard
+                frozen, remaining = shock_guard.is_entry_frozen()
+                if frozen and action in ('ADD',):
+                    _log(f'SHOCK FREEZE: {action} blocked ({remaining:.0f}s remaining)')
+                    action = 'HOLD'
+                    reason = f'SHOCK FREEZE: {action} 차단 ({remaining:.0f}s)'
+            except Exception:
+                pass
+
+            # P0-2: Sync server-side stop order (after _decide, before action execution)
+            try:
+                import server_stop_manager
+                ssm = server_stop_manager.get_manager()
+                if pos and pos.get('side') and pos.get('entry_price'):
+                    _sl_base = scores.get('dynamic_stop_loss_pct', 2.0)
+                    _entry = pos.get('entry_price', 0)
+                    if _entry > 0 and _sl_base > 0:
+                        if pos['side'] == 'long':
+                            _sl_price = _entry * (1 - _sl_base / 100)
+                        else:
+                            _sl_price = _entry * (1 + _sl_base / 100)
+                        ssm.sync_stop_order(cur, pos, _sl_price)
+                elif action in ('CLOSE', 'REVERSE'):
+                    ssm.cancel_all_stops(cur)
+            except Exception as _e:
+                _log(f'server_stop sync error (FAIL-OPEN): {_e}')
 
             # Non-HOLD score_engine action → reset hold tracker
             if action != 'HOLD':
@@ -2592,6 +2701,12 @@ def _cycle():
                     reason=reason,
                     pm_decision_id=dec_id,
                     priority=2)
+                # P0-2: Cancel server stops on Python SL trigger
+                try:
+                    import server_stop_manager
+                    server_stop_manager.get_manager().cancel_all_stops(cur)
+                except Exception:
+                    pass
                 # TP CLOSE 시 peak 리셋 → trailing TP 재트리거 방지
                 if eq_id and reason and 'TP' in reason:
                     try:
