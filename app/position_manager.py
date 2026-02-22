@@ -2632,8 +2632,9 @@ def _cycle():
             try:
                 import server_stop_manager
                 ssm = server_stop_manager.get_manager()
+                _scores = ctx.get('scores', {})
                 if pos and pos.get('side') and pos.get('entry_price'):
-                    _sl_base = scores.get('dynamic_stop_loss_pct', 2.0)
+                    _sl_base = _scores.get('dynamic_stop_loss_pct', 2.0)
                     _entry = pos.get('entry_price', 0)
                     if _entry > 0 and _sl_base > 0:
                         if pos['side'] == 'long':
