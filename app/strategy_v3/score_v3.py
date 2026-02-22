@@ -91,6 +91,18 @@ def _compute_static_range_modifier(total_score, features, price, cfg):
                 modifier += penalty
             reasoning.append(f'edge overshoot penalty: {penalty} ({overshoot_dist:.1f} ATR)')
 
+    # 4. Non-breakout impulse chase guard
+    impulse = safe_float(features.get('impulse'))
+    impulse_penalty = cfg.get('non_breakout_impulse_penalty', 20)
+    impulse_block_mult = cfg.get('non_breakout_impulse_block_mult', 1.5)
+    if impulse > impulse_block_mult:
+        modifier -= impulse_penalty
+        reasoning.append(f'impulse={impulse:.2f} > {impulse_block_mult} → -{impulse_penalty} penalty')
+        if impulse > impulse_block_mult * 1.5:
+            blocked = True
+            block_reason = f'extreme impulse in STATIC_RANGE: {impulse:.2f}'
+            reasoning.append(block_reason)
+
     return modifier, blocked, block_reason, reasoning
 
 
@@ -134,6 +146,18 @@ def _compute_drift_modifier(total_score, features, price, regime_class, cfg):
             else:
                 modifier -= 5
             reasoning.append('POC level retest bonus: ±5')
+
+    # 4. Non-breakout impulse chase guard
+    impulse = safe_float(features.get('impulse'))
+    impulse_penalty = cfg.get('non_breakout_impulse_penalty', 20)
+    impulse_block_mult = cfg.get('non_breakout_impulse_block_mult', 1.5)
+    if impulse > impulse_block_mult:
+        modifier -= impulse_penalty
+        reasoning.append(f'impulse={impulse:.2f} > {impulse_block_mult} → -{impulse_penalty} penalty')
+        if impulse > impulse_block_mult * 1.5:
+            blocked = True
+            block_reason = f'extreme impulse in {regime_class}: {impulse:.2f}'
+            reasoning.append(block_reason)
 
     return modifier, blocked, block_reason, reasoning
 
@@ -255,7 +279,25 @@ def _compute_breakout_modifier(total_score, features, price, cfg, v3_regime=None
     return modifier, blocked, block_reason, reasoning
 
 
-def compute_modifier(total_score, features, v3_regime, price):
+def _is_adaptive_enabled():
+    """Check if ff_adaptive_layers flag is ON."""
+    try:
+        import feature_flags
+        return feature_flags.is_enabled('ff_adaptive_layers')
+    except Exception:
+        return False
+
+
+def _is_adaptive_dryrun():
+    """Check if adaptive_dryrun mode is ON."""
+    try:
+        val = config_v3.get('adaptive_dryrun', True)
+        return str(val).lower() in ('true', '1', 'on')
+    except Exception:
+        return True
+
+
+def compute_modifier(total_score, features, v3_regime, price, regime_ctx=None):
     """Compute V3 score modifier based on regime classification.
 
     Args:
@@ -263,6 +305,7 @@ def compute_modifier(total_score, features, v3_regime, price):
         features: dict from build_feature_snapshot()
         v3_regime: dict from regime_v3.classify()
         price: current price
+        regime_ctx: dict from regime_reader (optional, for L2 adaptive)
 
     Returns:
         dict with keys:
@@ -281,6 +324,22 @@ def compute_modifier(total_score, features, v3_regime, price):
             }
 
         cfg = config_v3.get_all()
+
+        # spread/liquidity hard block
+        if cfg.get('spread_hard_block', True):
+            spread_ok = features.get('spread_ok')
+            if spread_ok is False:
+                return {'modifier': 0, 'entry_blocked': True,
+                        'block_reason': 'spread_ok=False',
+                        'reasoning': ['spread too wide → entry blocked']}
+
+        if cfg.get('liquidity_hard_block', True):
+            liquidity_ok = features.get('liquidity_ok')
+            if liquidity_ok is False:
+                return {'modifier': 0, 'entry_blocked': True,
+                        'block_reason': 'liquidity_ok=False',
+                        'reasoning': ['insufficient liquidity → entry blocked']}
+
         regime_class = v3_regime.get('regime_class', 'STATIC_RANGE')
 
         if regime_class == 'STATIC_RANGE':
@@ -295,8 +354,35 @@ def compute_modifier(total_score, features, v3_regime, price):
         else:
             modifier, blocked, block_reason, reasoning = 0, False, '', ['unknown regime — passthrough']
 
+        # vol_pct=N/A penalty
+        vol_pct = features.get('vol_pct')
+        if vol_pct is None:
+            vol_na_penalty = cfg.get('vol_pct_na_penalty', 10)
+            modifier -= vol_na_penalty
+            reasoning.append(f'vol_pct=N/A → -{vol_na_penalty} penalty')
+
         # Clamp modifier
         modifier = _clamp(modifier, -50, 50)
+
+        # L2: MeanReversion Protection (adaptive layer)
+        try:
+            if _is_adaptive_enabled():
+                from strategy_v3.adaptive_v3 import compute_layer2
+                entry_mode = v3_regime.get('entry_mode', 'MeanRev')
+                direction = 'LONG' if total_score >= 0 else 'SHORT'
+                l2 = compute_layer2(entry_mode, direction, regime_class,
+                                    features, regime_ctx or {}, cfg)
+                if l2.get('l2_meanrev_blocked'):
+                    dryrun = _is_adaptive_dryrun()
+                    reason_str = l2.get('l2_block_reason', 'L2 MeanRev blocked')
+                    if dryrun:
+                        reasoning.append(f'[L2_DRYRUN] {reason_str}')
+                    else:
+                        blocked = True
+                        block_reason = reason_str
+                        reasoning.append(f'[L2] {reason_str}')
+        except Exception as e:
+            _log(f'L2 FAIL-OPEN: {e}')
 
         return {
             'modifier': modifier,

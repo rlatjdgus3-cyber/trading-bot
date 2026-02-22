@@ -388,8 +388,9 @@ def _check_loss_streak_cooldown(cur):
 
         # Query recent closed trades within the window, ordered by time desc
         cur.execute("""
-            SELECT pnl_usdt FROM execution_log
-            WHERE action IN ('CLOSE', 'SL')
+            SELECT realized_pnl FROM execution_log
+            WHERE order_type IN ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE')
+              AND status = 'FILLED'
               AND ts > now() - make_interval(hours => %s)
             ORDER BY ts DESC
             LIMIT %s
@@ -411,7 +412,8 @@ def _check_loss_streak_cooldown(cur):
             # Check if most recent loss is within cooldown window
             cur.execute("""
                 SELECT ts FROM execution_log
-                WHERE action IN ('CLOSE', 'SL') AND pnl_usdt < 0
+                WHERE order_type IN ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE')
+                  AND status = 'FILLED' AND realized_pnl < 0
                   AND ts > now() - make_interval(hours => %s)
                 ORDER BY ts DESC LIMIT 1
             """, (window_hours,))
@@ -431,6 +433,77 @@ def _check_loss_streak_cooldown(cur):
         return (True, '')
     except Exception as e:
         _log(f'loss_streak_cooldown check error (FAIL-OPEN): {e}')
+        return (True, '')
+
+
+def _get_current_loss_streak(cur):
+    """Return count of consecutive recent losses (0 if none)."""
+    try:
+        from strategy_v3 import config_v3
+        window_hours = config_v3.get('loss_streak_window_hours', 3)
+        cur.execute("""
+            SELECT realized_pnl FROM execution_log
+            WHERE order_type IN ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE')
+              AND status = 'FILLED'
+              AND ts > now() - make_interval(hours => %s)
+            ORDER BY ts DESC LIMIT 10
+        """, (window_hours,))
+        streak = 0
+        for row in cur.fetchall():
+            if row[0] is not None and float(row[0]) < 0:
+                streak += 1
+            else:
+                break
+        return streak
+    except Exception:
+        return 0
+
+
+# ── Mode cooloff state (in-memory) ──
+_mode_cooloff_until = {}  # {'STATIC_RANGE': ts, ...}
+
+
+def _check_mode_cooloff(cur, regime_class):
+    """Block regime_class if its recent win rate is too low.
+    Returns (ok: bool, reason: str).
+    """
+    try:
+        from strategy_v3 import config_v3
+        if not config_v3.get('mode_cooloff_enabled', False):
+            return (True, '')
+
+        cooloff_until = _mode_cooloff_until.get(regime_class, 0)
+        now = time.time()
+        if cooloff_until > now:
+            remaining = int(cooloff_until - now)
+            return (False, f'MODE_COOLOFF: {regime_class} blocked ({remaining}s remaining)')
+
+        min_trades = config_v3.get('mode_cooloff_min_trades', 5)
+        min_winrate = config_v3.get('mode_cooloff_min_winrate', 0.30)
+        cooloff_hours = config_v3.get('mode_cooloff_hours', 4)
+
+        cur.execute("""
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE realized_pnl > 0) as wins
+            FROM execution_log
+            WHERE order_type IN ('CLOSE', 'FULL_CLOSE', 'REDUCE', 'REVERSE_CLOSE')
+              AND status = 'FILLED'
+              AND regime_tag = %s
+              AND ts > now() - interval '24 hours'
+        """, (regime_class,))
+        row = cur.fetchone()
+        total, wins = row[0] or 0, row[1] or 0
+
+        if total >= min_trades and total > 0:
+            wr = wins / total
+            if wr < min_winrate:
+                _mode_cooloff_until[regime_class] = now + cooloff_hours * 3600
+                return (False, f'MODE_COOLOFF: {regime_class} wr={wr:.0%} < {min_winrate:.0%} '
+                        f'({total} trades) → blocked {cooloff_hours}h')
+
+        return (True, '')
+    except Exception as e:
+        _log(f'mode_cooloff error (FAIL-OPEN): {e}')
         return (True, '')
 
 
@@ -469,6 +542,18 @@ def should_emit_signal(cur, symbol, direction, conf, regime_ctx=None):
         _last_suppress_reason = ls_reason
         _last_suppress_ts = now_ts
         return (False, ls_reason)
+
+    # 5. Loss streak confidence escalation
+    streak_count = _get_current_loss_streak(cur)
+    if streak_count >= 2:
+        from strategy_v3 import config_v3
+        escalation = config_v3.get('loss_streak_conf_escalation', 5)
+        escalated_min = MIN_CONFIDENCE + (streak_count * escalation)
+        if conf < escalated_min:
+            reason = f'LOSS_STREAK_ESCALATION: streak={streak_count}, conf={conf} < {escalated_min}'
+            _last_suppress_reason = reason
+            _last_suppress_ts = now_ts
+            return (False, reason)
 
     return (True, 'OK')
 
@@ -1935,11 +2020,18 @@ def _cycle():
                     pre_v3_total_score = total_score
                     pre_v3_dominant = dominant
 
-                    v3_mod = v3_score_mod(total_score, v3_features, v3_regime, v3_price)
+                    v3_mod = v3_score_mod(total_score, v3_features, v3_regime, v3_price,
+                                          regime_ctx=regime_ctx)
 
                     if v3_mod.get('entry_blocked'):
                         _log(f'[V3] BLOCKED: {v3_mod.get("block_reason", "")} '
                              f'(regime={v3_regime.get("regime_class", "?")} mode={v3_regime.get("entry_mode", "?")})')
+                        return
+
+                    # Mode cooloff check
+                    cooloff_ok, cooloff_reason = _check_mode_cooloff(cur, v3_regime.get('regime_class'))
+                    if not cooloff_ok:
+                        _log(f'[V3] {cooloff_reason}')
                         return
 
                     # Apply score modification
@@ -1959,7 +2051,70 @@ def _cycle():
                     dominant = new_dominant
 
                     # Compute risk overrides
-                    v3_risk_params = v3_risk(v3_features, v3_regime)
+                    streak = _get_current_loss_streak(cur)
+                    v3_risk_params = v3_risk(v3_features, v3_regime, loss_streak=streak)
+
+                    # ── ADAPTIVE LAYERS: L1/L4/L5 (entry gate + penalty) ──
+                    _adaptive_result = None
+                    try:
+                        import feature_flags
+                        if feature_flags.is_enabled('ff_adaptive_layers'):
+                            from strategy_v3.adaptive_v3 import apply_adaptive_layers
+                            from strategy_v3 import compute_market_health
+                            _health = compute_market_health(v3_features or {})
+                            _entry_mode = v3_regime.get('entry_mode', 'MeanRev')
+                            _adaptive_result = apply_adaptive_layers(
+                                cur, _entry_mode, new_dominant,
+                                v3_regime.get('regime_class', 'STATIC_RANGE'),
+                                v3_features, regime_ctx, _health)
+
+                            _is_dryrun = _adaptive_result.get('dryrun', True)
+
+                            if not _is_dryrun:
+                                # L4: WARN entry block
+                                if _adaptive_result.get('l4_entry_blocked'):
+                                    _log(f'[L4] health=WARN entry blocked')
+                                    return
+
+                                # L1: mode cooldown block
+                                if _adaptive_result.get('l1_cooldown_active'):
+                                    _log(f'[L1] {_entry_mode} cooldown '
+                                         f'{_adaptive_result.get("l1_cooldown_remaining", 0)}s')
+                                    return
+
+                                # L1: global WR block
+                                if _adaptive_result.get('l1_global_wr_block'):
+                                    effective_min = MIN_CONFIDENCE + _adaptive_result.get('l1_effective_threshold_add', 0)
+                                    if new_confidence < effective_min:
+                                        _log(f'[L1] global WR block: conf={new_confidence} < {effective_min}')
+                                        return
+
+                                # Apply combined penalty to total_score
+                                penalty = _adaptive_result.get('combined_penalty', 1.0)
+                                if penalty < 1.0:
+                                    total_score = total_score * penalty
+                                    total_score = max(-100, min(100, total_score))
+                                    new_long_score = int(max(0, min(100, 50 + total_score / 2)))
+                                    new_short_score = 100 - new_long_score
+                                    new_confidence = abs(new_long_score - new_short_score)
+                                    new_dominant = 'LONG' if new_long_score >= new_short_score else 'SHORT'
+                                    scores = dict(scores)
+                                    scores['long_score'] = new_long_score
+                                    scores['short_score'] = new_short_score
+                                    scores['confidence'] = new_confidence
+                                    scores['dominant_side'] = new_dominant
+                                    confidence = new_confidence
+                                    dominant = new_dominant
+                                    _log(f'[ADAPTIVE] penalty={penalty:.2f} → score={total_score:+.0f} '
+                                         f'conf={new_confidence}')
+
+                                # Propagate L4 time_stop/trailing to _v3_result
+                                if _adaptive_result.get('l4_time_stop_mult', 1.0) < 1.0:
+                                    v3_risk_params['l4_time_stop_mult'] = _adaptive_result['l4_time_stop_mult']
+                                if _adaptive_result.get('l4_trailing_sensitive'):
+                                    v3_risk_params['l4_trailing_sensitive'] = True
+                    except Exception as e:
+                        _log(f'[ADAPTIVE] error (FAIL-OPEN): {e}')
 
                     # Store V3 result for signal metadata (including comparison fields)
                     _v3_result = {
@@ -1979,6 +2134,15 @@ def _cycle():
                     # Propagate max_stage from regime risk v3
                     if 'max_stage' in v3_risk_params:
                         _v3_result['max_stage'] = v3_risk_params['max_stage']
+                    # Propagate L4 params
+                    if 'l4_time_stop_mult' in v3_risk_params:
+                        _v3_result['l4_time_stop_mult'] = v3_risk_params['l4_time_stop_mult']
+                    if v3_risk_params.get('l4_trailing_sensitive'):
+                        _v3_result['l4_trailing_sensitive'] = True
+                    # Propagate adaptive debug
+                    if _adaptive_result:
+                        _v3_result['adaptive'] = _adaptive_result.get('debug', {})
+                        _v3_result['adaptive_penalty'] = _adaptive_result.get('combined_penalty', 1.0)
 
                     _log(f'[V3] regime={v3_regime.get("regime_class", "?")} '
                          f'pre={pre_v3_total_score:+.0f} mod={v3_mod.get("modifier", 0):+.0f} '
@@ -2085,6 +2249,30 @@ def _cycle():
                 if confidence < CONF_ADD_THRESHOLD:
                     _log(f'ADD blocked: conf too low for ADD ({confidence} < {CONF_ADD_THRESHOLD})')
                     return
+
+                # L3/L4: Adaptive ADD gate (before existing checks)
+                try:
+                    import feature_flags as _ff
+                    if _ff.is_enabled('ff_adaptive_layers'):
+                        from strategy_v3.adaptive_v3 import apply_adaptive_add_gate, _is_dryrun as _adp_dryrun
+                        from strategy_v3 import compute_market_health as _cmh
+                        _add_health = _cmh(_v3_features or {})
+                        _add_gate = apply_adaptive_add_gate(
+                            cur, ps_row[0], _v3_features or {}, _add_health)
+                        if not _adp_dryrun():
+                            if _add_gate.get('l4_add_blocked'):
+                                _log(f'[L4] health=WARN ADD blocked')
+                                return
+                            if _add_gate.get('l3_add_blocked'):
+                                _log(f'[L3] {_add_gate.get("l3_add_reason", "ADD blocked")}')
+                                return
+                        else:
+                            if _add_gate.get('l4_add_blocked'):
+                                _log(f'[L4_DRYRUN] health=WARN ADD would be blocked')
+                            if _add_gate.get('l3_add_blocked'):
+                                _log(f'[L3_DRYRUN] {_add_gate.get("l3_add_reason", "")}')
+                except Exception as e:
+                    _log(f'[ADAPTIVE] ADD gate FAIL-OPEN: {e}')
 
                 # v14: order_throttle pre-gate — check BEFORE any ADD attempt
                 try:

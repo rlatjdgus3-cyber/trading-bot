@@ -87,10 +87,49 @@ DEFAULTS = {
     'max_stage_v3': 3,
     'breakout_reverse_block': True,
 
+    # Scoring guards
+    'liquidity_hard_block': True,
+    'spread_hard_block': True,
+    'vol_pct_na_penalty': 10,
+    'non_breakout_impulse_penalty': 20,
+    'non_breakout_impulse_block_mult': 1.5,
+
     # 연속손실 쿨다운
     'loss_streak_trigger': 3,
     'loss_streak_cooldown_sec': 1200,
     'loss_streak_window_hours': 3,
+
+    # Performance guardrails
+    'mode_cooloff_enabled': False,
+    'mode_cooloff_min_trades': 5,
+    'mode_cooloff_min_winrate': 0.30,
+    'mode_cooloff_hours': 4,
+    'loss_streak_conf_escalation': 5,
+    'loss_streak_slice_mult_2': 0.7,
+    'loss_streak_slice_mult_3': 0.5,
+
+    # Adaptive Layers v2.1
+    'adaptive_dryrun': True,
+    'adaptive_l1_streak_penalty_3': 0.70,
+    'adaptive_l1_cooldown_5_sec': 7200,
+    'adaptive_l1_global_wr_trades': 20,
+    'adaptive_l1_global_wr_low': 0.35,
+    'adaptive_l1_global_wr_recovery': 0.40,
+    'adaptive_l1_global_wr_threshold_add': 10,
+    'adaptive_l1_global_wr_add_conf_min': 60,
+    'adaptive_l2_range_pos_short_min': 0.85,
+    'adaptive_l2_impulse_hard_block': 1.5,
+    'adaptive_l3_peak_upnl_threshold': 0.4,
+    'adaptive_l4_warn_tighten_sec': 120,
+    'adaptive_l4_time_stop_mult': 0.5,
+    'adaptive_l5_trades': 50,
+    'adaptive_l5_min_sample': 10,
+    'adaptive_l5_wr_low': 0.35,
+    'adaptive_l5_wr_recovery': 0.40,
+    'adaptive_l5_penalty': 0.75,
+    'adaptive_combined_penalty_floor': 0.55,
+    'adaptive_anti_paralysis_hours_1': 24,
+    'adaptive_anti_paralysis_hours_2': 36,
 }
 
 

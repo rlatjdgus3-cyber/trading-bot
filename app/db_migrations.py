@@ -1669,6 +1669,9 @@ def run_all():
             ensure_execution_log_regime_tag(cur)
             # safety_limits max_consecutive_stops column
             ensure_safety_limits_consecutive_stops(cur)
+            # Adaptive v2.1: state table + entry_mode column
+            ensure_adaptive_layer_state(cur)
+            ensure_execution_log_entry_mode(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
@@ -2052,6 +2055,26 @@ def ensure_trade_switch_default_on(cur):
         cur.execute("INSERT INTO trade_switch (enabled, updated_at) VALUES (true, now());")
         _log('ensure_trade_switch_default_on: inserted default ON row')
     _log('ensure_trade_switch_default_on done')
+
+
+def ensure_adaptive_layer_state(cur):
+    """adaptive_layer_state 테이블 — Adaptive v2.1 상태 저장."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.adaptive_layer_state (
+            key         TEXT PRIMARY KEY,
+            value       JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """)
+    _log('ensure_adaptive_layer_state done')
+
+
+def ensure_execution_log_entry_mode(cur):
+    """Add entry_mode column to execution_log for adaptive per-mode tracking."""
+    cur.execute("""
+        ALTER TABLE execution_log ADD COLUMN IF NOT EXISTS entry_mode TEXT;
+    """)
+    _log('ensure_execution_log_entry_mode done')
 
 
 if __name__ == '__main__':
