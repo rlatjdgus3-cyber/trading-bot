@@ -358,6 +358,22 @@ def _send_threshold_alert(error_type, source, count, sample_msg=''):
         pass
 
 
+_WINDOW_DICT_MAX_KEYS = 100  # max distinct error_type:source keys before pruning
+
+def _prune_window_dicts():
+    """Remove stale entries from _error_windows and _alert_sent_windows to prevent unbounded growth."""
+    now = time.time()
+    cutoff = now - _ALERT_WINDOW_SEC
+    # Prune _error_windows: remove keys with no recent entries
+    stale = [k for k, dq in _error_windows.items() if not dq or dq[-1] < cutoff]
+    for k in stale:
+        del _error_windows[k]
+    # Prune _alert_sent_windows: remove expired entries
+    stale_alerts = [k for k, ts in _alert_sent_windows.items() if now - ts > _ALERT_WINDOW_SEC]
+    for k in stale_alerts:
+        del _alert_sent_windows[k]
+
+
 def _check_error_threshold(error_type, source, msg=''):
     """Track error and fire alert if threshold reached in 10-min window.
     Gated by ff_news_alert_throttle_v2; fallback to old 30-min cooldown if disabled.
@@ -375,10 +391,13 @@ def _check_error_threshold(error_type, source, msg=''):
         return
     key = f'{error_type}:{source}'
     now = time.time()
+    # Periodic pruning when dicts grow too large
+    if len(_error_windows) > _WINDOW_DICT_MAX_KEYS:
+        _prune_window_dicts()
     if key not in _error_windows:
         _error_windows[key] = deque(maxlen=200)
     _error_windows[key].append(now)
-    # Prune old entries
+    # Prune old entries from this key's deque
     cutoff = now - _ALERT_WINDOW_SEC
     while _error_windows[key] and _error_windows[key][0] < cutoff:
         _error_windows[key].popleft()
@@ -921,11 +940,20 @@ def main():
                     continue
 
                 except psycopg2.IntegrityError as ie:
-                    # ALL IntegrityErrors = duplicate = normal operation
-                    # Never send Telegram alert, never increment db_errors
-                    duplicate_ignored += 1
-                    _record_event('duplicate_ignored')
-                    log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
+                    # UniqueViolation (23505) = duplicate = normal operation
+                    if ie.pgcode == '23505':
+                        duplicate_ignored += 1
+                        _record_event('duplicate_ignored')
+                        log(f"[news_bot] DEBUG duplicate skip: {title[:60]}")
+                    else:
+                        # Other IntegrityErrors (check constraint, FK, etc.) = real error
+                        log(f"[news_bot] WARN IntegrityError (pgcode={ie.pgcode}): {ie}")
+                        _record_event('parse_fail')
+                        _record_raw_error(db, source, f'IntegrityError_{ie.pgcode}',
+                                          raw_title=title, raw_url=link,
+                                          exception_msg=str(ie)[:200])
+                        _check_error_threshold('IntegrityError', source, str(ie))
+                        db_errors += 1
                     continue
 
                 except Exception as ex:

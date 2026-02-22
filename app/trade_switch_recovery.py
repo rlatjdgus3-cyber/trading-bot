@@ -101,6 +101,11 @@ def _ensure_columns(cur):
         _columns_ensured = True
     except Exception as e:
         _log(f'_ensure_columns warning: {e}')
+        try:
+            if cur.connection and not cur.connection.autocommit:
+                cur.connection.rollback()
+        except Exception:
+            pass
 
 
 def set_on(cur, changed_by='system', auto_recovered=False):
@@ -130,6 +135,12 @@ def set_on(cur, changed_by='system', auto_recovered=False):
     except Exception as e:
         # Fallback: if new columns missing, do simple UPDATE
         _log(f'set_on fallback (new columns missing?): {e}')
+        try:
+            # Ensure connection is usable (rollback any failed transaction state)
+            if cur.connection and not cur.connection.autocommit:
+                cur.connection.rollback()
+        except Exception:
+            pass
         cur.execute("""
             UPDATE trade_switch
             SET enabled = true, off_reason = NULL, manual_off_until = NULL,
@@ -170,6 +181,11 @@ def set_off_with_reason(cur, reason, manual_ttl_minutes=0, changed_by='system'):
     except Exception as e:
         # Fallback: if new columns missing, do simple UPDATE
         _log(f'set_off_with_reason fallback (new columns missing?): {e}')
+        try:
+            if cur.connection and not cur.connection.autocommit:
+                cur.connection.rollback()
+        except Exception:
+            pass
         if manual_ttl_minutes > 0:
             cur.execute("""
                 UPDATE trade_switch
