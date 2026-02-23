@@ -20,11 +20,15 @@ def _log(msg):
 
 
 def _get_config():
-    """Load v1.1 config params."""
+    """Load v1.1 config params from top-level unified_v11 YAML section."""
     try:
-        from strategy_v3 import config_v3
-        cfg = config_v3.get_all()
-        v11 = cfg.get('unified_v11', {}) if isinstance(cfg.get('unified_v11'), dict) else {}
+        import yaml, os
+        _path = os.path.join(os.path.dirname(__file__), 'config', 'strategy_modes.yaml')
+        with open(_path, 'r') as _f:
+            _full = yaml.safe_load(_f) or {}
+        v11 = _full.get('unified_v11', {})
+        if not isinstance(v11, dict):
+            v11 = {}
     except Exception:
         v11 = {}
     return {

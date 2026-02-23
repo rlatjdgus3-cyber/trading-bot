@@ -154,8 +154,9 @@ def _v3_check_signal_debounce(cur, symbol, v3_regime, direction, features):
 
 
 def _is_reentry_valid(symbol, side, current_price):
-    """[0-3] Price reentry validation: last signal price must have been
-    exceeded in the opposite direction before allowing re-entry.
+    """[0-3] Price reentry dedup: block re-entry if price is still near
+    the last signal price (within 0.1%). Only allow if price moved
+    significantly away, indicating a fresh signal.
     Returns (valid, reason)."""
     key = (symbol, side)
     if key not in _last_signal_price:
@@ -166,7 +167,7 @@ def _is_reentry_valid(symbol, side, current_price):
     # Calculate threshold: 0.1% from last signal price
     threshold = last_price * 0.001
     if side == 'LONG':
-        # Price must have gone below last_price - threshold, then come back above
+        # LONG: price must have moved above last signal + 0.1% (new breakout level)
         if current_price > last_price + threshold:
             return (True, f'price moved above {last_price:.1f}+{threshold:.1f}')
         return (False, f'reentry blocked: price {current_price:.1f} near last signal {last_price:.1f}')
@@ -2585,8 +2586,8 @@ def _cycle():
                         msg_type='forced_rejected', cooldown_sec=600)
                     _log(f'FORCED entry REJECTED: {dominant} conf={confidence} (ff_allow_forced_entry=false)')
                     return
-            except Exception:
-                pass  # FAIL-OPEN
+            except Exception as _e_forced:
+                _log(f'[FORCED] check error (FAIL-OPEN): {_e_forced}')
 
             # B2: Signal spam guard (3 signals/30min same direction → 30min cooldown)
             try:

@@ -51,6 +51,31 @@ _tick_lock = threading.Lock()
 _last_known_entry_price = 0.0
 _exchange_position_zero = False
 
+# [3-4] Cached v1.1 circuit breaker config (reload every 60s)
+_v11_cb_cfg = {}
+_v11_cb_cfg_ts = 0
+_V11_CB_CFG_TTL = 60
+
+
+def _load_v11_cb_cfg():
+    """Load unified_v11 config with 60s cache."""
+    global _v11_cb_cfg, _v11_cb_cfg_ts
+    now = time.time()
+    if now - _v11_cb_cfg_ts < _V11_CB_CFG_TTL and _v11_cb_cfg:
+        return _v11_cb_cfg
+    try:
+        import yaml
+        with open('/root/trading-bot/app/config/strategy_modes.yaml') as f:
+            full = yaml.safe_load(f) or {}
+        _v11_cb_cfg = full.get('unified_v11', {})
+        if not isinstance(_v11_cb_cfg, dict):
+            _v11_cb_cfg = {}
+        _v11_cb_cfg_ts = now
+    except Exception:
+        if not _v11_cb_cfg:
+            _v11_cb_cfg = {}
+    return _v11_cb_cfg
+
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
@@ -257,26 +282,23 @@ def _handle_price_tick(price, ex):
             try:
                 import feature_flags as _ff_cb
                 if _ff_cb.is_enabled('ff_unified_engine_v11'):
-                    import yaml as _yaml_cb
-                    with open('/root/trading-bot/app/config/strategy_modes.yaml') as _f_cb:
-                        _v11_cfg = (_yaml_cb.safe_load(_f_cb) or {}).get('unified_v11', {})
-                    cb_block = _v11_cfg.get('cb_block_pct', 0.005)
-                    cb_reduce = _v11_cfg.get('cb_reduce_pct', 0.010)
-                    cb_close = _v11_cfg.get('cb_close_pct', 0.015)
+                    _v11 = _load_v11_cb_cfg()
+                    cb_block = _v11.get('cb_block_pct', 0.005)
+                    cb_reduce = _v11.get('cb_reduce_pct', 0.010)
+                    cb_close = _v11.get('cb_close_pct', 0.015)
 
-                    if abs(rolling_ret_1m) > cb_close * 100:
-                        _action_v11 = 'CLOSE_ALL'
-                    elif abs(rolling_ret_1m) > cb_reduce * 100:
-                        _action_v11 = 'REDUCE_HALF'
-                    elif abs(rolling_ret_1m) > cb_block * 100:
-                        _action_v11 = 'ENTRY_BLOCK'
-                    else:
-                        _action_v11 = None
-
-                    if _action_v11:
-                        _log(f'[v1.1 CB] 1m={rolling_ret_1m:.3f}% → {_action_v11}')
-            except Exception:
-                pass
+                    # rolling_ret_1m is in % (e.g. 1.0 = 1%), config is decimal (0.015 = 1.5%)
+                    abs_ret = abs(rolling_ret_1m)
+                    if abs_ret > cb_close * 100:
+                        action = 'CLOSE_ALL'
+                        _log(f'[v1.1 CB] 1m={rolling_ret_1m:.3f}% > {cb_close*100:.1f}% → CLOSE_ALL')
+                    elif abs_ret > cb_reduce * 100:
+                        action = 'REDUCE_HALF'
+                        _log(f'[v1.1 CB] 1m={rolling_ret_1m:.3f}% > {cb_reduce*100:.1f}% → REDUCE_HALF')
+                    elif abs_ret > cb_block * 100:
+                        _log(f'[v1.1 CB] 1m={rolling_ret_1m:.3f}% > {cb_block*100:.1f}% → ENTRY_BLOCK')
+            except Exception as _e_cb:
+                _log(f'[v1.1 CB] error (FAIL-OPEN): {_e_cb}')
 
             if effective_adverse < cfg['tighten_pct']:
                 return

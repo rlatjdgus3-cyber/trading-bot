@@ -135,7 +135,8 @@ def get_equity_limits(cur=None):
         import feature_flags
         if feature_flags.is_enabled('ff_unified_engine_v11'):
             operating_cap = equity * 0.20  # 20% cap
-            slice_usdt = operating_cap  # single position sizing
+            reserve = equity - operating_cap
+            slice_usdt = max(operating_cap, SLICE_MIN_USDT)
     except Exception:
         pass
 

@@ -1983,8 +1983,8 @@ def _decide(ctx=None):
                             _unrealized_r = _ch_add._compute_unrealized_r(price)
                             if _unrealized_r < 1.0:
                                 return ('HOLD', f'[v1.1] ADD blocked: {_unrealized_r:.2f}R < 1.0R')
-                except Exception:
-                    pass
+                except Exception as _e_add:
+                    _log(f'[v1.1] ADD +1R check error (FAIL-OPEN): {_e_add}')
                 return ('ADD', f'score {relevant} favors {direction}, stage={stage}/{regime_stage_max}')
 
     return ('HOLD', 'no action needed')
@@ -2528,8 +2528,8 @@ def _cycle():
                     elif current_side is None and _prev_position_side:
                         # Position closed
                         _ch_t.on_close()
-            except Exception:
-                pass
+            except Exception as _e_ch_init:
+                _log(f'[CHANDELIER] init error (FAIL-OPEN): {_e_ch_init}')
 
             _prev_position_side = current_side
 

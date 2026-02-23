@@ -227,7 +227,7 @@ feature_flags:
   ff_allow_forced_entry: false       # FORCED=1 강제 진입 허용 여부 (default: 차단)
   ff_signal_spam_guard: true         # 반복 신호 쿨다운 (3회/30분 → 30분 cooldown)
   # Unified Engine v1.1 feature flags
-  ff_unified_engine_v11: false        # Master switch (기본 OFF)
+  ff_unified_engine_v11: true         # Master switch (ON)
   ff_pullback_trigger: false          # Phase 2 pullback (기본 OFF)
   ff_chandelier_exit: false           # Phase 4 (기본 OFF)
 

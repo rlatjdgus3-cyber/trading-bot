@@ -280,8 +280,7 @@ while True:
         )
 
         # ── MTF Indicator Computation (every 60s) ──
-        import time as _t
-        _now = _t.time()
+        _now = time.time()
         if _now - _mtf_last_compute >= _MTF_INTERVAL_SEC:
             _mtf_last_compute = _now
             try:
