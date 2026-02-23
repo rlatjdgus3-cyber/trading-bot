@@ -363,6 +363,42 @@ def _handle_entry_filled(ex, cur, eid, order_id, direction, signal_id,
     except Exception as e:
         log(f'plan_state PLAN.OPEN update error: {e}')
 
+    # D0-3: 서버측 SL 배치 (진입 직후)
+    try:
+        import feature_flags as _ff_ss
+        if _ff_ss.is_enabled('ff_server_stop_orders'):
+            import server_stop_manager
+            from strategy_v3 import config_v3
+            ssm = server_stop_manager.get_manager()
+            _cfg = config_v3.get_all()
+            # Regime-aware SL: use the widest SL across regimes as safety net
+            _sl_pct = max(
+                float(_cfg.get('static_range_max_sl', 0.009)),
+                float(_cfg.get('drift_max_sl', 0.012)),
+                float(_cfg.get('breakout_max_sl', 0.02)),
+            ) * 100  # fraction → %
+            if _sl_pct <= 0:
+                _sl_pct = 2.0  # fallback 2%
+            position = {'side': pos_side, 'qty': pos_qty, 'entry_price': avg_price}
+            if pos_side == 'long':
+                _sl_price = avg_price * (1 - _sl_pct / 100)
+            else:
+                _sl_price = avg_price * (1 + _sl_pct / 100)
+            synced, detail = ssm.sync_stop_order(cur, position, sl_price=_sl_price)
+            if synced and 'invalid' not in detail:
+                cur.execute("UPDATE position_state SET server_stop_status = 'ACTIVE' WHERE symbol = %s;", (SYMBOL,))
+                log(f'SERVER STOP: entry fill → ACTIVE @ {_sl_price:.1f} ({detail})')
+            else:
+                cur.execute("UPDATE position_state SET server_stop_status = 'FAILED' WHERE symbol = %s;", (SYMBOL,))
+                log(f'SERVER STOP: entry fill → FAILED ({detail})')
+                _send_telegram(f'⚠️ SERVER STOP FAILED after entry: {detail}')
+    except Exception as _ss_err:
+        log(f'SERVER STOP: entry fill error (non-fatal): {_ss_err}')
+        try:
+            cur.execute("UPDATE position_state SET server_stop_status = 'FAILED' WHERE symbol = %s;", (SYMBOL,))
+        except Exception:
+            pass
+
     msg = report_formatter.format_fill_notify('entry',
         direction=direction, avg_price=avg_price, filled_qty=filled_qty,
         fee_cost=fee_cost, fee_currency=fee_currency, signal_id=signal_id,
@@ -619,12 +655,13 @@ def _sync_position_state(cur, pos_side, pos_qty, avg_price=None, stage_delta=0, 
     new_capital = max(0, old_capital + capital_delta)
 
     if pos_side is None or pos_qty == 0:
-        # Position closed
+        # Position closed — reset all fields including server_stop_status
         cur.execute("""
             UPDATE position_state SET
                 side = NULL, total_qty = 0, stage = 0,
                 capital_used_usdt = 0, trade_budget_used_pct = 0,
                 stage_consumed_mask = 0, accumulated_entry_fee = 0,
+                server_stop_status = NULL,
                 updated_at = now()
             WHERE symbol = %s;
         """, (symbol,))
@@ -706,6 +743,46 @@ def _handle_add_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
         cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s;", (SYMBOL,))
     except Exception as e:
         log(f'plan_state ADD update error: {e}')
+
+    # D0-3: 서버측 SL 재동기화 (ADD 후 — qty/entry 변경)
+    try:
+        import feature_flags as _ff_ss2
+        if _ff_ss2.is_enabled('ff_server_stop_orders'):
+            import server_stop_manager
+            from strategy_v3 import config_v3
+            ssm = server_stop_manager.get_manager()
+            _cfg2 = config_v3.get_all()
+            # Regime-aware SL: use the widest SL across regimes
+            _sl_pct2 = max(
+                float(_cfg2.get('static_range_max_sl', 0.009)),
+                float(_cfg2.get('drift_max_sl', 0.012)),
+                float(_cfg2.get('breakout_max_sl', 0.02)),
+            ) * 100
+            if _sl_pct2 <= 0:
+                _sl_pct2 = 2.0
+            cur.execute('SELECT avg_entry_price FROM position_state WHERE symbol = %s;', (SYMBOL,))
+            _ep_row = cur.fetchone()
+            _new_entry = float(_ep_row[0]) if _ep_row and _ep_row[0] else avg_price
+            position = {'side': pos_side, 'qty': pos_qty, 'entry_price': _new_entry}
+            if pos_side == 'long':
+                _sl_price2 = _new_entry * (1 - _sl_pct2 / 100)
+            else:
+                _sl_price2 = _new_entry * (1 + _sl_pct2 / 100)
+            synced, detail = ssm.sync_stop_order(cur, position, sl_price=_sl_price2)
+            if synced and 'invalid' not in detail:
+                cur.execute("UPDATE position_state SET server_stop_status = 'ACTIVE' WHERE symbol = %s;", (SYMBOL,))
+                log(f'SERVER STOP: ADD fill → ACTIVE @ {_sl_price2:.1f} ({detail})')
+            else:
+                cur.execute("UPDATE position_state SET server_stop_status = 'FAILED' WHERE symbol = %s;", (SYMBOL,))
+                log(f'SERVER STOP: ADD fill → FAILED ({detail})')
+                _send_telegram(f'⚠️ SERVER STOP FAILED after ADD: {detail}')
+    except Exception as _ss_err2:
+        log(f'SERVER STOP: ADD fill error (non-fatal): {_ss_err2}')
+        try:
+            cur.execute("UPDATE position_state SET server_stop_status = 'FAILED' WHERE symbol = %s;", (SYMBOL,))
+        except Exception:
+            pass
+
     log(f'ADD VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={new_stage} budget={budget_used_pct:.0f}%')
 
 

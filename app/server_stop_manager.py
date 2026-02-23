@@ -5,6 +5,14 @@ P0-2: Places and maintains exchange-side conditional stop orders as a safety net
 The server stop is set 0.1% wider than the Python SL to prevent double execution.
 All orders use reduce-only mode to prevent position reversal.
 
+Key design (110072 fix):
+  - clientOrderId uses timestamp+random for uniqueness (never reuses)
+  - Pre-check: fetch existing stop orders before placing new ones (idempotent)
+  - 110072 handler: re-query → if SL already set, treat as OK
+  - Per-symbol mutex: prevents concurrent stop operations
+  - Debounce: min 3s between stop operations
+  - UNSET alert: if stop remains unset >60s, one-time Telegram warning
+
 FAIL-OPEN: Errors in this module never block trading, only log warnings.
 """
 
@@ -12,6 +20,9 @@ import os
 import sys
 import time
 import json
+import random
+import string
+import threading
 import traceback
 
 sys.path.insert(0, '/root/trading-bot/app')
@@ -19,7 +30,8 @@ sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[server_stop]'
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 _VERIFY_INTERVAL_SEC = 30
-_last_verify_ts = 0
+_DEBOUNCE_SEC = 3
+_UNSET_ALERT_SEC = 60
 
 
 def _log(msg):
@@ -43,10 +55,18 @@ def _notify_telegram(text):
     try:
         import urllib.parse
         import urllib.request
-        from dotenv import load_dotenv
-        load_dotenv('/root/trading-bot/app/telegram_cmd.env')
-        token = os.getenv('TELEGRAM_BOT_TOKEN')
-        chat_id = os.getenv('TELEGRAM_ALLOWED_CHAT_ID')
+        cfg = {}
+        try:
+            with open('/root/trading-bot/app/telegram_cmd.env') as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.split('=', 1)
+                        cfg[k.strip()] = v.strip()
+        except Exception:
+            pass
+        token = cfg.get('TELEGRAM_BOT_TOKEN', '')
+        chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
         if not token or not chat_id:
             return
         url = f'https://api.telegram.org/bot{token}/sendMessage'
@@ -60,21 +80,36 @@ def _notify_telegram(text):
         pass
 
 
+def _make_unique_id(prefix='SL'):
+    """Generate unique clientOrderId: SL_<epoch_ms>_<rand6>."""
+    ts = int(time.time() * 1000)
+    rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f'{prefix}_{ts}_{rand}'
+
+
 class ServerStopManager:
     """Manages server-side conditional stop-market orders on Bybit."""
 
     def __init__(self, symbol=SYMBOL):
         self.symbol = symbol
-        self._exchange = None
-        self._version = 0
+        self._exchange = _get_exchange()  # FIX: init eagerly (thread-safe)
         self._last_order_id = None
         self._last_stop_price = None
         self._last_verify_ts = 0
+        self._last_sync_ts = 0
+        self._last_set_result = None       # 'OK' | 'FAILED' | 'DUPLICATE_OK' etc
+        self._last_set_ts = 0
+        self._unset_since = 0              # 0 = not unset
+        self._unset_alert_sent = False
+        self._lock = threading.Lock()
+        self._last_client_id = None        # Track actual clientOrderId for DB
 
     def _ex(self):
-        if self._exchange is None:
-            self._exchange = _get_exchange()
         return self._exchange
+
+    # ──────────────────────────────────────────────────────────
+    # MAIN ENTRY: sync_stop_order
+    # ──────────────────────────────────────────────────────────
 
     def sync_stop_order(self, cur, position, sl_price):
         """Main entry point: ensure server-side stop exists and matches.
@@ -90,72 +125,163 @@ class ServerStopManager:
         if not feature_flags.is_enabled('ff_server_stop_orders'):
             return (True, 'ff_server_stop_orders OFF')
 
+        # Mutex: serialize per-symbol stop operations
+        if not self._lock.acquire(blocking=False):
+            return (True, 'lock held — skipping')
+
+        try:
+            # FIX: Debounce check INSIDE the lock to prevent race
+            now = time.time()
+            if now - self._last_sync_ts < _DEBOUNCE_SEC:
+                return (True, f'debounce ({_DEBOUNCE_SEC}s)')
+            self._last_sync_ts = now
+            return self._sync_inner(cur, position, sl_price)
+        finally:
+            self._lock.release()
+
+    def _sync_inner(self, cur, position, sl_price):
+        """Core sync logic (called under lock)."""
         try:
             side = position.get('side', '').lower()
             qty = float(position.get('qty', 0))
             if not side or qty <= 0 or not sl_price or sl_price <= 0:
                 return (True, 'no position or invalid params')
 
-            # Server stop is 0.1% wider than Python SL
+            # Compute server stop price (0.1% wider than Python SL)
             from strategy_v3 import config_v3
             cfg = config_v3.get_all()
             offset_pct = cfg.get('server_stop_offset_pct', 0.1)
 
             if side == 'long':
-                # For long: stop triggers below, so set lower
                 server_stop_price = round(sl_price * (1 - offset_pct / 100), 2)
             else:
-                # For short: stop triggers above, so set higher
                 server_stop_price = round(sl_price * (1 + offset_pct / 100), 2)
 
-            # Check if existing stop is close enough (within 0.05%)
-            if (self._last_stop_price and self._last_order_id and
-                    abs(server_stop_price - self._last_stop_price) / server_stop_price < 0.0005):
-                # Periodic verify
-                if time.time() - self._last_verify_ts >= _VERIFY_INTERVAL_SEC:
-                    verified = self._verify_stop_exists()
-                    if not verified:
-                        _log('STOP MISSING on verify — recreating')
-                        _notify_telegram('⚠ Server STOP missing — recreating')
-                    else:
-                        return (True, f'stop in sync @ {server_stop_price}')
-                else:
-                    return (True, f'stop in sync @ {server_stop_price}')
+            if server_stop_price <= 0:
+                return (True, 'computed stop price <= 0')
 
-            # Cancel existing stop if price changed
-            if self._last_order_id:
-                self._cancel_stop(self._last_order_id)
+            # ── Step 1: Pre-check existing stop on exchange ──
+            existing = self._fetch_existing_stops()
 
-            # Place new stop
+            if existing:
+                for stop in existing:
+                    ex_price = float(stop.get('trigger_price', 0))
+                    if ex_price > 0 and abs(server_stop_price - ex_price) / server_stop_price < 0.001:
+                        oid = stop.get('order_id', '')
+                        self._last_order_id = oid
+                        self._last_stop_price = ex_price
+                        self._last_set_result = 'OK'
+                        self._last_set_ts = time.time()
+                        self._clear_unset()
+                        self._last_verify_ts = time.time()
+                        return (True, f'stop already set @ {ex_price} (id={oid})')
+
+                # Existing stop at different price → cancel all and re-place
+                for stop in existing:
+                    self._cancel_stop(stop.get('order_id', ''))
+
+            elif self._last_order_id:
+                self._last_order_id = None
+                self._last_stop_price = None
+
+            # ── Step 2: Place new stop ──
             close_side = 'sell' if side == 'long' else 'buy'
-            success, order_id = self._place_stop_market(
+            success, order_id, ret_code = self._place_stop_market(
                 close_side, qty, server_stop_price, side)
 
             if success:
                 self._last_order_id = order_id
                 self._last_stop_price = server_stop_price
-                self._version += 1
-                # DB record
+                self._last_set_result = 'OK'
+                self._last_set_ts = time.time()
+                self._last_verify_ts = time.time()
+                self._clear_unset()
                 self._db_record(cur, order_id, close_side, qty,
                                 server_stop_price, 'ACTIVE')
                 return (True, f'stop placed @ {server_stop_price} (id={order_id})')
-            else:
-                _log(f'STOP placement failed: {order_id}')
-                return (False, f'placement failed: {order_id}')
+
+            # ── Step 3: Handle 110072 (duplicate orderLinkId) ──
+            if ret_code == 110072:
+                return self._handle_duplicate(cur, close_side, qty,
+                                              server_stop_price, side)
+
+            # Other failure
+            self._last_set_result = f'FAILED({ret_code})'
+            self._last_set_ts = time.time()
+            self._mark_unset()
+            _log(f'STOP placement failed: ret={ret_code} detail={order_id}')
+            return (False, f'placement failed: {order_id}')
 
         except Exception as e:
             _log(f'sync_stop_order error (FAIL-OPEN): {e}')
             traceback.print_exc()
+            self._last_set_result = f'ERROR({e})'
+            self._last_set_ts = time.time()
             return (False, f'error: {e}')
+
+    # ──────────────────────────────────────────────────────────
+    # 110072 HANDLER
+    # ──────────────────────────────────────────────────────────
+
+    def _handle_duplicate(self, cur, close_side, qty, desired_price, position_side):
+        """Handle Bybit 110072 (OrderLinkedID duplicate).
+        Re-query exchange → if SL is already set, treat as OK.
+        Otherwise retry once with a fresh unique ID."""
+        _log('110072: duplicate orderLinkId — re-checking exchange')
+
+        existing = self._fetch_existing_stops()
+        if existing:
+            for stop in existing:
+                ex_price = float(stop.get('trigger_price', 0))
+                oid = stop.get('order_id', '')
+                if ex_price > 0:
+                    self._last_order_id = oid
+                    self._last_stop_price = ex_price
+                    self._last_set_result = 'DUPLICATE_OK'
+                    self._last_set_ts = time.time()
+                    self._clear_unset()
+                    _log(f'110072 resolved: stop exists @ {ex_price} (id={oid})')
+                    return (True, f'stop already exists @ {ex_price} (110072 resolved)')
+
+        # No stop found → retry once with fresh ID
+        _log('110072: no existing stop found — retrying with new ID')
+        success, order_id, ret_code = self._place_stop_market(
+            close_side, qty, desired_price, position_side)
+
+        if success:
+            self._last_order_id = order_id
+            self._last_stop_price = desired_price
+            self._last_set_result = 'OK(retry)'
+            self._last_set_ts = time.time()
+            self._clear_unset()
+            self._db_record(cur, order_id, close_side, qty,
+                            desired_price, 'ACTIVE')
+            _log(f'110072 retry OK: stop placed @ {desired_price}')
+            return (True, f'stop placed @ {desired_price} (retry after 110072)')
+
+        # Final failure
+        self._last_set_result = f'FAILED(110072_retry:{ret_code})'
+        self._last_set_ts = time.time()
+        self._mark_unset()
+        _notify_telegram(
+            f'SERVER_STOP_UNSET\n'
+            f'110072 retry failed (retCode={ret_code})\n'
+            f'Desired SL: {desired_price}')
+        _log(f'110072 retry FAILED: ret={ret_code}')
+        return (False, f'110072 retry failed: {ret_code}')
+
+    # ──────────────────────────────────────────────────────────
+    # PLACE / CANCEL / VERIFY
+    # ──────────────────────────────────────────────────────────
 
     def _place_stop_market(self, close_side, qty, stop_price, position_side):
         """Place reduce-only conditional stop-market order on Bybit.
 
-        Returns: (success: bool, order_id_or_error: str)
+        Returns: (success: bool, order_id_or_error: str, ret_code: int)
         """
         try:
-            self._version += 1
-            client_id = f'STOP:{self.symbol}:{close_side}:{self._version}'
+            client_id = _make_unique_id('SL')
+            self._last_client_id = client_id
 
             # triggerDirection: 1=rise-above, 2=fall-below
             if position_side == 'long':
@@ -175,15 +301,31 @@ class ServerStopManager:
 
             order_id = order.get('id', '') or order.get('info', {}).get('orderId', '')
             _log(f'STOP placed: side={close_side} qty={qty} '
-                 f'trigger={stop_price} id={order_id}')
-            return (True, order_id)
+                 f'trigger={stop_price} id={order_id} clientId={client_id}')
+            return (True, order_id, 0)
 
         except Exception as e:
-            _log(f'_place_stop_market error: {e}')
-            return (False, str(e))
+            err_str = str(e)
+            ret_code = self._extract_ret_code(err_str)
+            _log(f'_place_stop_market error (ret={ret_code}): {e}')
+            return (False, err_str, ret_code)
+
+    def _extract_ret_code(self, error_str):
+        """Extract Bybit retCode from error string."""
+        try:
+            if '"retCode":' in error_str:
+                import re
+                m = re.search(r'"retCode"\s*:\s*(\d+)', error_str)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        return -1
 
     def _cancel_stop(self, order_id):
         """Cancel existing conditional stop order."""
+        if not order_id:
+            return False
         try:
             self._ex().cancel_order(order_id, self.symbol, params={
                 'orderFilter': 'StopOrder',
@@ -194,65 +336,111 @@ class ServerStopManager:
             _log(f'_cancel_stop error (non-fatal): {e}')
             return False
 
-    def _verify_stop_exists(self):
-        """Verify server-side stop still exists. Called every 30s."""
-        self._last_verify_ts = time.time()
+    def _fetch_existing_stops(self):
+        """Fetch all existing stop orders from exchange.
+
+        Returns: list of {order_id, trigger_price, side, qty}
+        """
         try:
             orders = self._ex().fetch_open_orders(self.symbol, params={
                 'orderFilter': 'StopOrder',
             })
+            result = []
             for o in orders:
                 oid = o.get('id', '') or o.get('info', {}).get('orderId', '')
-                if oid == self._last_order_id:
-                    return True
-            return False
+                trigger = (o.get('info', {}).get('triggerPrice') or
+                           o.get('triggerPrice') or
+                           o.get('stopPrice') or 0)
+                result.append({
+                    'order_id': oid,
+                    'trigger_price': float(trigger) if trigger else 0,
+                    'side': o.get('side', ''),
+                    'qty': float(o.get('amount', 0)),
+                })
+            return result
         except Exception as e:
-            _log(f'_verify_stop_exists error: {e}')
-            return True  # FAIL-OPEN: assume exists on error
+            _log(f'_fetch_existing_stops error: {e}')
+            return []
 
     def cancel_all_stops(self, cur=None):
         """Cancel all server-side stops for this symbol. Called on position close."""
-        try:
-            orders = self._ex().fetch_open_orders(self.symbol, params={
-                'orderFilter': 'StopOrder',
-            })
-            cancelled = 0
-            for o in orders:
-                oid = o.get('id', '') or o.get('info', {}).get('orderId', '')
-                if oid:
-                    self._cancel_stop(oid)
-                    if cur:
-                        self._db_update_status(cur, oid, 'CANCELLED',
-                                               'position_closed')
-                    cancelled += 1
-            self._last_order_id = None
-            self._last_stop_price = None
-            _log(f'cancel_all_stops: {cancelled} cancelled')
-            return cancelled
-        except Exception as e:
-            _log(f'cancel_all_stops error: {e}')
-            return 0
+        # FIX: acquire lock to prevent race with sync_stop_order
+        with self._lock:
+            try:
+                existing = self._fetch_existing_stops()
+                cancelled = 0
+                for stop in existing:
+                    oid = stop.get('order_id', '')
+                    if oid:
+                        self._cancel_stop(oid)
+                        if cur:
+                            self._db_update_status(cur, oid, 'CANCELLED',
+                                                   'position_closed')
+                        cancelled += 1
+                self._last_order_id = None
+                self._last_stop_price = None
+                self._last_set_result = None
+                self._clear_unset()
+                _log(f'cancel_all_stops: {cancelled} cancelled')
+                return cancelled
+            except Exception as e:
+                _log(f'cancel_all_stops error: {e}')
+                return 0
+
+    # ──────────────────────────────────────────────────────────
+    # UNSET ALERT TRACKING
+    # ──────────────────────────────────────────────────────────
+
+    def _mark_unset(self):
+        """Mark stop as unset — starts the 60s alert timer."""
+        if self._unset_since == 0:
+            self._unset_since = time.time()
+            self._unset_alert_sent = False
+
+    def _clear_unset(self):
+        """Clear unset state — stop is confirmed on exchange."""
+        self._unset_since = 0
+        self._unset_alert_sent = False
+
+    def check_unset_alert(self):
+        """Call periodically to send one-time alert if stop remains unset >60s."""
+        if (self._unset_since > 0 and
+                not self._unset_alert_sent and
+                time.time() - self._unset_since >= _UNSET_ALERT_SEC):
+            self._unset_alert_sent = True
+            _notify_telegram(
+                f'SERVER STOP UNSET > {_UNSET_ALERT_SEC}s\n'
+                f'Last result: {self._last_set_result}\n'
+                f'Symbol: {self.symbol}')
+            _log(f'UNSET ALERT: stop unset for >{_UNSET_ALERT_SEC}s')
+
+    # ──────────────────────────────────────────────────────────
+    # STATUS / DB
+    # ──────────────────────────────────────────────────────────
 
     def get_status(self):
-        """Return status dict for /debug stop_orders."""
+        """Return status dict for /debug stop_orders and /bundle."""
         return {
             'symbol': self.symbol,
             'last_order_id': self._last_order_id,
             'last_stop_price': self._last_stop_price,
-            'version': self._version,
+            'last_set_result': self._last_set_result,
+            'last_set_ts': self._last_set_ts,
             'last_verify_ts': self._last_verify_ts,
+            'unset_since': self._unset_since,
             'ff_enabled': _is_ff_enabled(),
         }
 
     def _db_record(self, cur, order_id, side, qty, stop_price, status):
         """Record stop order to DB."""
         try:
+            # FIX: use actual clientOrderId instead of generated REC_ prefix
+            actual_client_id = self._last_client_id or _make_unique_id('REC')
             cur.execute("""
                 INSERT INTO server_stop_orders
                     (symbol, order_id, client_order_id, side, qty, stop_price, status)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """, (self.symbol, order_id,
-                  f'STOP:{self.symbol}:{side}:{self._version}',
+            """, (self.symbol, order_id, actual_client_id,
                   side, qty, stop_price, status))
         except Exception as e:
             _log(f'_db_record error: {e}')
@@ -277,13 +465,16 @@ def _is_ff_enabled():
         return False
 
 
-# Module-level singleton
+# Module-level singleton with thread-safe init
 _manager = None
+_manager_lock = threading.Lock()
 
 
 def get_manager(symbol=SYMBOL):
-    """Get or create singleton ServerStopManager."""
+    """Get or create singleton ServerStopManager (thread-safe)."""
     global _manager
     if _manager is None:
-        _manager = ServerStopManager(symbol)
+        with _manager_lock:
+            if _manager is None:
+                _manager = ServerStopManager(symbol)
     return _manager

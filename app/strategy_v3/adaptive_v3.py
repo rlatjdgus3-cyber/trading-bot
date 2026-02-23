@@ -30,6 +30,9 @@ _state = {
     'last_trade_ts': 0,
     'anti_paralysis_stage': 0,    # 0=none, 1=partial_reset, 2=full_reset
     'anti_paralysis_reset_ts': 0,
+    # D2-2: 히스테리시스 — penalty 완화 시 연속 개선 신호 카운트
+    'wr_recovery_consecutive': 0,  # 연속 개선 카운트
+    'last_wr_sample': 0.0,         # 직전 WR 값
 }
 
 
@@ -345,13 +348,25 @@ def compute_layer1(cur, entry_mode, cfg):
         wr, total = _query_global_wr(cur, wr_trades)
         result['l1_global_wr'] = wr
 
-        # 1C. Hysteresis
+        # 1C. Hysteresis — D2-2: penalty 완화에 N회 연속 개선 요구
+        relax_consecutive = int(cfg.get('adaptive_penalty_relax_consecutive', 3))
         if total >= wr_trades:
             if wr < wr_low:
                 _state['global_wr_penalty_active'] = True
+                _state['wr_recovery_consecutive'] = 0  # 리셋
             elif wr >= wr_recovery:
-                _state['global_wr_penalty_active'] = False
-            # else: 0.35~0.40 → hold current state
+                # D2-2: Consecutive improvement count — strict > (stagnation = no progress)
+                _last_wr = _state.get('last_wr_sample', -1)  # default -1 so first sample counts
+                if wr > _last_wr:
+                    _state['wr_recovery_consecutive'] = _state.get('wr_recovery_consecutive', 0) + 1
+                else:
+                    _state['wr_recovery_consecutive'] = 0  # stagnation or worse = reset
+                if _state.get('wr_recovery_consecutive', 0) >= relax_consecutive:
+                    _state['global_wr_penalty_active'] = False
+                    _state['wr_recovery_consecutive'] = 0
+                    _log(f'[L1] WR penalty RELAXED after {relax_consecutive} consecutive improvements')
+            # else: wr_low~wr_recovery → hold current state
+            _state['last_wr_sample'] = wr
 
         if _state['global_wr_penalty_active']:
             result['l1_global_wr_block'] = True
@@ -394,6 +409,17 @@ def _check_anti_paralysis(cur, cfg, result):
         off_seconds = _get_trade_switch_off_seconds(cur)
         effective_no_trade = no_trade_duration - off_seconds
 
+        # D2-2: 24h zero-trade partial reset (one-shot, not every cycle)
+        zero_trade_reset = cfg.get('adaptive_24h_zero_trade_partial_reset', True)
+        if zero_trade_reset and effective_no_trade >= hours_1 * 3600 and health_ok:
+            if not _state.get('_24h_partial_reset_done', False):
+                # One-shot: ease penalty and reset hysteresis counter once
+                if result.get('l1_penalty', 1.0) < 0.85:
+                    result['l1_penalty'] = 0.85
+                    _log('[L1] Anti-Paralysis: 24h zero-trade penalty eased to 0.85')
+                _state['wr_recovery_consecutive'] = 0
+                _state['_24h_partial_reset_done'] = True
+
         if effective_no_trade >= hours_2 * 3600 and health_ok:
             # Full reset
             if _state['anti_paralysis_stage'] < 2:
@@ -404,6 +430,7 @@ def _check_anti_paralysis(cur, cfg, result):
             _state['mode_cooldowns'] = {}
             _state['global_wr_penalty_active'] = False
             _state['mode_wr_penalty'] = {}
+            _state['wr_recovery_consecutive'] = 0
             result['l1_penalty'] = 1.0
             result['l1_cooldown_active'] = False
             result['l1_global_wr_block'] = False
@@ -432,6 +459,7 @@ def _check_anti_paralysis(cur, cfg, result):
             # Reset anti-paralysis counter if trade happened
             if _state['anti_paralysis_stage'] > 0 and last_trade_ts > _state['anti_paralysis_reset_ts']:
                 _state['anti_paralysis_stage'] = 0
+                _state['_24h_partial_reset_done'] = False  # reset one-shot flag
     except Exception as e:
         _log(f'Anti-paralysis check FAIL-OPEN: {e}')
 

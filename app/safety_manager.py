@@ -166,6 +166,36 @@ def check_service_health():
         return (True, 'health check unavailable')
 
 
+def check_server_stop_gate(cur):
+    """D0-3: 서버측 SL 설정 실패 시 신규 진입 차단.
+    Returns (ok, reason). EXIT/CLOSE는 항상 허용.
+    포지션 없음(row=None) → 허용 (server stop은 진입 후 설정).
+    포지션 있고 status=FAILED → 차단."""
+    try:
+        import feature_flags as _ff_ssg
+        if not _ff_ssg.is_enabled('ff_server_stop_orders'):
+            return (True, 'ff_server_stop_orders disabled')
+        cur.execute("""
+            SELECT server_stop_status, side, total_qty
+            FROM position_state WHERE symbol = %s;
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        if not row:
+            return (True, 'no position_state row — server stop will be set on entry')
+        # FIX: Only check status when position is actually active
+        # Stale FAILED from previous trade should NOT block new entries
+        _status, _side, _qty = row[0], row[1], float(row[2] or 0)
+        if not _side or _qty <= 0:
+            return (True, 'no active position — server stop will be set on entry')
+        if _status == 'FAILED':
+            _log('SERVER STOP GATE: entry blocked (server_stop_status=FAILED, active position)')
+            return (False, 'SERVER STOP FAILED — entry blocked (SL not set)')
+        return (True, f'ok (status={_status})')
+    except Exception as e:
+        _log(f'check_server_stop_gate error (FAIL-OPEN): {e}')
+        return (True, 'server stop gate check unavailable')
+
+
 def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_override=False):
     '''Run all safety checks. Returns (ok, reason).
     When emergency=True or manual_override=True, daily/hourly trade limits are BYPASSED.
@@ -177,6 +207,12 @@ def run_all_checks(cur, target_usdt=0, limits=None, emergency=False, manual_over
     '''
     if limits is None:
         limits = _load_safety_limits(cur)
+
+    # D0-3: Server stop gate (SL 설정 실패 시 신규 진입 차단)
+    if not emergency and not manual_override:
+        ssg_ok, ssg_reason = check_server_stop_gate(cur)
+        if not ssg_ok:
+            return (False, ssg_reason)
 
     # P0-5: Health entry gate (진입/ADD 차단, EXIT 허용)
     if not emergency and not manual_override:

@@ -1509,6 +1509,45 @@ def ensure_news_impact_stats_extended(cur):
     _log('ensure_news_impact_stats_extended done')
 
 
+def ensure_hemorrhage_mode_limits(cur):
+    """D0-2: 지혈 모드 — max_stages=1, trade_budget_pct=20 강제 적용."""
+    cur.execute("""
+        UPDATE safety_limits SET max_stages = 1, trade_budget_pct = 20
+        WHERE max_stages > 1 OR trade_budget_pct > 20;
+    """)
+    _log('ensure_hemorrhage_mode_limits done')
+
+
+def ensure_position_state_stop_status(cur):
+    """D0-3: server_stop_status 컬럼 추가 — 서버 SL 상태 추적."""
+    cur.execute("""
+        ALTER TABLE position_state
+        ADD COLUMN IF NOT EXISTS server_stop_status TEXT DEFAULT NULL;
+    """)
+    _log('ensure_position_state_stop_status done')
+
+
+def ensure_panic_guard_events(cur):
+    """D1-1: panic_guard_events 테이블 — WS PanicGuard 이벤트 기록."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS panic_guard_events (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            action TEXT NOT NULL,
+            ret_1m DOUBLE PRECISION,
+            price DOUBLE PRECISION,
+            meta JSONB
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_panic_guard_events_ts
+        ON panic_guard_events (ts DESC);
+    """)
+    _log('ensure_panic_guard_events done')
+
+
 def run_all():
     '''Run all migrations. Safe to call multiple times.'''
     conn = None
@@ -1684,6 +1723,12 @@ def run_all():
             ensure_supervisor_reports(cur)
             ensure_strategy_config_versions(cur)
             ensure_strategy_change_proposals(cur)
+            # D0-2: 지혈 모드 — max_stages=1, cap=20%
+            ensure_hemorrhage_mode_limits(cur)
+            # D0-3: position_state.server_stop_status 컬럼
+            ensure_position_state_stop_status(cur)
+            # D1-1: panic_guard_events 테이블
+            ensure_panic_guard_events(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

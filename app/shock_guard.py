@@ -183,6 +183,98 @@ def is_entry_frozen():
     return (False, 0)
 
 
+# D1-1: PanicGuard 단계적 대응 — 쿨다운 상태
+_panic_last_action_ts = 0
+
+
+def get_graduated_action(cur, position):
+    """D1-1: 단계적 급락 대응 판정.
+
+    Args:
+        cur: DB cursor
+        position: dict {side, qty, entry_price}
+
+    Returns:
+        (action, detail) where action = None | 'TIGHTEN_STOP' | 'REDUCE_HALF' | 'CLOSE_ALL'
+    """
+    global _panic_last_action_ts
+
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_shock_guard'):
+            return (None, 'ff_shock_guard OFF')
+
+        from strategy_v3 import config_v3
+        cfg = config_v3.get_all()
+        tighten_pct = cfg.get('panic_guard_tighten_pct', 0.35)
+        reduce_pct = cfg.get('panic_guard_reduce_pct', 0.60)
+        close_pct = cfg.get('panic_guard_close_pct', 1.00)
+        cooldown_sec = cfg.get('panic_guard_cooldown_sec', 60)
+
+        side = position.get('side', '').lower()
+        entry_price = float(position.get('entry_price', 0))
+        if not side or entry_price <= 0:
+            return (None, 'no position')
+
+        # 쿨다운 체크
+        now = time.time()
+        if now - _panic_last_action_ts < cooldown_sec:
+            remaining = cooldown_sec - (now - _panic_last_action_ts)
+            return (None, f'COOLDOWN ({remaining:.0f}s remaining)')
+
+        # 최신 1분봉 수익률 계산
+        cur.execute("""
+            SELECT o, c FROM candles
+            WHERE symbol = %s AND tf = '1m'
+            ORDER BY ts DESC LIMIT 1;
+        """, (SYMBOL,))
+        row = cur.fetchone()
+        if not row or not row[0] or float(row[0]) <= 0:
+            return (None, 'no candle data')
+
+        candle_open = float(row[0])
+        candle_close = float(row[1])
+        ret_1m = (candle_close - candle_open) / candle_open * 100
+
+        # 불리한 방향 판별 (long이면 하락이 불리, short이면 상승이 불리)
+        adverse_ret = -ret_1m if side == 'long' else ret_1m
+
+        if adverse_ret < tighten_pct:
+            return (None, f'no action (adverse={adverse_ret:.3f}% < tighten={tighten_pct}%)')
+
+        # 단계적 대응 결정
+        if adverse_ret >= close_pct:
+            action = 'CLOSE_ALL'
+        elif adverse_ret >= reduce_pct:
+            action = 'REDUCE_HALF'
+        else:
+            action = 'TIGHTEN_STOP'
+
+        _panic_last_action_ts = now
+        detail = f'{action}: adverse_ret={adverse_ret:.3f}% (thresholds: T={tighten_pct} R={reduce_pct} C={close_pct})'
+
+        # DB 기록
+        record_panic_event(cur, action, adverse_ret, candle_close, side)
+
+        _log(f'PANIC GUARD: {detail}')
+        return (action, detail)
+
+    except Exception as e:
+        _log(f'get_graduated_action FAIL-OPEN: {e}')
+        return (None, f'error: {e}')
+
+
+def record_panic_event(cur, action, ret_pct, price, side='unknown'):
+    """D1-1: panic_guard_events 테이블에 이벤트 기록."""
+    try:
+        cur.execute("""
+            INSERT INTO panic_guard_events (symbol, side, action, ret_1m, price, meta)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb);
+        """, (SYMBOL, side, action, ret_pct, price, json.dumps({'ts': time.time()})))
+    except Exception as e:
+        _log(f'record_panic_event error: {e}')
+
+
 def get_shock_status():
     """Return full shock guard status for /debug."""
     frozen, remaining = is_entry_frozen()
@@ -192,6 +284,14 @@ def get_shock_status():
     except Exception:
         ff_on = False
 
+    # Read cooldown from config (not hardcoded)
+    try:
+        from strategy_v3 import config_v3
+        _cfg = config_v3.get_all()
+        _cooldown = _cfg.get('panic_guard_cooldown_sec', 60)
+    except Exception:
+        _cooldown = 60
+
     return {
         'ff_enabled': ff_on,
         'frozen': frozen,
@@ -199,4 +299,5 @@ def get_shock_status():
         'freeze_until': _freeze_until,
         'last_shock_pct': round(_last_shock_pct, 4),
         'last_shock_ts': _last_shock_ts,
+        'panic_cooldown_remaining': max(0, round(_cooldown - (time.time() - _panic_last_action_ts), 1)),
     }

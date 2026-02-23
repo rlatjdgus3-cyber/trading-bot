@@ -276,6 +276,78 @@ def _apply_hysteresis(raw_class):
     return _v3_state['current_class']
 
 
+def compute_trend_probability(features):
+    """D2-1: 연속 확률 0.0~1.0 — 트렌드 존재 확률.
+
+    Components:
+      ADX component (0~0.4): ADX 25+ → strong trend signal
+      Drift component (0~0.3): drift magnitude → directional momentum
+      Volume_z component (0~0.3): volume above average → conviction
+
+    Returns:
+        float 0.0~1.0 (0 = no trend, 1 = strong trend)
+    """
+    try:
+        if not features:
+            return 0.0  # no data = no trend signal (FAIL-OPEN: won't trigger no-trade zone)
+
+        # ADX component (weight: 0.4)
+        # FIX: check both 'adx_14' and 'adx' keys for compatibility
+        adx = safe_float(features.get('adx_14') or features.get('adx'), 20)
+        if adx >= 40:
+            adx_score = 0.4
+        elif adx >= 25:
+            adx_score = 0.2 + 0.2 * (adx - 25) / 15
+        elif adx >= 15:
+            adx_score = 0.1 + 0.1 * (adx - 15) / 10
+        else:
+            adx_score = adx / 15 * 0.1
+
+        # Drift component (weight: 0.3)
+        drift = abs(safe_float(features.get('drift_score'), 0))
+        if drift >= 0.002:
+            drift_score = 0.3
+        elif drift >= 0.001:
+            drift_score = 0.15 + 0.15 * (drift - 0.001) / 0.001
+        else:
+            drift_score = drift / 0.001 * 0.15
+
+        # Volume_z component (weight: 0.3)
+        vol_z = safe_float(features.get('volume_z'), 0)
+        if vol_z >= 2.0:
+            vol_score = 0.3
+        elif vol_z >= 1.0:
+            vol_score = 0.15 + 0.15 * (vol_z - 1.0) / 1.0
+        elif vol_z >= 0:
+            vol_score = vol_z / 1.0 * 0.15
+        else:
+            vol_score = 0.0
+
+        return round(min(1.0, adx_score + drift_score + vol_score), 4)
+
+    except Exception as e:
+        _log(f'compute_trend_probability error: {e}')
+        return 0.5
+
+
+def is_no_trade_zone(trend_prob, cfg=None):
+    """D2-1: no-trade zone 판별 (0.30~0.70 구간 = 방향성 불확실).
+
+    Returns:
+        (is_ntx: bool, reason: str)
+    """
+    try:
+        if cfg is None:
+            cfg = config_v3.get_all()
+        ntx_low = cfg.get('no_trade_zone_low', 0.30)
+        ntx_high = cfg.get('no_trade_zone_high', 0.70)
+        if ntx_low <= trend_prob <= ntx_high:
+            return (True, f'NO_TRADE_ZONE: trend_prob={trend_prob:.3f} in [{ntx_low},{ntx_high}]')
+        return (False, f'trend_prob={trend_prob:.3f} outside no-trade zone')
+    except Exception as e:
+        return (False, f'ntx check error: {e}')
+
+
 def classify(features, regime_ctx, prev_state=None):
     """Classify market regime into V3 4-state model.
 

@@ -608,6 +608,18 @@ def _eq_handle_reduce(ex, cur, eq_id, direction, reduce_pct, target_qty,
 
 def _eq_handle_add(ex, cur, eq_id, direction, target_usdt, reason, meta=None):
     """Handle ADD: pyramid add to position."""
+    # D0-1: 전역 ADD 차단 (ff_global_add_block) — 최종 방어선
+    try:
+        import feature_flags as _ff_add
+        if _ff_add.is_enabled('ff_global_add_block'):
+            log(f"EQ id={eq_id} ADD blocked by GLOBAL_ADD_BLOCK")
+            _update_eq_status(cur, eq_id, "REJECTED")
+            audit(cur, "EQ_REJECTED", SYMBOL, {
+                "eq_id": eq_id, "reason": "GLOBAL_ADD_BLOCK"})
+            return
+    except Exception:
+        pass  # FAIL-OPEN: feature_flags 로드 실패 시 기존 로직으로 진행
+
     # Protection mode: block OPEN/ADD
     pm_ok, pm_reason = ecl.check_protection_mode_for_action('ADD')
     if not pm_ok:

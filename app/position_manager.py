@@ -1888,8 +1888,12 @@ def _decide(ctx=None):
     if regime_stage_max == 0:
         return ('HOLD', f'REGIME VETO: ADD 차단 ({regime_ctx.get("regime")})')
 
-    # P0-3: Hard ADD block in loss zone (unconditional when ff enabled)
+    # D0-1: 전역 ADD 차단 (ff_global_add_block) — 손익 무관 전면 차단
     import feature_flags as _ff
+    if _ff.is_enabled('ff_global_add_block'):
+        return ('HOLD', 'GLOBAL_ADD_BLOCK: 전역 ADD 차단 활성')
+
+    # P0-3: Hard ADD block in loss zone (unconditional when ff enabled)
     if _ff.is_enabled('ff_loss_zone_add_block'):
         if entry and entry > 0:
             if side == 'long':
@@ -1989,6 +1993,16 @@ def _build_leverage_context(ctx):
 def _enqueue_action(cur=None, action_type=None, direction=None, **kwargs):
     '''Insert action into execution_queue.'''
     import safety_manager
+
+    # D0-1: Global ADD block — covers ALL ADD paths (event, emergency, score engine)
+    if action_type == 'ADD':
+        try:
+            import feature_flags as _ff_eq
+            if _ff_eq.is_enabled('ff_global_add_block'):
+                _log(f'ENQUEUE BLOCKED: ADD {direction} — ff_global_add_block')
+                return None
+        except Exception:
+            pass
 
     # v14.1: Throttle pre-gate — block ENTRY actions at enqueue time
     # This prevents execution_queue flooding when rate limits are active
@@ -2283,8 +2297,10 @@ def _spawn_async_claude(ctx, event_result, snapshot, reason):
             _log('[async_claude] skipped: thread already running')
             return False
 
-        # Deep copy for thread safety
-        ctx_copy = copy.deepcopy(ctx)
+        # Deep copy for thread safety — exclude non-picklable objects (cursor, conn)
+        _skip_keys = {'cur', 'conn', 'cursor', 'connection'}
+        ctx_safe = {k: v for k, v in ctx.items() if k not in _skip_keys}
+        ctx_copy = copy.deepcopy(ctx_safe)
         snapshot_copy = copy.deepcopy(snapshot)
 
         _claude_thread = threading.Thread(
@@ -2622,11 +2638,38 @@ def _cycle():
                 import shock_guard
                 frozen, remaining = shock_guard.is_entry_frozen()
                 if frozen and action in ('ADD',):
-                    _log(f'SHOCK FREEZE: {action} blocked ({remaining:.0f}s remaining)')
+                    # FIX: build reason BEFORE overwriting action
+                    _orig_action = action
+                    reason = f'SHOCK FREEZE: {_orig_action} blocked ({remaining:.0f}s)'
+                    _log(f'SHOCK FREEZE: {_orig_action} blocked ({remaining:.0f}s remaining)')
                     action = 'HOLD'
-                    reason = f'SHOCK FREEZE: {action} 차단 ({remaining:.0f}s)'
             except Exception:
                 pass
+
+            # D1-1: PanicGuard graduated response fallback (WS daemon backup)
+            # FIX: Only ESCALATE — never downgrade a stronger action to weaker
+            _action_priority = {'HOLD': 0, 'ADD': 0, 'TIGHTEN_STOP': 1,
+                                'REDUCE': 2, 'CLOSE': 3, 'REVERSE': 4}
+            try:
+                import shock_guard as _sg_grad
+                if pos and pos.get('side') and pos.get('qty') and float(pos.get('qty', 0)) > 0:
+                    _grad_action, _grad_detail = _sg_grad.get_graduated_action(cur, pos)
+                    _mapped = {'CLOSE_ALL': 'CLOSE', 'REDUCE_HALF': 'REDUCE',
+                               'TIGHTEN_STOP': 'TIGHTEN_STOP'}.get(_grad_action)
+                    if _mapped and _action_priority.get(_mapped, 0) > _action_priority.get(action, 0):
+                        if _mapped == 'CLOSE':
+                            _log(f'PANIC GUARD FALLBACK: CLOSE_ALL — {_grad_detail}')
+                            action = 'CLOSE'
+                            reason = f'PANIC GUARD: {_grad_detail}'
+                        elif _mapped == 'REDUCE':
+                            _log(f'PANIC GUARD FALLBACK: REDUCE_HALF — {_grad_detail}')
+                            action = 'REDUCE'
+                            reason = f'PANIC GUARD REDUCE_HALF: {_grad_detail}'
+                    elif _grad_action == 'TIGHTEN_STOP':
+                        _log(f'PANIC GUARD FALLBACK: TIGHTEN_STOP — {_grad_detail}')
+                        ctx['panic_tighten_stop'] = True
+            except Exception as _pg_err:
+                _log(f'panic guard fallback error (FAIL-OPEN): {_pg_err}')
 
             # P0-2: Sync server-side stop order (after _decide, before action execution)
             try:
@@ -2635,6 +2678,10 @@ def _cycle():
                 _scores = ctx.get('scores', {})
                 if pos and pos.get('side') and pos.get('entry_price'):
                     _sl_base = _scores.get('dynamic_stop_loss_pct', 2.0)
+                    # TIGHTEN_STOP: SL tightened (50% reduction)
+                    if ctx.get('panic_tighten_stop'):
+                        _sl_base = _sl_base * 0.5
+                        _log(f'PANIC TIGHTEN: SL pct {_sl_base * 2:.2f}% -> {_sl_base:.2f}%')
                     _entry = pos.get('entry_price', 0)
                     if _entry > 0 and _sl_base > 0:
                         if pos['side'] == 'long':
@@ -2646,6 +2693,13 @@ def _cycle():
                     ssm.cancel_all_stops(cur)
             except Exception as _e:
                 _log(f'server_stop sync error (FAIL-OPEN): {_e}')
+
+            # FIX: check_unset_alert in separate try block (runs even if sync fails)
+            try:
+                import server_stop_manager as _ssm_alert
+                _ssm_alert.get_manager().check_unset_alert()
+            except Exception:
+                pass
 
             # Non-HOLD score_engine action → reset hold tracker
             if action != 'HOLD':

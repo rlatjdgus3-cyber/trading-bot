@@ -46,7 +46,9 @@ def set_trade_switch(cur, enabled: bool, off_reason=None):
         import trade_switch_recovery
         trade_switch_recovery.set_on(cur, changed_by='equity_guard')
     else:
-        cur.execute("INSERT INTO public.trade_switch(enabled) VALUES (%s);", (enabled,))
+        # D2-3: 표준 함수로 교체 (감사 추적)
+        import trade_switch_recovery
+        trade_switch_recovery.set_off_with_reason(cur, 'equity_guard_no_reason', changed_by='equity_guard')
 
 def get_cash(cur) -> Decimal:
     row = q1(cur, "SELECT capital_usdt FROM public.virtual_capital ORDER BY id DESC LIMIT 1;")

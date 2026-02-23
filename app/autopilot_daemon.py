@@ -1406,6 +1406,11 @@ def _check_breakout_structure_intact(cur, pos_side, regime_ctx):
 def _check_position_for_add(cur=None, pos_side=None, pos_qty=None, scores=None, regime_ctx=None):
     """Evaluate whether ADD is allowed for an existing position.
     Returns (decision, reason) -- 'ADD', 'HOLD', 'BLOCKED'."""
+    # D0-1: 전역 ADD 차단 (ff_global_add_block)
+    import feature_flags as _ff_add
+    if _ff_add.is_enabled('ff_global_add_block'):
+        return ('BLOCKED', 'GLOBAL_ADD_BLOCK')
+
     import safety_manager
     import regime_reader
     direction = 'LONG' if pos_side == 'long' else 'SHORT'
@@ -1890,6 +1895,15 @@ def _run_strategy_v2(cur, scores, regime_ctx):
         return 'ACTED'
 
     if action == 'ADD' and position:
+        # D0-1: Global ADD block (v2 path) — fail-CLOSED on error
+        try:
+            import feature_flags as _ff_v2add
+            if _ff_v2add.is_enabled('ff_global_add_block'):
+                _log('v2 ADD blocked: GLOBAL_ADD_BLOCK')
+                return 'HOLD'
+        except Exception as _ff_err:
+            _log(f'v2 ADD blocked: ff_global_add_block check error (fail-closed): {_ff_err}')
+            return 'HOLD'
         if dedupe_hit:
             _log('v2 ADD skipped: dedupe hit')
             return 'HOLD'
@@ -2371,6 +2385,29 @@ def _cycle():
                     _notify_telegram_throttled(
                         f'📊 ADD {decision}: {add_reason}', msg_type='add_blocked')
                 return
+
+            # D1-1: Shock guard freeze — 신규 진입 차단 (autopilot)
+            try:
+                import shock_guard as _sg_ap
+                _sg_frozen, _sg_remaining = _sg_ap.is_entry_frozen()
+                if _sg_frozen:
+                    _log(f'SHOCK FREEZE: ENTRY blocked ({_sg_remaining:.0f}s remaining)')
+                    return
+            except Exception:
+                pass  # FAIL-OPEN
+
+            # D2-1: No-trade zone filter (ff_no_trade_zone 뒤에 숨김)
+            try:
+                import feature_flags as _ff_ntx
+                if _ff_ntx.is_enabled('ff_no_trade_zone'):
+                    from strategy_v3.regime_v3 import compute_trend_probability, is_no_trade_zone
+                    _tp = compute_trend_probability(_v3_features or {})
+                    _is_ntx, _ntx_reason = is_no_trade_zone(_tp)
+                    if _is_ntx:
+                        _log(f'NO_TRADE_ZONE: ENTRY blocked — {_ntx_reason}')
+                        return
+            except Exception:
+                pass  # FAIL-OPEN
 
             # ── V3: SL cooldown + signal debounce (before emission gate) ──
             if _is_v3_enabled():

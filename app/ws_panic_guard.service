@@ -1,0 +1,14 @@
+[Unit]
+Description=WS PanicGuard — Real-time price shock protection daemon
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/trading-bot/app
+ExecStart=/usr/bin/python3 /root/trading-bot/app/ws_panic_guard.py
+Restart=always
+RestartSec=3
+EnvironmentFile=/root/trading-bot/app/.env
+
+[Install]
+WantedBy=multi-user.target

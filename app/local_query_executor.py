@@ -5220,15 +5220,17 @@ def _bundle(_text=None):
             try:
                 cur.execute("""
                     SELECT symbol, side, total_qty, avg_entry_price, stage,
-                           capital_used_usdt, plan_state, order_state, peak_upnl_pct
+                           capital_used_usdt, plan_state, order_state, peak_upnl_pct,
+                           server_stop_status
                     FROM position_state LIMIT 5;
                 """)
                 ps_rows = cur.fetchall()
                 ps_lines = []
                 for r in ps_rows:
+                    _sss = r[9] if len(r) > 9 else None
                     ps_lines.append(
                         f'  {r[0]}: side={r[1]} qty={r[2]} entry={r[3]} '
-                        f'stage={r[4]} cap={r[5]} plan={r[6]} order={r[7]} peak_upnl={r[8]}'
+                        f'stage={r[4]} cap={r[5]} plan={r[6]} order={r[7]} peak_upnl={r[8]} stop_status={_sss}'
                     )
                 sections.append('=== INTERNAL STATE ===\n' + '\n'.join(ps_lines) if ps_lines
                                 else '=== INTERNAL STATE ===\nposition_state 비어있음')
@@ -5298,6 +5300,16 @@ def _bundle(_text=None):
             # === MCTX ===
             try:
                 mctx_text = _mctx_status()
+                # D2-1: trend_probability + no-trade zone 정보 추가
+                try:
+                    from strategy_v3.regime_v3 import compute_trend_probability, is_no_trade_zone
+                    from strategy.common.features import build_feature_snapshot
+                    _tp_features = build_feature_snapshot(cur) if cur else {}
+                    _tp = compute_trend_probability(_tp_features)
+                    _is_ntx, _ntx_reason = is_no_trade_zone(_tp)
+                    mctx_text += f'\n  trend_prob={_tp:.4f} NO_TRADE={"YES" if _is_ntx else "NO"}'
+                except Exception:
+                    mctx_text += '\n  trend_prob=N/A'
                 sections.append(f'=== MCTX ===\n{mctx_text}')
             except Exception as e:
                 _log(f'bundle MCTX error: {e}')
@@ -5373,6 +5385,69 @@ def _bundle(_text=None):
             except Exception as e:
                 _log(f'bundle RECENT REJECTIONS error: {e}')
                 sections.append(f'=== RECENT REJECTIONS ===\n오류: {e}')
+
+            # === SERVER STOP ===
+            try:
+                import feature_flags as _ff_b
+                _ss_enabled = _ff_b.is_enabled('ff_server_stop_orders')
+                ss_lines = [f'  FF enabled: {_ss_enabled}']
+                if _ss_enabled:
+                    try:
+                        import server_stop_manager
+                        ssm = server_stop_manager.get_manager()
+                        _st = ssm.get_status()
+                        _set_ago = ''
+                        if _st.get('last_set_ts'):
+                            _set_ago = f' ({int(time.time() - _st["last_set_ts"])}s ago)'
+                        ss_lines.append(f'  STATUS: {_st.get("last_set_result", "N/A")}{_set_ago}')
+                        ss_lines.append(f'  stop_price: {_st.get("last_stop_price")}')
+                        ss_lines.append(f'  order_id: {_st.get("last_order_id", "N/A")}')
+                        _unset = _st.get('unset_since', 0)
+                        if _unset > 0:
+                            ss_lines.append(f'  ⚠ UNSET for {int(time.time() - _unset)}s')
+                    except Exception as _ss_e:
+                        ss_lines.append(f'  manager error: {_ss_e}')
+                    # DB status
+                    try:
+                        cur.execute("SELECT server_stop_status FROM position_state WHERE symbol = %s;", (SYMBOL,))
+                        _ss_row = cur.fetchone()
+                        ss_lines.append(f'  DB status: {_ss_row[0] if _ss_row else "N/A"}')
+                    except Exception:
+                        ss_lines.append('  DB status: query error')
+                sections.append('=== SERVER STOP ===\n' + '\n'.join(ss_lines))
+            except Exception as e:
+                sections.append(f'=== SERVER STOP ===\n  error: {e}')
+
+            # === PANIC GUARD ===
+            try:
+                import shock_guard as _sg_b
+                _sg_status = _sg_b.get_shock_status()
+                pg_lines = [
+                    f'  FF shock_guard: {_sg_status.get("ff_enabled")}',
+                    f'  frozen: {_sg_status.get("frozen")} ({_sg_status.get("remaining_sec", 0):.0f}s)',
+                    f'  last_shock_pct: {_sg_status.get("last_shock_pct", 0):.4f}%',
+                    f'  panic_cooldown: {_sg_status.get("panic_cooldown_remaining", 0):.0f}s',
+                ]
+                # Recent panic events
+                try:
+                    cur.execute("""
+                        SELECT action, ret_1m, price,
+                               to_char(ts AT TIME ZONE 'Asia/Seoul', 'MM-DD HH24:MI:SS') as ts_kr
+                        FROM panic_guard_events
+                        ORDER BY ts DESC LIMIT 3;
+                    """)
+                    _pe_rows = cur.fetchall()
+                    if _pe_rows:
+                        pg_lines.append('  recent events:')
+                        for _pe in _pe_rows:
+                            pg_lines.append(f'    {_pe[3]} {_pe[0]} ret={_pe[1]:.3f}% price={_pe[2]:.1f}')
+                    else:
+                        pg_lines.append('  recent events: none')
+                except Exception:
+                    pg_lines.append('  recent events: table not ready')
+                sections.append('=== PANIC GUARD ===\n' + '\n'.join(pg_lines))
+            except Exception as e:
+                sections.append(f'=== PANIC GUARD ===\n  error: {e}')
 
         return '\n\n'.join(sections)
     except Exception as e:

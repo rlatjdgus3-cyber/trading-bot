@@ -120,7 +120,7 @@ strategy_v3:
   breakout_max_sl: 0.02
   breakout_atr_sl_mult: 2.0
   impulse_chase_threshold: 1.5
-  max_stage_v3: 3
+  max_stage_v3: 1
   breakout_reverse_block: true
 
   # Scoring guards
@@ -166,6 +166,9 @@ strategy_v3:
   adaptive_combined_penalty_floor: 0.55
   adaptive_anti_paralysis_hours_1: 24
   adaptive_anti_paralysis_hours_2: 36
+  # D2-2: 히스테리시스 + 마비 방지 강화
+  adaptive_penalty_relax_consecutive: 3    # penalty 완화에 필요한 연속 "개선" 신호 수
+  adaptive_24h_zero_trade_partial_reset: true  # 24h 거래 0이면 penalty 부분 리셋
 
   # P0-1: SL basis conversion
   sl_basis: UPNL_PCT           # PRICE_PCT | UPNL_PCT | EQUITY_PCT
@@ -176,6 +179,12 @@ strategy_v3:
   shock_guard_atr_mult: 2.5
   shock_guard_freeze_sec: 300
   shock_guard_lookback_candles: 3
+
+  # D1-1: PanicGuard — WS 기반 단계적 급락 대응
+  panic_guard_tighten_pct: 0.35    # 0.35% adverse → SL 재조정
+  panic_guard_reduce_pct: 0.60     # 0.60% adverse → 50% 감축
+  panic_guard_close_pct: 1.00      # 1.00% adverse → 전량 청산
+  panic_guard_cooldown_sec: 60
 
   # P1-1: per-mode L1 cooldown (seconds)
   adaptive_l1_cooldown_5_sec_StaticRange: 7200
@@ -198,12 +207,16 @@ feature_flags:
   ff_news_health_command: true
   ff_news_upsert_enabled: true
   # P0 feature flags
-  ff_sl_basis_conversion: false     # P0-1: SL PRICE→UPNL 전환 (shadow 후 true)
-  ff_server_stop_orders: false      # P0-2: 서버사이드 스탑 주문
+  ff_sl_basis_conversion: true      # P0-1: SL PRICE→UPNL 전환 (D0-3: 활성화)
+  ff_server_stop_orders: true       # P0-2: 서버사이드 스탑 주문 (D0-3: 활성화)
+  ff_global_add_block: true          # D0-1: 전역 ADD 차단 (지혈 — 손익 무관 전면 차단)
   ff_loss_zone_add_block: true      # P0-3: 손실 중 ADD 차단 (즉시 ON)
-  ff_shock_guard: false             # P0-4: 1m 급변 방어
+  ff_shock_guard: true              # P0-4: 1m 급변 방어 (D0-3: 활성화)
+  ff_panic_guard_ws: true           # D1-1: WS PanicGuard 데몬 활성화
   ff_health_entry_gate: true        # P0-5: Health 기반 진입 게이트 (즉시 ON)
   ff_debug_risk_commands: true      # P0-6: 리스크 디버그 커맨드 (즉시 ON)
+  # D2 feature flags
+  ff_no_trade_zone: false           # D2-1: trend_probability 기반 no-trade zone (초기 비활성)
   # P1 feature flags
   ff_l2_strict_short: false         # P1-2: MeanRev SHORT 강화
   # P3 feature flags
