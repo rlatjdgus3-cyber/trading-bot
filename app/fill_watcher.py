@@ -783,6 +783,8 @@ def _handle_add_filled(ex, cur, eid, order_id, direction, filled_qty, avg_price,
         except Exception:
             pass
 
+    # Reset order_state so position_manager can resume management
+    _update_position_order_state(cur, 'FILLED')
     log(f'ADD VERIFIED: {direction} qty={filled_qty} price={avg_price} stage={new_stage} budget={budget_used_pct:.0f}%')
 
 
@@ -827,6 +829,12 @@ def _handle_reduce_filled(ex, cur, eid, order_id, direction, filled_qty, avg_pri
         fee_cost=fee_cost, fee_currency=fee_currency, realized_pnl=realized_pnl,
         pos_side=pos_side, pos_qty=pos_qty, close_reason=close_reason)
     _send_telegram(msg)
+    # Reset order_state so position_manager can resume management
+    _update_position_order_state(cur, 'FILLED')
+    try:
+        cur.execute("UPDATE position_state SET plan_state = 'PLAN.OPEN' WHERE symbol = %s AND plan_state = 'PLAN.EXITING';", (SYMBOL,))
+    except Exception:
+        pass
     log(f'REDUCE VERIFIED: {direction} qty={filled_qty} price={avg_price} pnl={realized_pnl}')
 
 
