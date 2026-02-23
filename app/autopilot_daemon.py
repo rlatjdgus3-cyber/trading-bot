@@ -1356,6 +1356,74 @@ def _notify_telegram_throttled(text, msg_type='info', cooldown_sec=600):
     _notify_telegram(text)
 
 
+# B2: Signal spam guard — same direction signal dedup
+_signal_emission_cache = {}  # {f'{symbol}_{direction}': [ts1, ts2, ...]}
+
+def _check_signal_spam(symbol, direction):
+    """Check if same direction signals exceeded 3/30min threshold.
+    Returns (ok: bool, cooldown_remaining: int)
+    """
+    key = f'{symbol}_{direction}'
+    now = time.time()
+    window_sec = 1800   # 30min
+    max_signals = 3
+    cooldown_sec = 1800  # 30min cooldown
+
+    history = _signal_emission_cache.get(key, [])
+    recent = [t for t in history if now - t < window_sec]
+    _signal_emission_cache[key] = recent
+
+    if len(recent) >= max_signals:
+        last = max(recent)
+        remaining = cooldown_sec - (now - last)
+        if remaining > 0:
+            return (False, int(remaining))
+    # Record this check as pending (actual record on signal creation)
+    return (True, 0)
+
+def _record_signal_spam(symbol, direction):
+    """Record a signal emission for spam guard tracking."""
+    key = f'{symbol}_{direction}'
+    _signal_emission_cache.setdefault(key, []).append(time.time())
+
+
+# B3: Post-impulse chasing ban
+_impulse_ban_until = 0
+
+def _check_impulse_ban(cur, direction):
+    """5min abs(change) >= 1.0% → 10~20min no-entry.
+    Especially: price_drop >= 1.5% AND direction==SHORT → 20min block.
+    Returns (ok: bool, remaining: float)
+    """
+    global _impulse_ban_until
+    now = time.time()
+    if now < _impulse_ban_until:
+        return (False, _impulse_ban_until - now)
+
+    try:
+        cur.execute("""
+            SELECT c FROM candles WHERE symbol=%s AND tf='1m'
+            ORDER BY ts DESC LIMIT 5;
+        """, (SYMBOL,))
+        rows = cur.fetchall()
+        if len(rows) >= 2:
+            latest = float(rows[0][0])
+            oldest = float(rows[-1][0])
+            if oldest > 0:
+                change_pct = abs(latest - oldest) / oldest * 100
+
+                if change_pct >= 1.0:
+                    ban_sec = 600  # 10min default
+                    # Crash + SHORT chasing = 20min
+                    if oldest > latest and direction == 'SHORT' and change_pct >= 1.5:
+                        ban_sec = 1200
+                    _impulse_ban_until = now + ban_sec
+                    return (False, ban_sec)
+    except Exception:
+        pass  # FAIL-OPEN
+    return (True, 0)
+
+
 def _check_same_dir_reentry_cooldown(cur, direction, regime_params):
     """v14.1: Check same-direction re-entry cooldown.
     After a position is closed, block same-direction re-entry for N seconds.
@@ -2445,6 +2513,47 @@ def _cycle():
                     _log(f'SIGNAL_SUPPRESSED: {emit_reason}')
                 return
 
+            # B1: FORCED kill-switch (ff_allow_forced_entry=false → reject FORCED entries)
+            try:
+                import feature_flags as _ff_forced
+                if not _ff_forced.is_enabled('ff_allow_forced_entry'):
+                    _notify_telegram_throttled(
+                        f'[Autopilot] FORCED 진입 차단: {dominant} conf={confidence}\n'
+                        f'- ff_allow_forced_entry=false',
+                        msg_type='forced_rejected', cooldown_sec=600)
+                    _log(f'FORCED entry REJECTED: {dominant} conf={confidence} (ff_allow_forced_entry=false)')
+                    return
+            except Exception:
+                pass  # FAIL-OPEN
+
+            # B2: Signal spam guard (3 signals/30min same direction → 30min cooldown)
+            try:
+                import feature_flags as _ff_spam
+                if _ff_spam.is_enabled('ff_signal_spam_guard'):
+                    _spam_ok, _spam_remaining = _check_signal_spam(SYMBOL, dominant)
+                    if not _spam_ok:
+                        _notify_telegram_throttled(
+                            f'[Autopilot] 신호 스팸 차단: {dominant} (cooldown {_spam_remaining}s)\n'
+                            f'- 30분 내 3회 이상 동일 방향 신호',
+                            msg_type='signal_spam', cooldown_sec=600)
+                        _log(f'SIGNAL SPAM blocked: {dominant} (cooldown {_spam_remaining}s)')
+                        return
+            except Exception:
+                pass  # FAIL-OPEN
+
+            # B3: Post-impulse chasing ban
+            try:
+                _impulse_ok, _impulse_remaining = _check_impulse_ban(cur, dominant)
+                if not _impulse_ok:
+                    _notify_telegram_throttled(
+                        f'[Autopilot] 급변 추격 차단: {dominant} ({_impulse_remaining:.0f}s)\n'
+                        f'- 5분 내 1%+ 변동 감지',
+                        msg_type='impulse_ban', cooldown_sec=600)
+                    _log(f'IMPULSE BAN: {dominant} blocked ({_impulse_remaining:.0f}s remaining)')
+                    return
+            except Exception:
+                pass  # FAIL-OPEN
+
             import safety_manager
             eq = safety_manager.get_equity_limits(cur)
             # v3: start_stage always 1
@@ -2455,6 +2564,11 @@ def _cycle():
             if signal_id:
                 # Record emission for cooldown tracking
                 _record_signal_emission(cur, SYMBOL, dominant, regime_ctx=regime_ctx)
+                # B2: Record for spam guard
+                try:
+                    _record_signal_spam(SYMBOL, dominant)
+                except Exception:
+                    pass
 
                 # V3: record debounce key after successful signal creation
                 if _is_v3_enabled() and _v3_result:
@@ -2504,14 +2618,33 @@ def main():
     _log('=== AUTOPILOT DAEMON START ===')
     from watchdog_helper import init_watchdog
     init_watchdog(interval_sec=10)
+    _consecutive_errors = 0
+    _MAX_CONSECUTIVE_ERRORS = 5
+
     while True:
         if os.path.exists(KILL_SWITCH_PATH):
             _log('KILL_SWITCH detected. Exiting.')
             sys.exit(0)
         try:
             _cycle()
+            _consecutive_errors = 0  # reset on success
+
+            # D3: heartbeat record
+            try:
+                from db_config import get_conn as _hb_get_conn
+                _hb_conn = _hb_get_conn(autocommit=True)
+                with _hb_conn.cursor() as _hb_cur:
+                    _hb_cur.execute(
+                        "INSERT INTO service_health_log (service, state) VALUES ('autopilot_daemon', 'OK');")
+                _hb_conn.close()
+            except Exception:
+                pass
         except Exception:
+            _consecutive_errors += 1
             traceback.print_exc()
+            if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                _notify_telegram(f'[autopilot] 연속 {_consecutive_errors}회 에러 — 자동 복구 시도 중')
+                _consecutive_errors = 0
         time.sleep(POLL_SEC)
 
 

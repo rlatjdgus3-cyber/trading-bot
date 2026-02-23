@@ -138,6 +138,22 @@ def _poll_cycle(ex):
                 conn.rollback()
                 traceback.print_exc()
 
+            # C1: Integrity check (piggyback on reconcile cycle)
+            try:
+                if _reconcile_cycle_count > 0 and _reconcile_cycle_count % 5 == 0:
+                    from integrity_checker import check_integrity, auto_remediate
+                    ic_result = check_integrity(ex, cur, SYMBOL)
+                    if ic_result['status'] != 'OK':
+                        log(f'INTEGRITY: {ic_result["status"]} — {ic_result["details"]}')
+                        auto_remediate(ex, cur, SYMBOL, ic_result['status'], ic_result['details'])
+                    conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                traceback.print_exc()
+
             cur.execute("""
                 SELECT id, order_id, order_type, direction, signal_id, decision_id,
                        close_reason, requested_qty, ticker_price, status,
@@ -462,6 +478,13 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
         except Exception as e:
             log(f'plan_state PLAN.NONE update error: {e}')
 
+        # A1: Orphan order cleanup (pos=0 verified)
+        try:
+            from orphan_cleanup import cleanup_if_flat
+            cleanup_if_flat(ex, SYMBOL, reason='post_exit_verified')
+        except Exception as e:
+            log(f'orphan cleanup post-exit error (non-fatal): {e}')
+
     # Backfill pnl_after_trade in trade_process_log for the originating signal
     if realized_pnl is not None and signal_id:
         _update_trade_process_log(cur, signal_id, pnl_after_trade=realized_pnl)
@@ -579,6 +602,12 @@ def _reconcile_and_heal(ex, cur):
                 """, (SYMBOL, json.dumps({'action': 'RESET_TO_FLAT', 'detail': detail})))
             except Exception:
                 pass
+            # A1: Orphan order cleanup after reconcile heal (pos=0)
+            try:
+                from orphan_cleanup import cleanup_if_flat
+                cleanup_if_flat(ex, SYMBOL, reason='reconcile_heal_flat')
+            except Exception as e:
+                log(f'orphan cleanup reconcile error (non-fatal): {e}')
 
         # Case B: Exchange has position, DB=FLAT → sync DB from exchange
         elif exch_pos in ('LONG', 'SHORT') and strat_state in ('FLAT', 'PLAN.NONE'):
@@ -969,14 +998,33 @@ def main():
     except Exception:
         traceback.print_exc()
 
+    _consecutive_errors = 0
+    _MAX_CONSECUTIVE_ERRORS = 5
+
     while True:
         try:
             if os.path.exists(KILL_SWITCH_PATH):
                 log('KILL_SWITCH detected. Exiting.')
                 sys.exit(0)
             _poll_cycle(ex)
+            _consecutive_errors = 0  # reset on success
+
+            # D3: heartbeat record
+            try:
+                _hb_conn = db_conn()
+                _hb_conn.autocommit = True
+                with _hb_conn.cursor() as _hb_cur:
+                    _hb_cur.execute(
+                        "INSERT INTO service_health_log (service, state) VALUES ('fill_watcher', 'OK');")
+                _hb_conn.close()
+            except Exception:
+                pass
         except Exception:
+            _consecutive_errors += 1
             traceback.print_exc()
+            if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                _send_telegram(f'[fill_watcher] 연속 {_consecutive_errors}회 에러 — 자동 복구 시도 중')
+                _consecutive_errors = 0
         time.sleep(POLL_SEC)
 
 

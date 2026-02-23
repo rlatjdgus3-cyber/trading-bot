@@ -292,6 +292,84 @@ def main():
             normalized_states[short] = state_val
         _write_heartbeats_to_db(normalized_states)
 
+    # 3c. D2: Heartbeat stale detection for required services
+    HEARTBEAT_STALE_THRESHOLD_SEC = 360  # expected interval * 3
+    REQUIRED_SERVICES_FOR_HEARTBEAT = {
+        'live_order_executor', 'position_manager', 'fill_watcher'
+    }
+    OPTIONAL_SERVICES_FOR_HEARTBEAT = {
+        'candles', 'indicators', 'news_bot', 'position_watcher', 'autopilot_daemon'
+    }
+    if db_ok:
+        try:
+            from db_config import get_conn as _hb_get
+            _hb_conn = _hb_get(autocommit=True)
+            with _hb_conn.cursor() as _hb_cur:
+                for svc_name in REQUIRED_SERVICES_FOR_HEARTBEAT | OPTIONAL_SERVICES_FOR_HEARTBEAT:
+                    is_required = svc_name in REQUIRED_SERVICES_FOR_HEARTBEAT
+                    # Check if service is running (systemctl active)
+                    unit_name = f'{svc_name}.service'
+                    if not _is_active(unit_name):
+                        continue  # already handled above as DOWN
+
+                    # Check heartbeat freshness
+                    _hb_cur.execute("""
+                        SELECT EXTRACT(EPOCH FROM (now() - MAX(ts)))::int
+                        FROM service_health_log
+                        WHERE service = %s AND ts > now() - interval '1 hour';
+                    """, (svc_name,))
+                    _hb_row = _hb_cur.fetchone()
+                    is_stale = True
+                    if _hb_row and _hb_row[0] is not None:
+                        is_stale = _hb_row[0] > HEARTBEAT_STALE_THRESHOLD_SEC
+                    else:
+                        is_stale = True  # no heartbeat = stale
+
+                    if not is_stale:
+                        continue
+
+                    stale_age = _hb_row[0] if (_hb_row and _hb_row[0] is not None) else 'N/A'
+                    _log(f'HEARTBEAT STALE: {svc_name} (age={stale_age}s, threshold={HEARTBEAT_STALE_THRESHOLD_SEC}s)')
+
+                    if is_required:
+                        # Restart attempt
+                        restart_ok = _restart_service(unit_name)
+                        if restart_ok:
+                            _log(f'HEARTBEAT STALE restart: {svc_name}')
+                            fixed.append(f'{svc_name}(stale-restart)')
+                            time.sleep(5)
+                            # Re-check heartbeat after restart
+                            _hb_cur.execute("""
+                                SELECT EXTRACT(EPOCH FROM (now() - MAX(ts)))::int
+                                FROM service_health_log
+                                WHERE service = %s AND ts > now() - interval '1 hour';
+                            """, (svc_name,))
+                            _hb_row2 = _hb_cur.fetchone()
+                            still_stale = True
+                            if _hb_row2 and _hb_row2[0] is not None:
+                                still_stale = _hb_row2[0] > HEARTBEAT_STALE_THRESHOLD_SEC
+                            if still_stale:
+                                # trade_switch OFF for safety
+                                try:
+                                    import trade_switch_recovery
+                                    trade_switch_recovery.set_off_with_reason(
+                                        _hb_cur, 'monitoring_down',
+                                        changed_by='system_watchdog')
+                                    issues.append(
+                                        f'CRITICAL: {svc_name} heartbeat stale after restart '
+                                        f'— trade_switch OFF')
+                                    _log(f'trade_switch OFF: {svc_name} heartbeat still stale after restart')
+                                except Exception as e:
+                                    issues.append(
+                                        f'CRITICAL: {svc_name} stale + trade_switch_off failed: {e}')
+                        else:
+                            issues.append(f'CRITICAL: {svc_name} heartbeat stale, restart failed')
+                    else:
+                        issues.append(f'WARNING: {svc_name} heartbeat stale (age={stale_age}s)')
+            _hb_conn.close()
+        except Exception as e:
+            _log(f'heartbeat stale check error (non-fatal): {e}')
+
     # 4. Check execution queue health
     eq_ok, eq_detail = _check_execution_queue_health()
     if not eq_ok:

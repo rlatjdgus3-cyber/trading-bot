@@ -2196,6 +2196,8 @@ _DEBUG_SUBCMDS = {
     'stops': 'debug_stop_orders',
     'risk_snapshot': 'debug_risk_snapshot',
     'risk': 'debug_risk_snapshot',
+    # Safety hotfix: integrity check
+    'integrity': 'debug_integrity',
 }
 
 _DEBUG_HELP = (
@@ -2228,11 +2230,12 @@ _DEBUG_HELP = (
     '  /debug news_health — 뉴스 파이프라인 상태/에러 카운트\n'
     '  /debug stop_orders — 서버사이드 스탑 주문 상태\n'
     '  /debug risk_snapshot — 리스크 종합 스냅샷\n'
+    '  /debug integrity — 무결성 체크 (거래소 vs DB 비교)\n'
     '  /debug on|off — 디버그 모드 토글\n'
     '\n'
     '  aliases: reaction, coverage, backfill, dryrun, gate,\n'
     '           bf_enable, bf_start, bf_pause, bf_resume, bf_stop, bf_log,\n'
-    '           news_gap, path_sample, path_stats, ai, stops, risk\n'
+    '           news_gap, path_sample, path_stats, ai, stops, risk, integrity\n'
     '\n'
     '━━━ 운영 점검 순서 (권장) ━━━\n'
     '1) /debug gate_details force_refresh=true → gate_verdict PASS + required fresh\n'

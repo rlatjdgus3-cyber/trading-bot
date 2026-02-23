@@ -1338,6 +1338,13 @@ def _cycle(ex, _last_order_ts_unused):
                     _send_telegram(report)
                 return
 
+            # A2: Pre-flight orphan order cleanup
+            try:
+                from orphan_cleanup import pre_flight_cleanup
+                pre_flight_cleanup(ex, cur, SYMBOL)
+            except Exception as e:
+                log(f"pre_flight_cleanup error (FAIL-OPEN): {e}")
+
             # --- Execute OPEN ---
             order_cap = _get_order_cap(cur)
             usdt_size = min(float(meta.get("qty", order_cap)), order_cap)

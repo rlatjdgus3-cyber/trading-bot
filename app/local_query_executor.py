@@ -126,7 +126,8 @@ def execute(query_type=None, original_text=None):
         'pnl_recent': _pnl_recent,
         'bundle': _bundle,
         'debug_stop_orders': _debug_stop_orders,
-        'debug_risk_snapshot': _debug_risk_snapshot}
+        'debug_risk_snapshot': _debug_risk_snapshot,
+        'debug_integrity': _debug_integrity}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -5449,6 +5450,37 @@ def _bundle(_text=None):
             except Exception as e:
                 sections.append(f'=== PANIC GUARD ===\n  error: {e}')
 
+            # === INTEGRITY STATUS ===
+            try:
+                from integrity_checker import check_integrity
+                ex_obj = exchange_reader._get_exchange()
+                ic_result = check_integrity(ex_obj, cur, SYMBOL)
+                ic_lines = [
+                    f'  status: {ic_result["status"]}',
+                    f'  details: {ic_result.get("details", "")}',
+                ]
+                checks = ic_result.get('checks', {})
+                if checks:
+                    ic_lines.append(f'  exch: {checks.get("exch_side", "?")} qty={checks.get("exch_qty", "?")}')
+                    ic_lines.append(f'  db: {checks.get("db_side", "?")} qty={checks.get("db_qty", "?")} plan={checks.get("db_plan_state", "?")}')
+                    ic_lines.append(f'  orders: active={checks.get("active_orders", "?")} conditional={checks.get("conditional_orders", "?")}')
+                    ic_lines.append(f'  signals_10m: {checks.get("signals_10m", "?")} fills_10m: {checks.get("fills_10m", "?")}')
+                sections.append('=== INTEGRITY STATUS ===\n' + '\n'.join(ic_lines))
+            except Exception as e:
+                sections.append(f'=== INTEGRITY STATUS ===\n  error: {e}')
+
+            # === SAFETY FLAGS ===
+            try:
+                import feature_flags as _ff_bundle
+                _forced = _ff_bundle.is_enabled('ff_allow_forced_entry')
+                _spam = _ff_bundle.is_enabled('ff_signal_spam_guard')
+                sections.append(
+                    f'=== SAFETY FLAGS ===\n'
+                    f'  forced_entry: {"ENABLED" if _forced else "DISABLED (blocked)"}\n'
+                    f'  signal_spam_guard: {"ON" if _spam else "OFF"}')
+            except Exception as e:
+                sections.append(f'=== SAFETY FLAGS ===\n  error: {e}')
+
         return '\n\n'.join(sections)
     except Exception as e:
         return f'⚠ bundle 오류: {e}'
@@ -5678,3 +5710,83 @@ def _debug_risk_snapshot(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'⚠ risk_snapshot 오류: {e}'
+
+
+def _debug_integrity(_text=None):
+    """Integrity snapshot: exchange vs DB state comparison."""
+    try:
+        lines = ['=== INTEGRITY CHECK ===']
+        conn = None
+        try:
+            conn = _db()
+            with conn.cursor() as cur:
+                from integrity_checker import check_integrity
+                ex_obj = exchange_reader._get_exchange()
+                result = check_integrity(ex_obj, cur, SYMBOL)
+
+                lines.append(f'Status: {result["status"]}')
+                lines.append(f'Details: {result.get("details", "")}')
+
+                checks = result.get('checks', {})
+                lines.append(f'\nExchange:')
+                lines.append(f'  side: {checks.get("exch_side", "?")}')
+                lines.append(f'  qty: {checks.get("exch_qty", "?")}')
+                lines.append(f'  active_orders: {checks.get("active_orders", "?")}')
+                lines.append(f'  conditional_orders: {checks.get("conditional_orders", "?")}')
+
+                lines.append(f'\nDB:')
+                lines.append(f'  side: {checks.get("db_side", "?")}')
+                lines.append(f'  qty: {checks.get("db_qty", "?")}')
+                lines.append(f'  plan_state: {checks.get("db_plan_state", "?")}')
+
+                lines.append(f'\nActivity (10min):')
+                lines.append(f'  signals: {checks.get("signals_10m", "?")}')
+                lines.append(f'  fills: {checks.get("fills_10m", "?")}')
+
+                # Cleanup timestamp
+                try:
+                    from orphan_cleanup import _last_cleanup_ts
+                    if _last_cleanup_ts > 0:
+                        import datetime
+                        dt = datetime.datetime.fromtimestamp(_last_cleanup_ts)
+                        lines.append(f'\nLast cleanup: {dt.strftime("%m-%d %H:%M:%S")}')
+                    else:
+                        lines.append(f'\nLast cleanup: never')
+                except Exception:
+                    lines.append(f'\nLast cleanup: N/A')
+
+                # Integrity freeze status
+                try:
+                    from integrity_checker import is_entry_frozen
+                    frozen, remaining = is_entry_frozen()
+                    if frozen:
+                        lines.append(f'Entry freeze: ACTIVE ({remaining:.0f}s remaining)')
+                    else:
+                        lines.append(f'Entry freeze: CLEAR')
+                except Exception:
+                    pass
+
+                # Recent mismatch count (1 hour)
+                try:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM live_executor_log
+                        WHERE event = 'RECONCILE_HEAL'
+                          AND ts >= now() - interval '1 hour';
+                    """)
+                    row = cur.fetchone()
+                    lines.append(f'\nReconcile heals (1h): {row[0] if row else 0}')
+                except Exception:
+                    pass
+
+        except Exception as e:
+            lines.append(f'Error: {e}')
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'integrity check error: {e}'
