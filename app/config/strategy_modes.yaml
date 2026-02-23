@@ -226,3 +226,26 @@ feature_flags:
   # Safety hotfix flags
   ff_allow_forced_entry: false       # FORCED=1 강제 진입 허용 여부 (default: 차단)
   ff_signal_spam_guard: true         # 반복 신호 쿨다운 (3회/30분 → 30분 cooldown)
+  # Unified Engine v1.1 feature flags
+  ff_unified_engine_v11: false        # Master switch (기본 OFF)
+  ff_pullback_trigger: false          # Phase 2 pullback (기본 OFF)
+  ff_chandelier_exit: false           # Phase 4 (기본 OFF)
+
+# ── UNIFIED ENGINE v1.1 Parameters ──
+unified_v11:
+  risk_pct: 0.0075                    # 0.75% per trade
+  sl_atr_mult: 2.0                    # SL = 2 * ATR_15m
+  trail_atr_mult: 2.5                 # Chandelier = 2.5 * ATR
+  cap_max_pct: 0.20                   # 20% max capital
+  daily_loss_limit_pct: -0.025        # -2.5% daily
+  adx_enter_threshold: 27             # ADX enter
+  adx_keep_threshold: 23              # ADX keep
+  time_stop_hours: 12                 # Time stop
+  time_stop_min_r: 1.0                # Min R for time stop
+  add_min_r: 1.0                      # +1R for ADD
+  add_max_count: 2                    # Max ADDs
+  add_size_pct: 0.5                   # ADD = 50% of initial
+  signal_cooldown_sec: 900            # 15min cooldown
+  cb_block_pct: 0.005                 # 0.5% → block
+  cb_reduce_pct: 0.010                # 1.0% → reduce 50%
+  cb_close_pct: 0.015                 # 1.5% → close all

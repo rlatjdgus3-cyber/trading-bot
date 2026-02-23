@@ -31,6 +31,95 @@ def ema(xs, period):
         ema_val = (price - ema_val) * multiplier + ema_val
     return ema_val
 
+
+def _resample_candles(candles_1m, target_tf_minutes):
+    """Resample 1m candles to target timeframe.
+    candles_1m: list of (ts, o, h, l, c, v) sorted ASC by ts.
+    Returns list of (ts, o, h, l, c, v) for target tf."""
+    if not candles_1m or target_tf_minutes <= 1:
+        return candles_1m
+    result = []
+    group = []
+    for candle in candles_1m:
+        group.append(candle)
+        if len(group) >= target_tf_minutes:
+            ts_first = group[0][0]
+            o_first = float(group[0][1])
+            h_max = max(float(g[2]) for g in group)
+            l_min = min(float(g[3]) for g in group)
+            c_last = float(group[-1][4])
+            v_sum = sum(float(g[5]) for g in group)
+            result.append((ts_first, o_first, h_max, l_min, c_last, v_sum))
+            group = []
+    return result
+
+
+def _compute_adx(highs, lows, closes, period=14):
+    """Compute ADX from high/low/close arrays."""
+    if len(highs) < period * 2 + 1:
+        return None
+    n = len(highs)
+    plus_dm = []
+    minus_dm = []
+    tr_list = []
+    for i in range(1, n):
+        h_diff = highs[i] - highs[i-1]
+        l_diff = lows[i-1] - lows[i]
+        plus_dm.append(h_diff if h_diff > l_diff and h_diff > 0 else 0)
+        minus_dm.append(l_diff if l_diff > h_diff and l_diff > 0 else 0)
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+
+    if len(tr_list) < period:
+        return None
+
+    # Smoothed averages (Wilder's smoothing)
+    atr = sum(tr_list[:period]) / period
+    plus_di_smooth = sum(plus_dm[:period]) / period
+    minus_di_smooth = sum(minus_dm[:period]) / period
+
+    dx_list = []
+    for i in range(period, len(tr_list)):
+        atr = (atr * (period - 1) + tr_list[i]) / period
+        plus_di_smooth = (plus_di_smooth * (period - 1) + plus_dm[i]) / period
+        minus_di_smooth = (minus_di_smooth * (period - 1) + minus_dm[i]) / period
+
+        if atr > 0:
+            plus_di = 100 * plus_di_smooth / atr
+            minus_di = 100 * minus_di_smooth / atr
+        else:
+            plus_di = 0
+            minus_di = 0
+
+        di_sum = plus_di + minus_di
+        if di_sum > 0:
+            dx = 100 * abs(plus_di - minus_di) / di_sum
+        else:
+            dx = 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return None
+
+    adx = sum(dx_list[:period]) / period
+    for i in range(period, len(dx_list)):
+        adx = (adx * (period - 1) + dx_list[i]) / period
+
+    return adx
+
+
+def _compute_donchian(highs, lows, period=20):
+    """Compute Donchian Channel high/low."""
+    if len(highs) < period:
+        return None, None
+    return max(highs[-period:]), min(lows[-period:])
+
+
+_mtf_last_compute = 0
+_MTF_INTERVAL_SEC = 60
+
 print("=== INDICATOR ENGINE STARTED ===", flush=True)
 
 from watchdog_helper import init_watchdog
@@ -189,6 +278,105 @@ while True:
             f"Saved indicators @ {ts} rsi={rsi_14} atr={atr_14} vol_spike={vol_spike}",
             flush=True
         )
+
+        # ── MTF Indicator Computation (every 60s) ──
+        import time as _t
+        _now = _t.time()
+        if _now - _mtf_last_compute >= _MTF_INTERVAL_SEC:
+            _mtf_last_compute = _now
+            try:
+                with db.cursor() as mtf_cur:
+                    # Fetch enough 1m candles for 1h EMA200 (200*60=12000, use 13000)
+                    mtf_cur.execute("""
+                        SELECT ts, o, h, l, c, v
+                        FROM candles
+                        WHERE symbol=%s AND tf=%s
+                        ORDER BY ts DESC
+                        LIMIT 13000
+                    """, (symbol, tf))
+                    mtf_rows = mtf_cur.fetchall()
+
+                if len(mtf_rows) >= 1200:  # minimum for 1h EMA (20 bars)
+                    mtf_rows_asc = list(reversed(mtf_rows))
+
+                    # Resample to 15m and 1h
+                    candles_15m = _resample_candles(mtf_rows_asc, 15)
+                    candles_1h = _resample_candles(mtf_rows_asc, 60)
+
+                    # Extract close/high/low arrays
+                    closes_15m = [float(c[4]) for c in candles_15m]
+                    highs_15m = [float(c[2]) for c in candles_15m]
+                    lows_15m = [float(c[3]) for c in candles_15m]
+
+                    closes_1h = [float(c[4]) for c in candles_1h]
+                    highs_1h = [float(c[2]) for c in candles_1h]
+                    lows_1h = [float(c[3]) for c in candles_1h]
+
+                    # EMA calculations
+                    ema_15m_50 = ema(closes_15m, 50) if len(closes_15m) >= 50 else None
+                    ema_15m_200 = ema(closes_15m, 200) if len(closes_15m) >= 200 else None
+                    ema_1h_50 = ema(closes_1h, 50) if len(closes_1h) >= 50 else None
+                    ema_1h_200 = ema(closes_1h, 200) if len(closes_1h) >= 200 else None
+
+                    # ADX on 1h
+                    adx_1h = _compute_adx(highs_1h, lows_1h, closes_1h, 14)
+
+                    # Donchian(20) on 15m
+                    dc_high_15m, dc_low_15m = _compute_donchian(highs_15m, lows_15m, 20)
+
+                    # ATR on 15m
+                    atr_15m = None
+                    if len(closes_15m) >= 15:
+                        trs_15m = []
+                        for i in range(-14, 0):
+                            _hi = highs_15m[i]
+                            _lo = lows_15m[i]
+                            _pc = closes_15m[i - 1]
+                            _tr = max(_hi - _lo, abs(_hi - _pc), abs(_lo - _pc))
+                            trs_15m.append(_tr)
+                        atr_15m = sum(trs_15m) / 14
+
+                    # Upsert to mtf_indicators
+                    with db.cursor() as mtf_cur:
+                        mtf_cur.execute("""
+                            CREATE TABLE IF NOT EXISTS mtf_indicators (
+                                symbol TEXT PRIMARY KEY,
+                                ema_15m_50 REAL, ema_15m_200 REAL,
+                                ema_1h_50 REAL, ema_1h_200 REAL,
+                                adx_1h REAL,
+                                donchian_high_15m_20 REAL, donchian_low_15m_20 REAL,
+                                atr_15m REAL,
+                                updated_at TIMESTAMPTZ DEFAULT now()
+                            );
+                        """)
+                        mtf_cur.execute("""
+                            INSERT INTO mtf_indicators (
+                                symbol, ema_15m_50, ema_15m_200,
+                                ema_1h_50, ema_1h_200,
+                                adx_1h, donchian_high_15m_20, donchian_low_15m_20,
+                                atr_15m, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                            ON CONFLICT (symbol) DO UPDATE SET
+                                ema_15m_50=EXCLUDED.ema_15m_50,
+                                ema_15m_200=EXCLUDED.ema_15m_200,
+                                ema_1h_50=EXCLUDED.ema_1h_50,
+                                ema_1h_200=EXCLUDED.ema_1h_200,
+                                adx_1h=EXCLUDED.adx_1h,
+                                donchian_high_15m_20=EXCLUDED.donchian_high_15m_20,
+                                donchian_low_15m_20=EXCLUDED.donchian_low_15m_20,
+                                atr_15m=EXCLUDED.atr_15m,
+                                updated_at=now()
+                        """, (symbol, ema_15m_50, ema_15m_200,
+                              ema_1h_50, ema_1h_200,
+                              adx_1h, dc_high_15m, dc_low_15m, atr_15m))
+
+                    print(f"MTF saved: ADX_1h={adx_1h} EMA_1h_50={ema_1h_50} "
+                          f"DC_15m=[{dc_low_15m},{dc_high_15m}] ATR_15m={atr_15m}",
+                          flush=True)
+                else:
+                    print(f"MTF: insufficient candles ({len(mtf_rows)}/1200)", flush=True)
+            except Exception as e:
+                print(f"MTF computation error: {e}", flush=True)
 
         time.sleep(15)
 

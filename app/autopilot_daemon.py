@@ -34,7 +34,7 @@ MAX_DAILY_TRADES = 60
 MIN_CONFIDENCE = 35  # v3: conf>=35 진입 허용 (35-49: stage1 only, >=50: 기존 로직)
 CONF_ADD_THRESHOLD = 50  # conf>=50 이어야 ADD 허용
 DEFAULT_SIZE_PCT = 10
-REPEAT_SIGNAL_COOLDOWN_SEC = 600  # 동일 방향 재신호 쿨다운 10분
+REPEAT_SIGNAL_COOLDOWN_SEC = 900  # [0-3] 동일 방향 재신호 쿨다운 15분
 STOP_LOSS_COOLDOWN_WINDOW_SEC = 3600  # 손절 감시 윈도우 60분
 STOP_LOSS_COOLDOWN_TRIGGER = 2  # 연속 손절 N회 이상이면 쿨다운
 STOP_LOSS_COOLDOWN_PAUSE_SEC = 1800  # 손절 쿨다운 30분
@@ -48,6 +48,9 @@ _last_add_ts = 0.0
 _add_dedup_initialized = False
 ADD_PRICE_DEDUP_PCT = 0.1       # ±0.1% range
 ADD_PRICE_DEDUP_SEC = 600       # 10min window
+
+# [0-3] Price reentry validation state
+_last_signal_price = {}  # (symbol, side) -> last trigger price
 
 # ── Strategy V3 state ──
 _v3_result = None  # last V3 cycle result (for signal metadata)
@@ -148,6 +151,34 @@ def _v3_check_signal_debounce(cur, symbol, v3_regime, direction, features):
     except Exception as e:
         _log(f'V3 debounce check FAIL-OPEN: {e}')
         return (True, '')
+
+
+def _is_reentry_valid(symbol, side, current_price):
+    """[0-3] Price reentry validation: last signal price must have been
+    exceeded in the opposite direction before allowing re-entry.
+    Returns (valid, reason)."""
+    key = (symbol, side)
+    if key not in _last_signal_price:
+        return (True, 'first signal')
+    last_price = _last_signal_price[key]
+    if last_price <= 0:
+        return (True, 'no previous price')
+    # Calculate threshold: 0.1% from last signal price
+    threshold = last_price * 0.001
+    if side == 'LONG':
+        # Price must have gone below last_price - threshold, then come back above
+        if current_price > last_price + threshold:
+            return (True, f'price moved above {last_price:.1f}+{threshold:.1f}')
+        return (False, f'reentry blocked: price {current_price:.1f} near last signal {last_price:.1f}')
+    else:  # SHORT
+        if current_price < last_price - threshold:
+            return (True, f'price moved below {last_price:.1f}-{threshold:.1f}')
+        return (False, f'reentry blocked: price {current_price:.1f} near last signal {last_price:.1f}')
+
+
+def _record_signal_price(symbol, side, price):
+    """[0-3] Record the price at which signal was generated."""
+    _last_signal_price[(symbol, side)] = price
 
 
 def _db_check_trade_switch_transition(cur):
@@ -2080,6 +2111,7 @@ def _cycle():
             global _v3_result, _v3_features
             _v3_result = None
             _v3_features = None
+            _mtf_data = None  # [1-5] MTF data placeholder
             if _is_v3_enabled():
                 try:
                     from strategy.common.features import build_feature_snapshot
@@ -2109,6 +2141,32 @@ def _cycle():
                         _log(f'[V3] BLOCKED: {v3_mod.get("block_reason", "")} '
                              f'(regime={v3_regime.get("regime_class", "?")} mode={v3_regime.get("entry_mode", "?")})')
                         return
+
+                    # [1-5] MTF Direction Gate (ff_unified_engine_v11)
+                    try:
+                        import feature_flags as _ff_mtf
+                        if _ff_mtf.is_enabled('ff_unified_engine_v11'):
+                            from mtf_direction import compute_mtf_direction, NO_TRADE, LONG_ONLY, SHORT_ONLY
+                            _mtf_data = compute_mtf_direction(cur)
+
+                            # TOP-LEVEL GATE
+                            if _mtf_data['direction'] == NO_TRADE:
+                                _log(f'[MTF] NO_TRADE: {_mtf_data["reasons"]}')
+                                return
+
+                            # Direction filter
+                            if _mtf_data['direction'] == LONG_ONLY and dominant == 'SHORT':
+                                _log(f'[MTF] LONG_ONLY but signal SHORT — blocked')
+                                return
+                            if _mtf_data['direction'] == SHORT_ONLY and dominant == 'LONG':
+                                _log(f'[MTF] SHORT_ONLY but signal LONG — blocked')
+                                return
+
+                            # Inject MTF direction into regime result
+                            if v3_regime:
+                                v3_regime['mtf_direction'] = _mtf_data['direction']
+                    except Exception as e:
+                        _log(f'[MTF] error (FAIL-OPEN): {e}')
 
                     # Mode cooloff check
                     cooloff_ok, cooloff_reason = _check_mode_cooloff(cur, v3_regime.get('regime_class'))
@@ -2513,9 +2571,13 @@ def _cycle():
                     _log(f'SIGNAL_SUPPRESSED: {emit_reason}')
                 return
 
-            # B1: FORCED kill-switch (ff_allow_forced_entry=false → reject FORCED entries)
+            # B1: FORCED hard block — autopilot FORCED entry prevention [0-3]
             try:
                 import feature_flags as _ff_forced
+                # [0-3] HARD BLOCK: conf<50 in autopilot → always rejected
+                if confidence < 50:
+                    _log(f'[FORCED_BLOCKED] autopilot에서 conf={confidence} < 50 진입 차단')
+                    return
                 if not _ff_forced.is_enabled('ff_allow_forced_entry'):
                     _notify_telegram_throttled(
                         f'[Autopilot] FORCED 진입 차단: {dominant} conf={confidence}\n'
@@ -2560,10 +2622,57 @@ def _cycle():
             start_stage = 1
             entry_pct = safety_manager.get_stage_entry_pct(start_stage)
 
+            # [0-3] Price reentry validation
+            try:
+                _cur_price = 0
+                cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
+                _pr = cur.fetchone()
+                if _pr:
+                    _cur_price = float(_pr[0])
+                if _cur_price > 0:
+                    _reentry_ok, _reentry_reason = _is_reentry_valid(SYMBOL, dominant, _cur_price)
+                    if not _reentry_ok:
+                        _log(f'[REENTRY_BLOCKED] {_reentry_reason}')
+                        return
+            except Exception as e:
+                _log(f'reentry check FAIL-OPEN: {e}')
+
+            # [2-2] Trend-Follow Trigger Evaluation (ff_unified_engine_v11)
+            _trigger_type = None
+            try:
+                import feature_flags as _ff_trend
+                if _ff_trend.is_enabled('ff_unified_engine_v11') and _mtf_data:
+                    from trend_triggers import evaluate_breakout, evaluate_pullback
+
+                    _bo = evaluate_breakout(cur, SYMBOL, _mtf_data['direction'], _v3_features or {})
+                    _pb = evaluate_pullback(cur, SYMBOL, _mtf_data['direction'], _v3_features or {})
+
+                    if _bo['triggered']:
+                        _trigger_type = 'DONCHIAN_BREAKOUT'
+                        dominant = _bo['side']
+                        _log(f'[TRIGGER] Donchian breakout: {_bo["side"]} @ {_bo["trigger_price"]:.1f}')
+                    elif _pb['triggered']:
+                        _trigger_type = 'EMA_PULLBACK'
+                        dominant = _pb['side']
+                        _log(f'[TRIGGER] EMA pullback: {_pb["side"]} @ {_pb["trigger_price"]:.1f}')
+                    else:
+                        _log(f'[TRIGGER] no trigger fired — skipping (bo={_bo["reasons"][:1]}, pb={_pb["reasons"][:1]})')
+                        return
+            except Exception as e:
+                _log(f'[TRIGGER] error (FAIL-OPEN): {e}')
+
             signal_id = _create_autopilot_signal(cur, dominant, scores, equity_limits=eq, regime_ctx=regime_ctx)
             if signal_id:
                 # Record emission for cooldown tracking
                 _record_signal_emission(cur, SYMBOL, dominant, regime_ctx=regime_ctx)
+                # [0-3] Record signal price for reentry validation
+                try:
+                    cur.execute("SELECT mark_price FROM market_data_cache WHERE symbol = %s;", (SYMBOL,))
+                    _sp = cur.fetchone()
+                    if _sp:
+                        _record_signal_price(SYMBOL, dominant, float(_sp[0]))
+                except Exception:
+                    pass
                 # B2: Record for spam guard
                 try:
                     _record_signal_spam(SYMBOL, dominant)

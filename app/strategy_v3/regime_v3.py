@@ -372,6 +372,20 @@ def classify(features, regime_ctx, prev_state=None):
 
         raw_class, entry_mode, confidence, reasons, extra = _classify_raw(features, regime_ctx)
 
+        # [1-3] range_pos > 1.0 → BREAKOUT override
+        try:
+            import feature_flags
+            if feature_flags.is_enabled('ff_unified_engine_v11'):
+                range_pos = features.get('range_position')
+                if range_pos is not None and range_pos > 1.0:
+                    raw_class = 'BREAKOUT'
+                    entry_mode = 'BreakoutTrend'
+                    reasons.append(f'[v1.1] range_pos={range_pos:.2f} > 1.0 → BREAKOUT')
+                    extra['range_pos_raw'] = range_pos
+                    extra['range_pos_clamped'] = min(1.0, max(0.0, range_pos))
+        except Exception:
+            pass  # FAIL-OPEN
+
         # Apply hysteresis
         effective_class = _apply_hysteresis(raw_class)
 
@@ -395,6 +409,8 @@ def classify(features, regime_ctx, prev_state=None):
         # Merge strict breakout metadata
         if extra:
             result.update(extra)
+        # [1-2] MTF direction field (populated by caller if v1.1 active)
+        result['mtf_direction'] = None
         return result
     except Exception as e:
         _log(f'classify FAIL-OPEN: {e}')

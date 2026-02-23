@@ -478,10 +478,14 @@ def _handle_exit_filled(ex, cur, eid, order_id, order_type, direction,
         except Exception as e:
             log(f'plan_state PLAN.NONE update error: {e}')
 
-        # A1: Orphan order cleanup (pos=0 verified)
+        # A1: Orphan order cleanup (pos=0 verified) [0-1 enhanced]
         try:
             from orphan_cleanup import cleanup_if_flat
-            cleanup_if_flat(ex, SYMBOL, reason='post_exit_verified')
+            cleaned, detail = cleanup_if_flat(ex, SYMBOL, reason='post_exit_verified')
+            if cleaned:
+                log(f'[POST_EXIT_CLEANUP] {detail}')
+            else:
+                log(f'[POST_EXIT_CLEANUP] no orphans ({detail})')
         except Exception as e:
             log(f'orphan cleanup post-exit error (non-fatal): {e}')
 

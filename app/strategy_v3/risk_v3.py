@@ -159,3 +159,95 @@ def compute_risk(features, v3_regime, loss_streak=0):
             'leverage_max': 5,
             'reasoning': [f'FAIL-OPEN: {e}'],
         }
+
+
+def compute_risk_v11(features, v3_regime, equity, mtf_data=None):
+    """[3-1] v1.1 ATR-based risk management.
+
+    Uses 15m ATR for SL, fixed risk% per trade, position sizing from equity.
+
+    Args:
+        features: dict from build_feature_snapshot()
+        v3_regime: dict from regime_v3.classify()
+        equity: float, current equity in USDT
+        mtf_data: dict from mtf_direction (with atr_15m)
+
+    Returns:
+        dict with sl_distance, sl_pct, position_size_usdt, risk_pct, cap_used_pct
+    """
+    try:
+        # Load unified_v11 from top-level YAML (not strategy_v3 section)
+        import yaml, os
+        _yaml_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                  'config', 'strategy_modes.yaml')
+        try:
+            with open(_yaml_path, 'r') as _f:
+                _full_cfg = yaml.safe_load(_f) or {}
+            v11 = _full_cfg.get('unified_v11', {})
+            if not isinstance(v11, dict):
+                v11 = {}
+        except Exception:
+            v11 = {}
+
+        risk_pct = v11.get('risk_pct', 0.0075)  # 0.75% per trade
+        sl_atr_mult = v11.get('sl_atr_mult', 2.0)
+        cap_max_pct = v11.get('cap_max_pct', 0.20)
+
+        # Get ATR_15m from mtf_data or features
+        atr_15m = 0
+        if mtf_data and mtf_data.get('atr_15m'):
+            atr_15m = float(mtf_data['atr_15m'])
+        if atr_15m <= 0:
+            atr_val = safe_float(features.get('atr_val') if features else None)
+            if atr_val > 0:
+                atr_15m = atr_val
+            else:
+                atr_pct = safe_float(features.get('atr_pct') if features else None, 0.005)
+                price = safe_float(features.get('price') if features else None, 50000)
+                atr_15m = atr_pct * price
+
+        price = safe_float(features.get('price') if features else None, 50000)
+        if price <= 0:
+            price = 50000  # fallback
+
+        sl_distance = sl_atr_mult * atr_15m
+        sl_pct = sl_distance / price if price > 0 else 0.01
+
+        if sl_pct <= 0:
+            sl_pct = 0.01  # safety floor
+            sl_distance = price * sl_pct
+
+        position_size_usdt = (equity * risk_pct) / sl_pct if sl_pct > 0 else 0
+
+        # Cap: total capital used <= cap_max_pct
+        max_usdt = equity * cap_max_pct
+        position_size_usdt = min(position_size_usdt, max_usdt)
+        position_size_usdt = max(5, position_size_usdt)  # minimum 5 USDT
+
+        cap_used_pct = (position_size_usdt / equity * 100) if equity > 0 else 0
+
+        _log(f'[v1.1] risk: {risk_pct*100:.2f}% equity={equity:.0f} '
+             f'SL={sl_distance:.1f} ({sl_pct*100:.3f}%) '
+             f'size={position_size_usdt:.0f} cap={cap_used_pct:.1f}%')
+
+        return {
+            'sl_distance': sl_distance,
+            'sl_pct': sl_pct,
+            'tp_pct': sl_pct * 3.0,  # 1:3 R:R target
+            'position_size_usdt': position_size_usdt,
+            'risk_pct': risk_pct,
+            'cap_used_pct': cap_used_pct,
+            'atr_15m': atr_15m,
+            'reasoning': [f'v1.1 ATR risk: {sl_atr_mult}×ATR15m({atr_15m:.1f})={sl_distance:.1f}'],
+            'stage_slice_mult': 1.0,
+            'leverage_max': 5,
+        }
+    except Exception as e:
+        _log(f'compute_risk_v11 FAIL-OPEN: {e}')
+        return {
+            'sl_distance': 0, 'sl_pct': 0.01, 'tp_pct': 0.03,
+            'position_size_usdt': min(equity * 0.10, 100) if equity else 50,
+            'risk_pct': 0.0075, 'cap_used_pct': 10,
+            'reasoning': [f'FAIL-OPEN: {e}'],
+            'stage_slice_mult': 1.0, 'leverage_max': 5,
+        }

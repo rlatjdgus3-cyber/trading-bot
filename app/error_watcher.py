@@ -259,14 +259,8 @@ def _check_process_alive(unit):
         return False
 
 
-def main():
-    env = load_env()
-    token = env.get('TELEGRAM_BOT_TOKEN', '')
-    chat_id = env.get('TELEGRAM_ALLOWED_CHAT_ID', '')
-    if not token or not chat_id:
-        print('[error_watcher] No telegram config, exiting', flush=True)
-        return
-
+def _one_cycle(token, chat_id):
+    """One monitoring cycle. Extracted from main() for self-healing wrapper."""
     state = read_state()
     state = _clean_old_state(state)
     now = time.time()
@@ -322,7 +316,7 @@ def main():
             # Severity: trade_switch OFF = WARN, others = CRITICAL (or WARN if alive)
             is_trade_switch = (alert_key == TRADE_SWITCH_KEY)
             if is_trade_switch:
-                icon = '⚠'
+                icon = '\u26a0'
                 label = '상태 알림'
             else:
                 _use_warn = False
@@ -333,13 +327,13 @@ def main():
                 except Exception:
                     pass
                 if _use_warn:
-                    icon = '⚠'
+                    icon = '\u26a0'
                     label = '경고'
                 else:
-                    icon = '🚨'
+                    icon = '\U0001f6a8'
                     label = '장애 감지'
 
-            cause_text = '\n'.join(f"  • {c[:200]}" for c in unique_causes)
+            cause_text = '\n'.join(f"  \u2022 {c[:200]}" for c in unique_causes)
             msg = f"{icon} {svc_name} {label}\n{cause_text}"
             if suppressed_local > 0:
                 msg += f"\n  (외 {suppressed_local}건 동일 에러 생략)"
@@ -349,7 +343,9 @@ def main():
 
     write_state(state)
 
-    # ── Heartbeat: record to service_health_log so /debug health sees us alive ──
+
+def _record_heartbeat():
+    """Record heartbeat to service_health_log."""
     try:
         from db_config import get_conn as _get_conn
         _hb_conn = _get_conn(autocommit=True)
@@ -362,6 +358,41 @@ def main():
             _hb_conn.close()
     except Exception:
         pass  # heartbeat failure should never block main flow
+
+
+POLL_SEC = 120  # 2분 주기 (systemd timer 대체)
+
+
+def main():
+    """[0-4] Self-healing main loop with consecutive error tracking."""
+    env = load_env()
+    token = env.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = env.get('TELEGRAM_ALLOWED_CHAT_ID', '')
+    if not token or not chat_id:
+        print('[error_watcher] No telegram config, exiting', flush=True)
+        return
+
+    consecutive_errors = 0
+    print('[error_watcher] === STARTED (self-healing loop) ===', flush=True)
+
+    while True:
+        try:
+            _one_cycle(token, chat_id)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            print(f'[error_watcher] [SELF_HEAL] cycle failed ({consecutive_errors}): {e}', flush=True)
+            traceback.print_exc()
+            if consecutive_errors >= 3:
+                try:
+                    send_message(token, chat_id,
+                                 f'\u26a0 error_watcher 연속 {consecutive_errors}회 실패\n{str(e)[:200]}')
+                except Exception:
+                    pass
+            time.sleep(min(30, 5 * consecutive_errors))
+
+        _record_heartbeat()
+        time.sleep(POLL_SEC)
 
 
 if __name__ == '__main__':

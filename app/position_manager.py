@@ -77,6 +77,7 @@ _prev_position_side = None
 _reconcile_cycle_count = 0
 _last_cleanup_ts = 0
 CLEANUP_INTERVAL_SEC = 300  # cleanup expired locks every 5 min
+_prev_had_position = False
 
 # ── Async Claude state ──────────────────────────────────
 _claude_thread = None
@@ -1773,6 +1774,53 @@ def _decide(ctx=None):
     if order_state == 'SENT':
         return ('HOLD', 'order in flight — waiting for fill confirmation')
 
+    # [4-2] Chandelier Exit check (ff_unified_engine_v11)
+    try:
+        import feature_flags as _ff_ch
+        if _ff_ch.is_enabled('ff_unified_engine_v11'):
+            if pos and pos.get('side') and pos.get('qty', 0) > 0:
+                from chandelier_exit import get_tracker
+                from mtf_direction import compute_mtf_direction
+                _ch = get_tracker()
+                _price = price
+
+                # Initialize tracker if needed
+                if _ch.entry_price is None and pos.get('entry_price', 0) > 0:
+                    _ch.on_entry(pos['side'], pos['entry_price'])
+
+                if _ch.entry_price is not None and _price > 0:
+                    _ch.update(_price)
+
+                    # Get ATR_15m
+                    _atr_15m = 0
+                    try:
+                        cur = ctx.get('cur')
+                        if cur:
+                            cur.execute("SELECT atr_15m FROM mtf_indicators WHERE symbol = %s;", (SYMBOL,))
+                            _r = cur.fetchone()
+                            if _r and _r[0]:
+                                _atr_15m = float(_r[0])
+                    except Exception:
+                        pass
+
+                    if _atr_15m > 0:
+                        exit_signal = _ch.check_exit(_price, _atr_15m)
+                        if exit_signal:
+                            _log(f'[CHANDELIER] {exit_signal[1]}')
+                            return exit_signal
+
+                    # [4-3] Regime transition: MTF→NO_TRADE tightens time_stop
+                    try:
+                        cur = ctx.get('cur')
+                        if cur:
+                            mtf = compute_mtf_direction(cur)
+                            if mtf['direction'] == 'NO_TRADE':
+                                _ch.time_stop_hours = min(_ch.time_stop_hours, 6)
+                    except Exception:
+                        pass
+    except Exception as e:
+        _log(f'[CHANDELIER] error (FAIL-OPEN): {e}')
+
     dominant = scores.get('dominant_side', 'LONG')
 
     # ── Strategy v2: mode-aware exit/add check ──
@@ -1925,6 +1973,18 @@ def _decide(ctx=None):
         if dominant == direction:
             relevant = long_score if direction == 'LONG' else short_score
             if relevant >= add_threshold:
+                # [3-3] ADD +1R condition (ff_unified_engine_v11)
+                try:
+                    import feature_flags as _ff_add
+                    if _ff_add.is_enabled('ff_unified_engine_v11'):
+                        from chandelier_exit import get_tracker
+                        _ch_add = get_tracker()
+                        if _ch_add.sl_distance and _ch_add.sl_distance > 0:
+                            _unrealized_r = _ch_add._compute_unrealized_r(price)
+                            if _unrealized_r < 1.0:
+                                return ('HOLD', f'[v1.1] ADD blocked: {_unrealized_r:.2f}R < 1.0R')
+                except Exception:
+                    pass
                 return ('ADD', f'score {relevant} favors {direction}, stage={stage}/{regime_stage_max}')
 
     return ('HOLD', 'no action needed')
@@ -2429,6 +2489,22 @@ def _cycle():
             # Fetch Bybit position
             ex = _get_exchange()
             pos = _fetch_position(ex)
+
+            # [0-1] Orphan cleanup: detect pos→0 transition
+            global _prev_had_position
+            if pos is None or pos.get('qty', 0) < 1e-09:
+                if _prev_had_position:
+                    try:
+                        from orphan_cleanup import cleanup_if_flat
+                        cleaned, detail = cleanup_if_flat(ex, SYMBOL, reason='pm_pos_zero_detected')
+                        if cleaned:
+                            _log(f'[PM_CLEANUP] pos→0 detected: {detail}')
+                    except Exception as e:
+                        _log(f'[PM_CLEANUP] error (FAIL-OPEN): {e}')
+                    _prev_had_position = False
+            else:
+                _prev_had_position = True
+
             if pos is None:
                 _log('position=NONE → HOLD(대기)')
                 return LOOP_SLOW_SEC
@@ -2440,6 +2516,21 @@ def _cycle():
                 import event_trigger as _et_reset
                 _et_reset.reset_edge_state(f'position: {_prev_position_side}->{current_side}')
                 _reset_hold_tracker(f'position: {_prev_position_side}->{current_side}')
+            # [4-2] Initialize Chandelier tracker on new position
+            try:
+                import feature_flags as _ff_ch_init
+                if _ff_ch_init.is_enabled('ff_unified_engine_v11') and pos and pos.get('side'):
+                    from chandelier_exit import get_tracker
+                    _ch_t = get_tracker()
+                    if _prev_position_side is None and current_side:
+                        # New position opened
+                        _ch_t.on_entry(current_side, pos.get('entry_price', 0))
+                    elif current_side is None and _prev_position_side:
+                        # Position closed
+                        _ch_t.on_close()
+            except Exception:
+                pass
+
             _prev_position_side = current_side
 
             # Phase 1: Real-time snapshot build

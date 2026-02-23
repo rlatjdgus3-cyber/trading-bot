@@ -297,6 +297,21 @@ def _is_adaptive_dryrun():
         return True
 
 
+def _is_mr_allowed(features, regime_class, v3_regime):
+    """[1-4] MeanReversion kill-switch for v1.1.
+    When ff_unified_engine_v11 is ON, MR is always OFF.
+    Returns True if MR entries are allowed."""
+    try:
+        import feature_flags
+        if not feature_flags.is_enabled('ff_unified_engine_v11'):
+            return True  # legacy behavior
+
+        # v1.1: MR 기본 OFF
+        return False
+    except Exception:
+        return True  # FAIL-OPEN
+
+
 def compute_modifier(total_score, features, v3_regime, price, regime_ctx=None):
     """Compute V3 score modifier based on regime classification.
 
@@ -341,6 +356,15 @@ def compute_modifier(total_score, features, v3_regime, price, regime_ctx=None):
                         'reasoning': ['insufficient liquidity → entry blocked']}
 
         regime_class = v3_regime.get('regime_class', 'STATIC_RANGE')
+
+        # [1-4] MR kill-switch: block STATIC_RANGE entries when v1.1 active
+        if regime_class == 'STATIC_RANGE' and not _is_mr_allowed(features, regime_class, v3_regime):
+            return {
+                'modifier': 0,
+                'entry_blocked': True,
+                'block_reason': '[v1.1] MR kill-switch: MeanReversion OFF',
+                'reasoning': ['MR disabled by ff_unified_engine_v11'],
+            }
 
         if regime_class == 'STATIC_RANGE':
             modifier, blocked, block_reason, reasoning = _compute_static_range_modifier(

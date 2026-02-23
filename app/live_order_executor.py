@@ -1338,12 +1338,14 @@ def _cycle(ex, _last_order_ts_unused):
                     _send_telegram(report)
                 return
 
-            # A2: Pre-flight orphan order cleanup
+            # A2: Pre-flight orphan order cleanup (enhanced [0-1])
             try:
-                from orphan_cleanup import pre_flight_cleanup
-                pre_flight_cleanup(ex, cur, SYMBOL)
+                from orphan_cleanup import cleanup_if_flat
+                cleaned, detail = cleanup_if_flat(ex, SYMBOL, reason='pre_entry_cleanup')
+                if cleaned:
+                    log(f"[PRE_ENTRY_CLEANUP] {detail}")
             except Exception as e:
-                log(f"pre_flight_cleanup error (FAIL-OPEN): {e}")
+                log(f"pre_entry_cleanup error (FAIL-OPEN): {e}")
 
             # --- Execute OPEN ---
             order_cap = _get_order_cap(cur)

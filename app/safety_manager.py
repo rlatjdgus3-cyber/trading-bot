@@ -130,6 +130,15 @@ def get_equity_limits(cur=None):
     raw_slice = operating_cap / max_stages if max_stages > 0 else operating_cap
     slice_usdt = max(raw_slice, SLICE_MIN_USDT)
 
+    # [3-2] v1.1 cap override
+    try:
+        import feature_flags
+        if feature_flags.is_enabled('ff_unified_engine_v11'):
+            operating_cap = equity * 0.20  # 20% cap
+            slice_usdt = operating_cap  # single position sizing
+    except Exception:
+        pass
+
     return {
         'equity': round(equity, 2),
         'operating_cap': round(operating_cap, 2),

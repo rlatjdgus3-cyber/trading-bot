@@ -2198,6 +2198,10 @@ _DEBUG_SUBCMDS = {
     'risk': 'debug_risk_snapshot',
     # Safety hotfix: integrity check
     'integrity': 'debug_integrity',
+    # Unified Engine v1.1 debug commands
+    'order_safety': 'debug_order_safety',
+    'perf_6h': 'debug_perf_6h',
+    'mtf': 'debug_mtf',
 }
 
 _DEBUG_HELP = (
@@ -2231,6 +2235,9 @@ _DEBUG_HELP = (
     '  /debug stop_orders — 서버사이드 스탑 주문 상태\n'
     '  /debug risk_snapshot — 리스크 종합 스냅샷\n'
     '  /debug integrity — 무결성 체크 (거래소 vs DB 비교)\n'
+    '  /debug order_safety — 주문 안전 상태 (서버스탑/고아주문)\n'
+    '  /debug perf_6h — 6시간 성과 요약\n'
+    '  /debug mtf — MTF 방향 상태\n'
     '  /debug on|off — 디버그 모드 토글\n'
     '\n'
     '  aliases: reaction, coverage, backfill, dryrun, gate,\n'

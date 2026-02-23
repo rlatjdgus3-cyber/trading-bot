@@ -81,10 +81,9 @@ def _notify_telegram(text):
 
 
 def _make_unique_id(prefix='SL'):
-    """Generate unique clientOrderId: SL_<epoch_ms>_<rand6>."""
-    ts = int(time.time() * 1000)
-    rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-    return f'{prefix}_{ts}_{rand}'
+    """Generate unique clientOrderId: SL_<uuid4_hex16>."""
+    import uuid
+    return f'{prefix}_{uuid.uuid4().hex[:16]}'
 
 
 class ServerStopManager:
@@ -103,6 +102,7 @@ class ServerStopManager:
         self._unset_alert_sent = False
         self._lock = threading.Lock()
         self._last_client_id = None        # Track actual clientOrderId for DB
+        self._entry_blocked_until = 0    # [0-2] entry block on repeated SL failure
 
     def _ex(self):
         return self._exchange
@@ -226,15 +226,17 @@ class ServerStopManager:
     def _handle_duplicate(self, cur, close_side, qty, desired_price, position_side):
         """Handle Bybit 110072 (OrderLinkedID duplicate).
         Re-query exchange → if SL is already set, treat as OK.
-        Otherwise retry once with a fresh unique ID."""
+        Otherwise retry once with a fresh unique ID.
+        On 2x failure → block new entries for 5 minutes."""
         _log('110072: duplicate orderLinkId — re-checking exchange')
 
+        # Step 1: Check if stop already exists at target price
         existing = self._fetch_existing_stops()
         if existing:
             for stop in existing:
                 ex_price = float(stop.get('trigger_price', 0))
                 oid = stop.get('order_id', '')
-                if ex_price > 0:
+                if ex_price > 0 and abs(desired_price - ex_price) / desired_price < 0.001:
                     self._last_order_id = oid
                     self._last_stop_price = ex_price
                     self._last_set_result = 'DUPLICATE_OK'
@@ -243,8 +245,8 @@ class ServerStopManager:
                     _log(f'110072 resolved: stop exists @ {ex_price} (id={oid})')
                     return (True, f'stop already exists @ {ex_price} (110072 resolved)')
 
-        # No stop found → retry once with fresh ID
-        _log('110072: no existing stop found — retrying with new ID')
+        # Step 2: Retry once with fresh uuid4-based ID
+        _log('110072: no matching stop found — retrying with new ID')
         success, order_id, ret_code = self._place_stop_market(
             close_side, qty, desired_price, position_side)
 
@@ -259,16 +261,25 @@ class ServerStopManager:
             _log(f'110072 retry OK: stop placed @ {desired_price}')
             return (True, f'stop placed @ {desired_price} (retry after 110072)')
 
-        # Final failure
+        # Step 3: 2x failure → CRITICAL + block new entries for 5 minutes
         self._last_set_result = f'FAILED(110072_retry:{ret_code})'
         self._last_set_ts = time.time()
         self._mark_unset()
+        self._entry_blocked_until = time.time() + 300
         _notify_telegram(
-            f'SERVER_STOP_UNSET\n'
-            f'110072 retry failed (retCode={ret_code})\n'
-            f'Desired SL: {desired_price}')
-        _log(f'110072 retry FAILED: ret={ret_code}')
+            f'CRITICAL: SL 설정 2회 실패\n'
+            f'retCode={ret_code}\n'
+            f'Desired SL: {desired_price}\n'
+            f'Entry 5분 차단 활성화')
+        _log(f'110072 retry FAILED: ret={ret_code} — entry blocked for 300s')
         return (False, f'110072 retry failed: {ret_code}')
+
+    def is_entry_blocked(self):
+        """[0-2] Check if entry is blocked due to repeated SL failures."""
+        if self._entry_blocked_until > time.time():
+            remaining = int(self._entry_blocked_until - time.time())
+            return (True, f'SL failure entry block ({remaining}s remaining)')
+        return (False, '')
 
     # ──────────────────────────────────────────────────────────
     # PLACE / CANCEL / VERIFY
@@ -429,6 +440,7 @@ class ServerStopManager:
             'last_verify_ts': self._last_verify_ts,
             'unset_since': self._unset_since,
             'ff_enabled': _is_ff_enabled(),
+            'entry_blocked_until': self._entry_blocked_until,
         }
 
     def _db_record(self, cur, order_id, side, qty, stop_price, status):

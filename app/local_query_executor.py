@@ -127,7 +127,10 @@ def execute(query_type=None, original_text=None):
         'bundle': _bundle,
         'debug_stop_orders': _debug_stop_orders,
         'debug_risk_snapshot': _debug_risk_snapshot,
-        'debug_integrity': _debug_integrity}
+        'debug_integrity': _debug_integrity,
+        'debug_order_safety': _debug_order_safety,
+        'debug_perf_6h': _debug_perf_6h,
+        'debug_mtf': _debug_mtf}
     handler = handlers.get(query_type, _unknown)
     return handler(original_text)
 
@@ -5790,3 +5793,118 @@ def _debug_integrity(_text=None):
         return '\n'.join(lines)
     except Exception as e:
         return f'integrity check error: {e}'
+
+
+def _debug_order_safety(_text=None):
+    """[5-2] Debug: order safety status."""
+    try:
+        from server_stop_manager import get_manager
+        mgr = get_manager()
+        status = mgr.get_status()
+        blocked, reason = mgr.is_entry_blocked()
+
+        lines = [
+            '=== Order Safety ===',
+            f'Server Stop: {status.get("last_set_result", "N/A")}',
+            f'Last SL: {status.get("last_stop_price", "N/A")}',
+            f'Unset since: {status.get("unset_since", 0):.0f}',
+            f'Entry blocked: {blocked} ({reason})',
+            f'FF enabled: {status.get("ff_enabled", False)}',
+        ]
+
+        # Orphan order count
+        conn = None
+        try:
+            conn = _db()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT count(*) FROM execution_log
+                    WHERE status IN ('SENT', 'PARTIALLY_FILLED')
+                    AND symbol = %s;
+                """, (SYMBOL,))
+                r = cur.fetchone()
+                ex_orders = r[0] if r else 0
+                lines.append(f'Pending orders: {ex_orders}')
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'debug_order_safety error: {e}'
+
+
+def _debug_perf_6h(_text=None):
+    """[5-2] Debug: 6h performance summary."""
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT count(*),
+                       count(*) FILTER (WHERE realized_pnl > 0),
+                       coalesce(sum(realized_pnl), 0),
+                       coalesce(min(realized_pnl), 0)
+                FROM execution_log
+                WHERE status = 'VERIFIED'
+                  AND realized_pnl IS NOT NULL
+                  AND symbol = %s
+                  AND last_fill_at >= now() - interval '6 hours';
+            """, (SYMBOL,))
+            r = cur.fetchone()
+            if not r or r[0] == 0:
+                return '6h: no trades'
+
+            total, wins, net_pnl, worst = r[0], r[1], float(r[2]), float(r[3])
+            wr = wins / total * 100 if total > 0 else 0
+
+            lines = [
+                '=== 6h Performance ===',
+                f'Trades: {total}',
+                f'WR: {wr:.1f}% ({wins}/{total})',
+                f'Net PnL: {net_pnl:.2f} USDT',
+                f'Worst: {worst:.2f} USDT',
+            ]
+            return '\n'.join(lines)
+    except Exception as e:
+        return f'debug_perf_6h error: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _debug_mtf(_text=None):
+    """[5-2] Debug: MTF direction status."""
+    conn = None
+    try:
+        conn = _db()
+        with conn.cursor() as cur:
+            from mtf_direction import compute_mtf_direction
+            mtf = compute_mtf_direction(cur, SYMBOL)
+
+            lines = [
+                '=== MTF Direction ===',
+                f'Direction: {mtf["direction"]}',
+                f'ADX_1h: {mtf["adx_1h"]:.1f} ({mtf["adx_state"]})',
+                f'EMA 1h: 50={mtf["ema_1h_50"]:.0f} 200={mtf["ema_1h_200"]:.0f}',
+                f'EMA 15m: 50={mtf["ema_15m_50"]:.0f} 200={mtf["ema_15m_200"]:.0f}',
+                f'Trend confirmed: {mtf["trend_confirmed"]}',
+                f'Reasons: {", ".join(mtf["reasons"])}',
+            ]
+            return '\n'.join(lines)
+    except Exception as e:
+        return f'debug_mtf error: {e}'
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass

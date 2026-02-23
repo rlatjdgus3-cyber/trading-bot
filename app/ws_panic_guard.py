@@ -253,6 +253,31 @@ def _handle_price_tick(price, ex):
             rolling_adverse = -rolling_ret_1m if side == 'long' else rolling_ret_1m
             effective_adverse = max(adverse_ret, rolling_adverse)
 
+            # [3-4] v1.1 circuit breaker: 1m-based thresholds
+            try:
+                import feature_flags as _ff_cb
+                if _ff_cb.is_enabled('ff_unified_engine_v11'):
+                    import yaml as _yaml_cb
+                    with open('/root/trading-bot/app/config/strategy_modes.yaml') as _f_cb:
+                        _v11_cfg = (_yaml_cb.safe_load(_f_cb) or {}).get('unified_v11', {})
+                    cb_block = _v11_cfg.get('cb_block_pct', 0.005)
+                    cb_reduce = _v11_cfg.get('cb_reduce_pct', 0.010)
+                    cb_close = _v11_cfg.get('cb_close_pct', 0.015)
+
+                    if abs(rolling_ret_1m) > cb_close * 100:
+                        _action_v11 = 'CLOSE_ALL'
+                    elif abs(rolling_ret_1m) > cb_reduce * 100:
+                        _action_v11 = 'REDUCE_HALF'
+                    elif abs(rolling_ret_1m) > cb_block * 100:
+                        _action_v11 = 'ENTRY_BLOCK'
+                    else:
+                        _action_v11 = None
+
+                    if _action_v11:
+                        _log(f'[v1.1 CB] 1m={rolling_ret_1m:.3f}% → {_action_v11}')
+            except Exception:
+                pass
+
             if effective_adverse < cfg['tighten_pct']:
                 return
 
