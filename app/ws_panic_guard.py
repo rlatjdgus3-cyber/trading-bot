@@ -393,9 +393,23 @@ def _handle_signal(signum, frame):
     # Close WS to unblock run_forever()
     if _ws_instance:
         try:
+            _ws_instance.keep_running = False
             _ws_instance.close()
         except Exception:
             pass
+        # Fallback: forcefully close underlying socket if close() doesn't work
+        try:
+            if _ws_instance.sock:
+                _ws_instance.sock.close()
+        except Exception:
+            pass
+    # Hard exit fallback — if run_forever() still blocks, force exit after 5s
+    def _force_exit():
+        time.sleep(5)
+        _log('Force exit after 5s timeout')
+        os._exit(0)
+    t = threading.Thread(target=_force_exit, daemon=True)
+    t.start()
 
 
 def main():
