@@ -24,6 +24,7 @@ OFF_REASONS = {
     'error_spike': '에러 급증 (order_throttle)',
     'rate_limit': 'API 속도 제한',
     'safety_gate_fail': '안전 게이트 실패',
+    'monitoring_down': '모니터링 서비스 heartbeat 중단',
     'unknown': '원인 미상',
 }
 

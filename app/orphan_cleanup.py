@@ -10,11 +10,9 @@ Usage:
 """
 import os
 import time
-import json
 import traceback
 import urllib.parse
 import urllib.request
-import ccxt
 
 SYMBOL = 'BTC/USDT:USDT'
 LOG_PREFIX = '[orphan_cleanup]'
@@ -24,16 +22,6 @@ _last_cleanup_ts = 0
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
-
-
-def _exchange():
-    ex = ccxt.bybit({
-        'apiKey': os.getenv('BYBIT_API_KEY'),
-        'secret': os.getenv('BYBIT_SECRET'),
-        'enableRateLimit': True,
-        'timeout': 20000,
-        'options': {'defaultType': 'swap'}})
-    return ex
 
 
 def _send_telegram(text):

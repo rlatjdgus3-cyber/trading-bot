@@ -11,9 +11,7 @@ All functions are FAIL-OPEN: errors return safe defaults.
 """
 import os
 import time
-import json
 import traceback
-import ccxt
 
 SYMBOL = 'BTC/USDT:USDT'
 LOG_PREFIX = '[integrity]'
@@ -24,16 +22,6 @@ _entry_freeze_until = 0
 
 def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
-
-
-def _exchange():
-    ex = ccxt.bybit({
-        'apiKey': os.getenv('BYBIT_API_KEY'),
-        'secret': os.getenv('BYBIT_SECRET'),
-        'enableRateLimit': True,
-        'timeout': 20000,
-        'options': {'defaultType': 'swap'}})
-    return ex
 
 
 def check_integrity(ex, cur, symbol) -> dict:
