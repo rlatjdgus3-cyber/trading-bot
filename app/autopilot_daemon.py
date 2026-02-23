@@ -2174,8 +2174,17 @@ def _cycle():
                     _log(f'strategy_v2 error (non-fatal): {e}')
 
                 # In 'on' mode: v2 decision replaces old logic
+                # Exception: V3 DRIFT regimes override V2 HOLD (drift-following > range no-trade zone)
                 if STRATEGY_V2_ENABLED == 'on' and v2_result in ('HOLD', 'ACTED'):
-                    return  # v2 handled this cycle
+                    v3_drift_override = (
+                        _v3_result
+                        and _v3_result.get('regime_class') in ('DRIFT_UP', 'DRIFT_DOWN')
+                        and v2_result == 'HOLD'
+                    )
+                    if v3_drift_override:
+                        _log(f'[V3] V2 HOLD overridden: regime={_v3_result["regime_class"]} drift takes priority')
+                    else:
+                        return  # v2 handled this cycle
 
                 # EARLY GATE CHECK — before any signal generation
                 try:
@@ -2206,18 +2215,23 @@ def _cycle():
             has_position = ps_row and ps_row[0] and float(ps_row[1] or 0) > 0
 
             # Regime entry filter (new entries only)
+            # Skip V1 RANGE filters when V3 identifies DRIFT regime
+            _v3_is_drift = (_v3_result and _v3_result.get('regime_class') in ('DRIFT_UP', 'DRIFT_DOWN'))
             if not has_position:
-                entry_ok, entry_reason = _check_regime_entry_filter(cur, regime_ctx, scores)
-                if not entry_ok:
-                    _log(f'REGIME_FILTER: {entry_reason}')
-                    return
-
-                # RANGE anti-chase filter
-                if regime_ctx.get('regime') == 'RANGE':
-                    chase_ok, chase_reason = _check_anti_chase(cur, regime_ctx)
-                    if not chase_ok:
-                        _log(f'ANTI_CHASE: {chase_reason}')
+                if _v3_is_drift:
+                    _log(f'[V3] V1 RANGE filters skipped: regime={_v3_result["regime_class"]}')
+                else:
+                    entry_ok, entry_reason = _check_regime_entry_filter(cur, regime_ctx, scores)
+                    if not entry_ok:
+                        _log(f'REGIME_FILTER: {entry_reason}')
                         return
+
+                    # RANGE anti-chase filter
+                    if regime_ctx.get('regime') == 'RANGE':
+                        chase_ok, chase_reason = _check_anti_chase(cur, regime_ctx)
+                        if not chase_ok:
+                            _log(f'ANTI_CHASE: {chase_reason}')
+                            return
 
                 # Post-close cooldowns (TP→3min, SL→10min)
                 pc_ok, pc_reason, _ = _check_post_close_cooldown(cur, SYMBOL)
