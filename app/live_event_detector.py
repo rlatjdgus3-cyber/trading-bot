@@ -13,6 +13,7 @@ import sys
 import time
 import math
 import json
+import atexit
 import traceback
 
 sys.path.insert(0, '/root/trading-bot/app')
@@ -28,6 +29,7 @@ POLL_SEC = 30
 ZSCORE_THRESHOLD = 2.0    # 기존 3.0 — 더 빈번한 변동성 감지
 COOLDOWN_SEC = 120        # 기존 300 — 감지 간격 단축
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
+PID_FILE = '/tmp/live_event_detector.pid'
 LOG_PREFIX = '[live_event]'
 
 
@@ -223,7 +225,38 @@ def _cycle(conn):
             _log(f"Elevated z={zscore:.2f} (below threshold {ZSCORE_THRESHOLD})")
 
 
+def _acquire_pid_lock():
+    """Write PID file. Exit if another instance is alive."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 0)  # check alive
+            _log(f'Another instance already running (pid={old_pid}). Exiting.')
+            sys.exit(0)
+        except (ProcessLookupError, ValueError):
+            pass  # stale PID file — safe to overwrite
+        except PermissionError:
+            _log(f'Another instance may be running (pid check permission denied). Exiting.')
+            sys.exit(0)
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    atexit.register(_release_pid_lock)
+
+
+def _release_pid_lock():
+    """Remove PID file on exit."""
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(PID_FILE)
+    except Exception:
+        pass
+
+
 def main():
+    _acquire_pid_lock()
     _log('=== LIVE EVENT DETECTOR START ===')
     conn = _db_conn()
     conn.autocommit = True
