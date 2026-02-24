@@ -264,8 +264,9 @@ def execute_trade_command(parsed = None):
         # Auto direction if not specified
         if not side:
             try:
-                from direction_scorer import get_direction
-                side = get_direction()
+                from direction_scorer import compute_scores
+                scores = compute_scores()
+                side = scores.get('dominant_side', 'LONG')
             except Exception:
                 side = 'LONG'
         # Calculate USDT amount

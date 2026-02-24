@@ -152,6 +152,32 @@ def _send_telegram(text: str):
         _log(f'telegram send error: {e}')
 
 
+def get_health_summary() -> dict:
+    """Return a lightweight health summary for event_decision_engine.
+
+    Returns dict with:
+        down_services: list of service names that are not active
+        latency_ms: int, DB round-trip latency in milliseconds
+    """
+    down = []
+    for unit, _level in MONITORED_SERVICES:
+        if not _is_active(unit):
+            down.append(unit.replace('.service', ''))
+    latency_ms = 0
+    try:
+        import time as _t
+        from db_config import get_conn
+        t0 = _t.monotonic()
+        conn = get_conn(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute('SELECT 1;')
+        conn.close()
+        latency_ms = int((_t.monotonic() - t0) * 1000)
+    except Exception:
+        latency_ms = -1
+    return {'down_services': down, 'latency_ms': latency_ms}
+
+
 def _check_db_connection() -> tuple:
     """Check PostgreSQL connectivity. Returns (ok, detail)."""
     try:

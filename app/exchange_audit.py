@@ -130,8 +130,10 @@ def check_market_info_changes(conn):
     try:
         # Load current market info from exchange
         try:
-            from exchange_compliance import _load_market_info_from_exchange
-            current_info = _load_market_info_from_exchange(SYMBOL)
+            from exchange_compliance import _load_market_info
+            from exchange_reader import _get_exchange
+            ex = _get_exchange()
+            current_info = _load_market_info(ex, SYMBOL)
         except (ImportError, AttributeError):
             current_info = None
 

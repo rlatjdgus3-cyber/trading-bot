@@ -465,15 +465,6 @@ class ServerStopManager:
         except Exception as e:
             _log(f'_db_update_status error: {e}')
 
-
-def _is_ff_enabled():
-    try:
-        import feature_flags
-        return feature_flags.is_enabled('ff_server_stop_orders')
-    except Exception:
-        return False
-
-
     def sync_event_stop(self, cur, position, new_sl_pct=None, urgency='MEDIUM'):
         """Event Decision Mode stop sync — wraps sync_stop_order with urgency bypass.
 
@@ -520,6 +511,14 @@ def _is_ff_enabled():
                 self._lock.release()
         else:
             return self.sync_stop_order(cur, position, sl_price)
+
+
+def _is_ff_enabled():
+    try:
+        import feature_flags
+        return feature_flags.is_enabled('ff_server_stop_orders')
+    except Exception:
+        return False
 
 
 # Module-level singleton with thread-safe init

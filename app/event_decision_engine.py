@@ -223,7 +223,7 @@ def _build_snapshot_bundle(cur, ctx, snapshot, position, event_result):
     # Orders info
     orders = {'active_count': 0, 'conditional_count': 0, 'has_orphan_risk': False}
     try:
-        from live_order_executor import _get_exchange
+        from exchange_reader import _get_exchange
         ex = _get_exchange()
         active = ex.fetch_open_orders(SYMBOL) or []
         cond = ex.fetch_open_orders(SYMBOL, params={'orderFilter': 'StopOrder'}) or []
@@ -590,7 +590,7 @@ def _post_execution_cleanup(symbol, action):
     if action not in ('HARD_EXIT', 'FULL_CLOSE'):
         return
     try:
-        from live_order_executor import _get_exchange
+        from exchange_reader import _get_exchange
         import orphan_cleanup
         ex = _get_exchange()
         orphan_cleanup.post_exit_cleanup(ex, symbol, caller='event_decision')

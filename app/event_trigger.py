@@ -11,9 +11,8 @@ Modes:
 
 Cost control:
   - EVENT Claude gated by 4 conditions (confidence, ret_5m, vol_spike, level break)
-  - EVENT Claude cooldown: 15 min minimum
-  - EVENT Claude daily cap: 20 calls/day
-  - event_hash dedupe: 15 min window
+  - EVENT Claude cooldown: 2 min minimum
+  - event_hash dedupe: 5 min window
   - Telegram throttle: same event type max once per 10 min
 """
 import hashlib
@@ -76,30 +75,30 @@ BOX_BB_BANDWIDTH_PCT = 0.6
 BOX_RET_5M_SUPPRESS_PCT = 1.0
 
 # ── dedup ──────────────────────────────────────────────────
-AUTO_DEDUP_WINDOW_SEC = 300    # 5 min (per-type trigger dedup)
-EVENT_HASH_DEDUP_SEC = 900     # 15 min (same event_hash dedup)
-EMERGENCY_LOCK_SEC = 180       # 3 min lock after emergency execution
+AUTO_DEDUP_WINDOW_SEC = 120    # 2 min (per-type trigger dedup) — 기존 300
+EVENT_HASH_DEDUP_SEC = 300     # 5 min (same event_hash dedup) — 기존 900
+EMERGENCY_LOCK_SEC = 60        # 1 min lock after emergency execution — 기존 180
 MIN_ORDER_QTY_BTC = 0.001     # Bybit BTC/USDT:USDT minimum
 
 # ── EVENT Claude escalation gate ─────────────────────────
-EVENT_CLAUDE_COOLDOWN_SEC = 300   # 5 min minimum between EVENT Claude calls
+EVENT_CLAUDE_COOLDOWN_SEC = 120   # 2 min minimum between EVENT Claude calls — 기존 300
 # EVENT_CLAUDE_DAILY_CAP: 삭제됨 (claude_gate의 비용 기반 제어에 위임)
 EVENT_CLAUDE_MIN_RET_5M = 1.2     # abs(ret_5m) >= 1.2%
 EVENT_CLAUDE_MIN_VOL_RATIO = 2.5  # vol_spike >= 2.5x
 EVENT_CLAUDE_MIN_CONFIDENCE = 0.75  # trigger confidence threshold
 
 # ── Async Claude escalation (need_claude) ───────────────
-ASYNC_CLAUDE_COOLDOWN_SEC = 600        # 10분 쿨다운
-ASYNC_CLAUDE_RET_5M_THRESHOLD = 1.0    # 조건A: |ret_5m| >= 1.0%
-ASYNC_CLAUDE_CONFIDENCE_THRESHOLD = 70  # 조건A: GPT confidence < 70
-ASYNC_CLAUDE_BAR_15M_CUMULATIVE = 1.5  # 조건B: 누적 >=1.5% (같은 방향)
-ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD = 40  # 조건C: |news_event_score| >= 40
+ASYNC_CLAUDE_COOLDOWN_SEC = 300        # 5분 쿨다운 — 기존 600
+ASYNC_CLAUDE_RET_5M_THRESHOLD = 0.7    # 조건A: |ret_5m| >= 0.7% — 기존 1.0
+ASYNC_CLAUDE_CONFIDENCE_THRESHOLD = 75  # 조건A: GPT confidence < 75 — 기존 70
+ASYNC_CLAUDE_BAR_15M_CUMULATIVE = 1.0  # 조건B: 누적 >=1.0% (같은 방향) — 기존 1.5
+ASYNC_CLAUDE_NEWS_SCORE_THRESHOLD = 30  # 조건C: |news_event_score| >= 30 — 기존 40
 
 # ── Telegram throttle ────────────────────────────────────
 TELEGRAM_EVENT_THROTTLE_SEC = 600  # same event type: max once per 10 min
 
 # ── Whipsaw guard (vol_spike + level_break) ──────────────
-WHIPSAW_GUARD_SEC = 120            # 120s wait when vol_spike + level_break coincide
+WHIPSAW_GUARD_SEC = 45             # 45s wait when vol_spike + level_break coincide — 기존 120
 
 # ── Event bundling (30s window) ──────────────────────────
 BUNDLE_WINDOW_SEC = 30
@@ -113,7 +112,7 @@ _event_bundle = {
 _emergency_lock = {}           # {symbol: expire_timestamp}
 _last_emergency_action = {}    # {symbol: {'action': str, 'direction': str, 'ts': float}}
 
-# ── per-type EVENT dedup (5 min) ─────────────────────────
+# ── per-type EVENT dedup (2 min) ─────────────────────────
 _last_trigger_ts = {}          # {trigger_type: timestamp}
 
 # ── EVENT Claude budget tracking ─────────────────────────
@@ -131,12 +130,12 @@ _event_hash_history = {}       # {event_hash: timestamp}
 _telegram_event_ts = {}        # {trigger_type_key: timestamp}
 
 # ── HOLD repeat suppression (§3) — progressive locking ───
-HOLD_REPEAT_LIMIT = 2             # first lock at 2 consecutive HOLDs
+HOLD_REPEAT_LIMIT = 3             # first lock at 3 consecutive HOLDs — 기존 2
 # Progressive lock durations (seconds)
 HOLD_LOCK_PROGRESSIVE = {
-    2: 600,    # 2회: 10분
-    3: 1200,   # 3회: 20분
-    4: 1800,   # 4회+: 30분
+    3: 180,    # 3회: 3분 — 기존 2회=10분
+    4: 300,    # 4회: 5분 — 기존 3회=20분
+    5: 600,    # 5회+: 10분 — 기존 4회=30분
 }
 
 _last_hold_state = {

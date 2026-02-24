@@ -5,9 +5,9 @@ Replaces all in-memory dedup (event_hash, HOLD repeat, consecutive HOLD)
 with PostgreSQL-backed locks visible to ALL processes.
 
 Lock types:
-  event     — symbol:trigger_type:price_bucket  (TTL 10 min)
-  hold_sup  — hold_suppress:symbol              (TTL 15 min)
-  hash      — hash:event_hash                   (TTL 30 min)
+  event     — symbol:trigger_type:price_bucket  (TTL 3 min)
+  hold_sup  — hold_suppress:symbol              (TTL 5 min)
+  hash      — hash:event_hash                   (TTL 10 min)
 
 Usage:
   from event_lock import acquire_event_lock, is_locked, check_hold_suppress
@@ -22,19 +22,19 @@ sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[event_lock]'
 
 # TTL defaults
-EVENT_LOCK_TTL_SEC = 600       # 10 min — per trigger type+price
-HOLD_SUPPRESS_TTL_SEC = 900    # 15 min — after 2 consecutive HOLDs
-HASH_LOCK_TTL_SEC = 1800       # 30 min — event hash dedup
-CONSECUTIVE_HOLD_LIMIT = 2     # 2 consecutive HOLDs → suppress
+EVENT_LOCK_TTL_SEC = 180       # 3 min — per trigger type+price — 기존 600
+HOLD_SUPPRESS_TTL_SEC = 300    # 5 min — after 3 consecutive HOLDs — 기존 900
+HASH_LOCK_TTL_SEC = 600        # 10 min — event hash dedup — 기존 1800
+CONSECUTIVE_HOLD_LIMIT = 3     # 3 consecutive HOLDs → suppress — 기존 2
 
 # Telegram suppression notification dedup (in-memory, per-process)
 _suppress_notify_ts = {}       # {lock_key: last_notify_timestamp}
-SUPPRESS_NOTIFY_COOLDOWN_SEC = 900  # max 1 notification per trigger type per 15 min
+SUPPRESS_NOTIFY_COOLDOWN_SEC = 300  # max 1 notification per trigger type per 5 min — 기존 900
 
 # Suppression accumulator: count per trigger_type, flush every 15 min
 _suppress_accumulator = {}     # {trigger_type: count}
 _suppress_accumulator_ts = 0   # last flush timestamp
-SUPPRESS_ACCUMULATOR_SEC = int(os.getenv('SUPPRESS_ACCUMULATOR_SEC', '900'))
+SUPPRESS_ACCUMULATOR_SEC = int(os.getenv('SUPPRESS_ACCUMULATOR_SEC', '300'))
 
 # Emergency triggers that bypass accumulation and send immediately
 IMMEDIATE_PASS_TRIGGERS = {
@@ -199,7 +199,7 @@ def cleanup_expired(conn=None):
 # ── Event lock convenience ───────────────────────────────
 
 def acquire_event_lock(symbol, trigger_types, price, caller='unknown', conn=None):
-    """Acquire event dedup lock (10 min TTL).
+    """Acquire event dedup lock (3 min TTL).
     Returns (acquired, info).
     """
     key = make_event_key(symbol, trigger_types, price)
@@ -221,7 +221,7 @@ def check_event_lock(symbol, trigger_types, price, conn=None):
 # ── Hash lock convenience ────────────────────────────────
 
 def acquire_hash_lock(event_hash, caller='unknown', conn=None):
-    """Acquire event hash dedup lock (30 min TTL).
+    """Acquire event hash dedup lock (10 min TTL).
     Returns (acquired, info).
     """
     key = make_hash_key(event_hash)
@@ -247,7 +247,7 @@ def record_hold_result(symbol, action, trigger_types, caller='unknown',
 
     If action == 'HOLD' and same trigger_types:
       increment consecutive_count
-      if count >= 2 → create hold_suppress lock (15 min)
+      if count >= 3 → create hold_suppress lock (5 min)
     If action != 'HOLD':
       reset consecutive_count to 0
 

@@ -15,7 +15,7 @@ LOG_PREFIX = '[claude_gate]'
 
 # ── constants ────────────────────────────────────────────
 COOLDOWN_GENERAL_SEC = 600        # 10 min
-COOLDOWN_EMERGENCY_SEC = 600      # 10 min
+COOLDOWN_EMERGENCY_SEC = 300      # 5 min — 기존 600
 COOLDOWN_ERROR_SEC = 3600         # 5xx → 1 hour block
 DAILY_CALL_LIMIT = 50
 DAILY_COST_LIMIT = 5.0            # $5/day
@@ -69,7 +69,7 @@ GATE_COOLDOWNS = {
     'scheduled': COOLDOWN_GENERAL_SEC,
     'telegram': COOLDOWN_GENERAL_SEC,
     'openclaw': 120,                      # 2 min — control tower, permissive
-    'event_trigger': 180,                 # 3 min — event cooldown (dedup is separate)
+    'event_trigger': 90,                  # 90s — event cooldown (dedup is separate) — 기존 180
     'chat_claude': 120,                   # 2 min — 사용자 대화 중 Claude 요청
     'auto_apply': 300,                    # 5 min — 자동 매매 분석
 }

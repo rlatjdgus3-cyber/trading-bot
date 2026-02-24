@@ -5,7 +5,7 @@ Every 30s:
   1. Check KILL_SWITCH
   2. Fetch latest 10 5m candles from Bybit -> upsert to market_ohlcv
   3. Compute z-score from last 2h of market_ohlcv rolling stats
-  4. If z-score > 3.0 and no event in last 5 min -> create LIVE_VOL_SPIKE event
+  4. If z-score > 2.0 and no event in last 2 min -> create LIVE_VOL_SPIKE event
   5. Link recent news (+/-30 min) via event_news
 """
 import os
@@ -18,14 +18,15 @@ import traceback
 sys.path.insert(0, '/root/trading-bot/app')
 import ccxt
 from psycopg2 import OperationalError, InterfaceError
+from ccxt.base.errors import RateLimitExceeded, NetworkError
 from db_config import get_conn
 import fact_categories
 
 SYMBOL = 'BTC/USDT:USDT'
 TF = '5m'
 POLL_SEC = 30
-ZSCORE_THRESHOLD = 3.0
-COOLDOWN_SEC = 300
+ZSCORE_THRESHOLD = 2.0    # 기존 3.0 — 더 빈번한 변동성 감지
+COOLDOWN_SEC = 120        # 기존 300 — 감지 간격 단축
 KILL_SWITCH_PATH = '/root/trading-bot/app/KILL_SWITCH'
 LOG_PREFIX = '[live_event]'
 
@@ -55,9 +56,21 @@ def _get_exchange():
 
 
 def _fetch_and_upsert(cur):
-    """Fetch latest 5m candles and upsert to market_ohlcv."""
+    """Fetch latest 5m candles and upsert to market_ohlcv.
+
+    Retries once on RateLimitExceeded with a 2s pause.
+    """
     ex = _get_exchange()
-    ohlcv = ex.fetch_ohlcv(SYMBOL, timeframe=TF, limit=10)
+    for attempt in range(2):
+        try:
+            ohlcv = ex.fetch_ohlcv(SYMBOL, timeframe=TF, limit=10)
+            break
+        except RateLimitExceeded:
+            if attempt == 0:
+                _log('Rate limit hit on fetch_ohlcv, retry in 2s')
+                time.sleep(2)
+            else:
+                raise
     if not ohlcv:
         return 0
     for ms, o, h, l, c, v in ohlcv:
@@ -206,7 +219,7 @@ def _cycle(conn):
                 _log(f"z={zscore:.2f} but cooldown active, skipping.")
                 return
             _create_event(cur, zscore, btc_price, direction)
-        elif abs_z > 2.0:
+        elif abs_z > 1.5:
             _log(f"Elevated z={zscore:.2f} (below threshold {ZSCORE_THRESHOLD})")
 
 
@@ -238,6 +251,11 @@ def main():
             conn = None
             time.sleep(backoff)
             backoff = min(backoff * 2, 120)
+
+        except (RateLimitExceeded, NetworkError) as e:
+            _log(f"Exchange transient error: {type(e).__name__} | wait {POLL_SEC}s")
+            time.sleep(POLL_SEC)
+            # Don't increase backoff — transient issue
 
         except KeyboardInterrupt:
             _log("Interrupted. Shutting down.")
