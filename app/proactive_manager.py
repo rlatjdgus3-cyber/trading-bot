@@ -790,9 +790,9 @@ def _enqueue_reduce(cur, pos, reduce_pct, reason):
 
         cur.execute("""
             INSERT INTO execution_queue
-                (symbol, action_type, direction, qty, reason, source, priority, status)
+                (symbol, action_type, direction, reduce_pct, reason, source, priority, status)
             VALUES (%s, 'REDUCE', %s, %s, %s, 'proactive_manager', 3, 'PENDING');
-        """, (SYMBOL, pos_side, reduce_qty, f'proactive: {reason}'))
+        """, (SYMBOL, pos_side, reduce_pct, f'proactive: {reason}'))
         _log(f'ENQUEUED REDUCE {reduce_pct}% ({reduce_qty:.4f} BTC): {reason}')
     except Exception as e:
         _log(f'enqueue REDUCE error: {e}')
@@ -893,9 +893,9 @@ def _apply_claude_recommendation(cur, pos, result):
             pos_side = (pos.get('side') or '').upper()
             cur.execute("""
                 INSERT INTO execution_queue
-                    (symbol, action_type, direction, qty, reason, source, priority, status)
-                VALUES (%s, 'CLOSE', %s, %s, %s, 'proactive_manager', 2, 'PENDING');
-            """, (SYMBOL, pos_side, pos.get('qty'),
+                    (symbol, action_type, direction, target_qty, reason, source, priority, status)
+                VALUES (%s, 'FULL_CLOSE', %s, %s, %s, 'proactive_manager', 2, 'PENDING');
+            """, (SYMBOL, pos_side, float(pos.get('qty', 0)),
                   f'proactive_claude: {rec.get("reason", "")}'))
             _send_telegram(
                 f'[Proactive] Claude 분석 → CLOSE\n'

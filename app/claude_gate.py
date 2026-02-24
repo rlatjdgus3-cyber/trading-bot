@@ -229,7 +229,7 @@ def _check_gate_condition(gate: str, context: dict) -> tuple:
 
     if gate == 'event_trigger':
         event_mode = context.get('event_mode', '')
-        if event_mode in ('EVENT', 'EMERGENCY'):
+        if event_mode in ('EVENT', 'EMERGENCY', 'EVENT_DECISION'):
             return (True, f'event_trigger: mode={event_mode}')
         return (False, 'event_trigger: no qualifying event')
 

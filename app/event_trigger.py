@@ -155,6 +155,9 @@ _prev_edge_state = {
     'price_spike_15m': False,
     'volume_spike': False,
     'atr_increase': False,
+    'range_position_extreme': False,
+    'impulse_spike': False,
+    'liquidity_stress': False,
 }
 _last_evaluate_ts = 0
 EDGE_STALE_SEC = 600  # 10분 이상 gap → 엣지 상태 리셋
@@ -960,23 +963,26 @@ def _check_3bar_directional(snapshot) -> list:
 # ── Event Decision Mode additional checks ────────────────
 
 def _check_range_position_extreme(snapshot) -> list:
-    """Check if range_pos is outside [-0.1, 1.1] — extreme deviation from range."""
+    """Check if range_pos is outside [0.0, 1.0] — edge-based (False→True only)."""
     triggers = []
     range_pos = snapshot.get('range_pos')
     if range_pos is None:
         return triggers
-    if range_pos < EVENT_DECISION_RANGE_POS_LOW or range_pos > EVENT_DECISION_RANGE_POS_HIGH:
+    now_active = range_pos < EVENT_DECISION_RANGE_POS_LOW or range_pos > EVENT_DECISION_RANGE_POS_HIGH
+    was_active = _prev_edge_state.get('range_position_extreme', False)
+    if now_active and not was_active:
         triggers.append({
             'type': 'range_position_extreme',
             'value': round(range_pos, 3),
             'threshold': f'{EVENT_DECISION_RANGE_POS_LOW}~{EVENT_DECISION_RANGE_POS_HIGH}',
             'direction': 'up' if range_pos > EVENT_DECISION_RANGE_POS_HIGH else 'down',
         })
+    _prev_edge_state['range_position_extreme'] = now_active
     return triggers
 
 
 def _check_impulse_spike(snapshot, cur=None) -> list:
-    """Check if impulse >= 1.5 — sharp directional momentum."""
+    """Check if |impulse| >= 1.0 — edge-based (False→True only)."""
     triggers = []
     impulse = None
     try:
@@ -986,27 +992,33 @@ def _check_impulse_spike(snapshot, cur=None) -> list:
         impulse = snapshot.get('impulse')
     if impulse is None:
         return triggers
-    if abs(impulse) >= EVENT_DECISION_IMPULSE_MIN:
+    now_active = abs(impulse) >= EVENT_DECISION_IMPULSE_MIN
+    was_active = _prev_edge_state.get('impulse_spike', False)
+    if now_active and not was_active:
         triggers.append({
             'type': 'impulse_spike',
             'value': round(impulse, 3),
             'threshold': EVENT_DECISION_IMPULSE_MIN,
             'direction': 'up' if impulse > 0 else 'down',
         })
+    _prev_edge_state['impulse_spike'] = now_active
     return triggers
 
 
 def _check_liquidity_stress(snapshot) -> list:
-    """Check if spread_ok or liquidity_ok is False — market stress."""
+    """Check if spread_ok or liquidity_ok is False — edge-based (False→True only)."""
     triggers = []
     spread_ok = snapshot.get('spread_ok', True)
     liquidity_ok = snapshot.get('liquidity_ok', True)
-    if not spread_ok or not liquidity_ok:
+    now_active = not spread_ok or not liquidity_ok
+    was_active = _prev_edge_state.get('liquidity_stress', False)
+    if now_active and not was_active:
         triggers.append({
             'type': 'liquidity_stress',
             'value': f'spread_ok={spread_ok},liquidity_ok={liquidity_ok}',
             'threshold': 'spread_ok=True,liquidity_ok=True',
         })
+    _prev_edge_state['liquidity_stress'] = now_active
     return triggers
 
 

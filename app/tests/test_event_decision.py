@@ -36,6 +36,9 @@ def _reset_event_trigger():
         'price_spike_15m': False,
         'volume_spike': False,
         'atr_increase': False,
+        'range_position_extreme': False,
+        'impulse_spike': False,
+        'liquidity_stress': False,
     })
     event_trigger._last_trigger_ts.clear()
     event_trigger._last_evaluate_ts = 0
@@ -602,7 +605,8 @@ class TestNewTriggerChecks:
     """New EVENT_DECISION-specific trigger functions"""
 
     def test_range_position_extreme_low(self):
-        """range_pos < -0.1 → trigger"""
+        """range_pos < 0.0 → trigger"""
+        event_trigger._prev_edge_state['range_position_extreme'] = False
         triggers = event_trigger._check_range_position_extreme(
             _base_snapshot(range_pos=-0.2))
         assert len(triggers) == 1
@@ -610,7 +614,8 @@ class TestNewTriggerChecks:
         assert triggers[0]['direction'] == 'down'
 
     def test_range_position_extreme_high(self):
-        """range_pos > 1.1 → trigger"""
+        """range_pos > 1.0 → trigger"""
+        event_trigger._prev_edge_state['range_position_extreme'] = False
         triggers = event_trigger._check_range_position_extreme(
             _base_snapshot(range_pos=1.3))
         assert len(triggers) == 1
@@ -618,12 +623,14 @@ class TestNewTriggerChecks:
 
     def test_range_position_normal_no_trigger(self):
         """range_pos 0.5 → no trigger"""
+        event_trigger._prev_edge_state['range_position_extreme'] = False
         triggers = event_trigger._check_range_position_extreme(
             _base_snapshot(range_pos=0.5))
         assert len(triggers) == 0
 
     def test_liquidity_stress_both_false(self):
         """spread_ok=False + liquidity_ok=False → trigger"""
+        event_trigger._prev_edge_state['liquidity_stress'] = False
         triggers = event_trigger._check_liquidity_stress(
             _base_snapshot(spread_ok=False, liquidity_ok=False))
         assert len(triggers) == 1
@@ -631,12 +638,14 @@ class TestNewTriggerChecks:
 
     def test_liquidity_stress_ok(self):
         """spread_ok=True + liquidity_ok=True → no trigger"""
+        event_trigger._prev_edge_state['liquidity_stress'] = False
         triggers = event_trigger._check_liquidity_stress(
             _base_snapshot(spread_ok=True, liquidity_ok=True))
         assert len(triggers) == 0
 
     def test_impulse_spike_trigger(self):
-        """impulse >= 1.5 → trigger"""
+        """impulse >= 1.0 → trigger"""
+        event_trigger._prev_edge_state['impulse_spike'] = False
         with patch('strategy.common.features.compute_impulse', return_value=2.0):
             triggers = event_trigger._check_impulse_spike(
                 _base_snapshot(impulse=2.0), _mock_cursor())
@@ -645,7 +654,8 @@ class TestNewTriggerChecks:
         assert triggers[0]['direction'] == 'up'
 
     def test_impulse_spike_negative(self):
-        """impulse <= -1.5 → trigger (down)"""
+        """impulse <= -1.0 → trigger (down)"""
+        event_trigger._prev_edge_state['impulse_spike'] = False
         with patch('strategy.common.features.compute_impulse', return_value=-1.8):
             triggers = event_trigger._check_impulse_spike(
                 _base_snapshot(impulse=-1.8), _mock_cursor())
@@ -654,6 +664,7 @@ class TestNewTriggerChecks:
 
     def test_impulse_normal_no_trigger(self):
         """impulse 0.5 → no trigger"""
+        event_trigger._prev_edge_state['impulse_spike'] = False
         with patch('strategy.common.features.compute_impulse', return_value=0.5):
             triggers = event_trigger._check_impulse_spike(
                 _base_snapshot(impulse=0.5), _mock_cursor())

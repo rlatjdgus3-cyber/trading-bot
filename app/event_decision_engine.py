@@ -74,7 +74,8 @@ def _send_telegram(text):
             'text': text,
             'disable_web_page_preview': 'true'}).encode('utf-8')
         req = urllib.request.Request(url, data=data, method='POST')
-        urllib.request.urlopen(req, timeout=5)
+        with urllib.request.urlopen(req, timeout=5):
+            pass
     except Exception:
         pass
 
@@ -366,14 +367,13 @@ def _apply_safety_guards(action, params, position, snapshot):
 
     # 6. No position + exit actions → HOLD
     pos_side = ''
+    pos_qty = 0
     if position:
         pos_side = (position.get('side') or '').upper()
-    if not pos_side:
-        pos_ctx = {}
-    else:
-        pos_ctx = position
-
-    pos_qty = float(pos_ctx.get('qty', 0)) if pos_ctx else 0
+        try:
+            pos_qty = float(position.get('qty', 0) or 0)
+        except (ValueError, TypeError):
+            pos_qty = 0
     if pos_qty <= 0 and action in ('RISK_OFF_REDUCE', 'HARD_EXIT', 'REVERSE', 'HEDGE'):
         guard_reasons.append(f'no position: {action} → HOLD')
         action = 'HOLD'
@@ -398,7 +398,10 @@ def _map_action_to_execution(cur, action, params, position, symbol):
     """
     eq_ids = []
     pos_side = (position.get('side') or '').upper() if position else ''
-    pos_qty = float(position.get('qty', 0)) if position else 0
+    try:
+        pos_qty = float(position.get('qty', 0) or 0) if position else 0
+    except (ValueError, TypeError):
+        pos_qty = 0
 
     if action == 'HOLD':
         # No-op: server SL check only (done separately)
@@ -455,7 +458,11 @@ def _map_action_to_execution(cur, action, params, position, symbol):
         hedge_side = 'SHORT' if pos_side == 'LONG' else 'LONG'
         hedge_ratio = params.get('hedge_size_ratio', 0.20)
         # Estimate hedge USDT from position
-        mark = float(position.get('mark_price', 0) or position.get('entry_price', 0) or 0)
+        try:
+            mark = float((position or {}).get('mark_price', 0) or
+                         (position or {}).get('entry_price', 0) or 0)
+        except (ValueError, TypeError):
+            mark = 0
         hedge_usdt = pos_qty * mark * hedge_ratio if mark > 0 else 0
         if hedge_usdt <= 0:
             return eq_ids
@@ -532,11 +539,13 @@ def _enqueue(cur, action_type, direction, symbol, **kwargs):
 
 def _enforce_server_stop(cur, position, params):
     """Ensure server-side stop-loss is set after Claude decision."""
+    if not position:
+        _log('enforce_server_stop: no position, skipping')
+        return
     try:
         import server_stop_manager
         mgr = server_stop_manager.get_manager()
         new_sl_value = params.get('new_sl_value', 0)
-        new_sl_pct = None
 
         if new_sl_value and float(new_sl_value) > 0:
             # Direct SL price
@@ -545,7 +554,10 @@ def _enforce_server_stop(cur, position, params):
             # Use sync_event_stop for percentage-based or default
             sl_type = params.get('new_sl_type', '')
             if sl_type == 'BREAKEVEN':
-                entry = float(position.get('entry_price', 0) or 0)
+                try:
+                    entry = float(position.get('entry_price', 0) or 0)
+                except (ValueError, TypeError):
+                    entry = 0
                 if entry > 0:
                     synced, detail = mgr.sync_stop_order(cur, position, entry)
                 else:

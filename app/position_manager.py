@@ -2686,8 +2686,13 @@ def _cycle():
                 # Claude Decision Engine
                 _log(f'EVENT_DECISION → Claude direct (caller={CALLER})')
                 import event_decision_engine as _ede
-                ed_action, ed_detail = _ede.handle_event_decision(
-                    cur, ctx, event_result, snapshot, pos, conn=conn)
+                ed_action, ed_detail = 'HOLD', {}
+                try:
+                    ed_action, ed_detail = _ede.handle_event_decision(
+                        cur, ctx, event_result, snapshot, pos, conn=conn)
+                except Exception as _ede_err:
+                    _log(f'EVENT_DECISION error (FAIL-OPEN): {_ede_err}')
+                    import traceback; traceback.print_exc()
 
                 # Record results
                 _record_claude_action(ed_action)
@@ -2698,7 +2703,7 @@ def _cycle():
                     caller=CALLER, gate_type='event_decision',
                     call_type='AUTO_EMERGENCY', trigger_types=_trigger_types,
                     action_result=ed_action, allowed=True,
-                    latency_ms=ed_detail.get('latency_ms', 0),
+                    latency_ms=ed_detail.get('latency_ms', 0) if ed_detail else 0,
                     conn=conn)
 
                 if ed_action and ed_action != 'HOLD':
