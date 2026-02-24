@@ -65,11 +65,11 @@ EMERGENCY_VOL_SPIKE_RATIO = 2.5
 EMERGENCY_VOL_ZSCORE = 3.0
 
 # ── Event Decision Mode thresholds (lower sensitivity) ───
-EVENT_DECISION_PRICE_1M_PCT = 0.5     # 기존 1.0에서 하향
-EVENT_DECISION_PRICE_5M_PCT = 1.0     # 기존 1.8에서 하향
-EVENT_DECISION_RANGE_POS_LOW = -0.1
-EVENT_DECISION_RANGE_POS_HIGH = 1.1
-EVENT_DECISION_IMPULSE_MIN = 1.5
+EVENT_DECISION_PRICE_1M_PCT = 0.3     # $190 움직임에 발동 (기존 0.5)
+EVENT_DECISION_PRICE_5M_PCT = 0.6     # $380 움직임에 발동 (기존 1.0)
+EVENT_DECISION_RANGE_POS_LOW = 0.0    # BB 하단 이탈 시 발동 (기존 -0.1)
+EVENT_DECISION_RANGE_POS_HIGH = 1.0   # BB 상단 이탈 시 발동 (기존 1.1)
+EVENT_DECISION_IMPULSE_MIN = 1.0      # 더 낮은 모멘텀 감지 (기존 1.5)
 
 # ── box range filter (EMERGENCY suppression) ─────────────
 BOX_BB_BANDWIDTH_PCT = 0.6
