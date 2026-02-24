@@ -231,7 +231,7 @@ feature_flags:
   ff_pullback_trigger: false          # Phase 2 pullback (기본 OFF)
   ff_chandelier_exit: false           # Phase 4 (기본 OFF)
   # Event Decision Mode — Claude direct decision on EVENT triggers
-  ff_event_decision_mode: false       # Claude Decision Mode (기본 비활성, 안전 롤아웃)
+  ff_event_decision_mode: true        # Claude Decision Mode (활성)
 
 # ── UNIFIED ENGINE v1.1 Parameters ──
 unified_v11:
