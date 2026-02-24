@@ -41,12 +41,33 @@ def _log(msg):
     print(f'{LOG_PREFIX} {msg}', flush=True)
 
 
+_tg_config = {}
+
+def _load_tg_config():
+    if _tg_config:
+        return _tg_config
+    env_path = '/root/trading-bot/app/telegram_cmd.env'
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    _tg_config[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return _tg_config
+
+
 def _send_telegram(text):
     try:
-        token = os.getenv('TELEGRAM_BOT_TOKEN', '')
-        chat_id = os.getenv('TELEGRAM_ALLOWED_CHAT_ID', '')
+        cfg = _load_tg_config()
+        token = cfg.get('TELEGRAM_BOT_TOKEN', '')
+        chat_id = cfg.get('TELEGRAM_ALLOWED_CHAT_ID', '')
         if not token or not chat_id:
             return
+        import report_formatter as _rf
+        text = _rf.korean_output_guard(text)
         url = f'https://api.telegram.org/bot{token}/sendMessage'
         data = urllib.parse.urlencode({
             'chat_id': chat_id,
