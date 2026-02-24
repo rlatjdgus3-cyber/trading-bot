@@ -14,7 +14,6 @@ Each axis: -100 (short) to +100 (long).
 Output: total_score, abs_score (0-100), stage (1-7), dynamic_stop_loss_pct.
 Legacy compatibility: long_score/short_score (0-100).
 """
-import os
 import sys
 import json
 sys.path.insert(0, '/root/trading-bot/app')

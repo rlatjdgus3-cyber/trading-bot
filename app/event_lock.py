@@ -521,7 +521,7 @@ def notify_event_suppressed(symbol, lock_info, trigger_types, caller='unknown'):
             import report_formatter
             kr_types = [report_formatter.TRIGGER_KR.get(t, t) for t in immediate]
             remaining = lock_info.get('remaining_sec', 0) if isinstance(lock_info, dict) else 0
-            text = f'🚨 긴급 이벤트 억제 (즉시 알림)\n'
+            text = '🚨 긴급 이벤트 억제 (즉시 알림)\n'
             text += f'- 트리거: {", ".join(kr_types)}\n'
             if remaining > 0:
                 text += f'- 잔여 락: {remaining}초\n'

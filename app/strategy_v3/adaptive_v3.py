@@ -116,7 +116,6 @@ def _load_state_from_file():
 
 def _sync_state(cur):
     """Sync in-memory state with DB (load on start, save on change)."""
-    global _state
     try:
         db_state = _load_state_from_db(cur)
         if db_state:
@@ -389,7 +388,6 @@ def _check_anti_paralysis(cur, cfg, result):
         hours_2 = float(cfg.get('adaptive_anti_paralysis_hours_2', 36))
 
         trade_switch_on = _check_trade_switch_on(cur)
-        from strategy_v3 import compute_market_health
         # We don't have features here, so check DB for health
         health_ok = True  # assume OK unless we can determine otherwise
 

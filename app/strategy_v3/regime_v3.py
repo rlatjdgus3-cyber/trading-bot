@@ -95,7 +95,7 @@ def _check_strict_breakout(features, cfg):
 
     fail_reasons = []
     if not structure_pass:
-        fail_reasons.append(f'structure_breakout=False')
+        fail_reasons.append('structure_breakout=False')
     if not volume_pass:
         fail_reasons.append(f'volume_z={volume_z:.2f} < {vol_min}')
     if not atr_pass:

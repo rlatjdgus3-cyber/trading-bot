@@ -13,7 +13,6 @@ Checks:
   - Policy A (cumulative): start_stage=k -> initial entry = k*10%
   - ADD = one slice (10%), total never exceeds 70%
 """
-import os
 import sys
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[safety_mgr]'

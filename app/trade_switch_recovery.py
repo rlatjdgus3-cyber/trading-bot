@@ -291,7 +291,6 @@ def format_trade_status(cur):
         changed_by = row[2] or '-'
         manual_off_until = row[3]
         last_auto_recover = row[4]
-        last_disable = row[5]
 
         settlement = _get_settlement_display()
 
@@ -303,7 +302,6 @@ def format_trade_status(cur):
             reason_label = OFF_REASONS.get(off_reason, off_reason)
             recover_str = '-'
             if manual_off_until:
-                import datetime
                 try:
                     import pytz
                     kst = pytz.timezone('Asia/Seoul')

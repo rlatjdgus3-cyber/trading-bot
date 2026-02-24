@@ -458,7 +458,7 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
         if pending:
             p = pending[0]
             sections.append(
-                f"   - 상태: ORDER_PLACED (실행큐 대기)")
+                "   - 상태: ORDER_PLACED (실행큐 대기)")
             sections.append(
                 f"   - #{p['id']} {p.get('action','')} {p.get('direction','')} "
                 f"${p.get('usdt',0):.0f} ({p.get('ts','')})")
@@ -564,7 +564,7 @@ def format_fact_snapshot(exch_pos, strat_pos, orders, exec_ctx=None):
 
     entry_str = 'ON' if entry_enabled else ('OFF' if entry_enabled is not None else 'UNKNOWN')
     sections.append(f'   - entry_enabled: {entry_str}')
-    sections.append(f'   - exit_enabled: 항상ON')
+    sections.append('   - exit_enabled: 항상ON')
 
     if once_lock:
         sections.append(f'   - once_lock: 있음 (TTL: {once_lock_ttl or "?"})')
@@ -796,7 +796,7 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
         stage = capital_info.get('stage', 0)
         sections.append(f'[STAGE] Position: {stage}/{max_stg} (capital used: {used:,.2f}/{op:,.2f} USDT)')
     else:
-        sections.append(f'[RISK] (use /risk_config for details)')
+        sections.append('[RISK] (use /risk_config for details)')
 
     # 5. [GATE] Pre-Live Safety
     if gate_status:
@@ -872,7 +872,7 @@ def format_snapshot(exch_pos, strat_pos, orders, gate_status, switch_status, wai
                     next_str = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime('%H:%M:%S UTC')
                     guard_lines.append(f'  next_order_allowed_at: {next_str} ({next_reason})')
                 else:
-                    guard_lines.append(f'  next_order_allowed_at: NOW')
+                    guard_lines.append('  next_order_allowed_at: NOW')
             except Exception:
                 pass
             sections.append('\n'.join(guard_lines))

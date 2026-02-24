@@ -99,9 +99,9 @@ class VolatileRangeStrategy(ModeStrategy):
         # ── DRIFT_SUBMODE: only trade in drift direction ──
         effective_drift = drift_submode or drift_dir
         if effective_drift == 'UP' and side == 'SHORT':
-            return self._hold(f'MODE_B: drift=UP, blocking SHORT entry')
+            return self._hold('MODE_B: drift=UP, blocking SHORT entry')
         if effective_drift == 'DOWN' and side == 'LONG':
-            return self._hold(f'MODE_B: drift=DOWN, blocking LONG entry')
+            return self._hold('MODE_B: drift=DOWN, blocking LONG entry')
 
         # ── Require spread_ok + liquidity_ok if configured ──
         if config.get('require_spread_ok', True) and not features.get('spread_ok', True):
@@ -172,7 +172,7 @@ class VolatileRangeStrategy(ModeStrategy):
                 'qty': None,
                 'tp': None,
                 'sl': None,
-                'reason': f'MODE_B EXIT: LONG but drift reversed to DOWN',
+                'reason': 'MODE_B EXIT: LONG but drift reversed to DOWN',
                 'signal_key': None,
                 'chase_entry': False,
                 'order_type': 'market',
@@ -185,7 +185,7 @@ class VolatileRangeStrategy(ModeStrategy):
                 'qty': None,
                 'tp': None,
                 'sl': None,
-                'reason': f'MODE_B EXIT: SHORT but drift reversed to UP',
+                'reason': 'MODE_B EXIT: SHORT but drift reversed to UP',
                 'signal_key': None,
                 'chase_entry': False,
                 'order_type': 'market',

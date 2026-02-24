@@ -767,6 +767,15 @@ def _risk_checks(cur=None):
     if not row or not row[0]:
         return (False, 'trade_switch OFF')
 
+    # Proactive Manager: entry veto check
+    try:
+        import proactive_manager
+        vetoed, veto_reason = proactive_manager.check_entry_veto(cur)
+        if vetoed:
+            return (False, f'proactive_veto: {veto_reason}')
+    except Exception:
+        pass  # FAIL-OPEN
+
     cur.execute("""
         SELECT count(*) FROM execution_log
         WHERE symbol = 'BTC/USDT:USDT' AND status = 'FILLED'
@@ -1608,7 +1617,6 @@ def _create_autopilot_signal(cur=None, side=None, scores=None, equity_limits=Non
     now = datetime.datetime.now(datetime.timezone.utc)
     ts_text = now.strftime('%Y-%m-%d %H:%M:%S+00')
     now_unix = int(time.time())
-    relevant_score = scores.get('long_score', 50) if side == 'LONG' else scores.get('short_score', 50)
     # v3: FORCE start_stage=1 — 추격 시작 방지
     start_stage = 1
     # Regime-based stage cap (reuse regime_ctx from caller)
@@ -1735,8 +1743,7 @@ def _run_strategy_v2(cur, scores, regime_ctx):
 
     from strategy.common.features import build_feature_snapshot
     from strategy.regime_router import route, get_mode_config
-    from strategy.common.dedupe import is_duplicate, record_signal, make_signal_key
-    from strategy.common.risk import validate_min_qty
+    from strategy.common.dedupe import is_duplicate, record_signal
     from strategy.modes.static_range import StaticRangeStrategy
     from strategy.modes.volatile_range import VolatileRangeStrategy
     from strategy.modes.shock_breakout import ShockBreakoutStrategy
@@ -1910,7 +1917,7 @@ def _run_strategy_v2(cur, scores, regime_ctx):
               AND ts >= now() - interval '5 minutes';
         """, (SYMBOL, direction))
         if cur.fetchone():
-            _log(f'v2 EXIT skipped: CLOSE already pending in queue')
+            _log('v2 EXIT skipped: CLOSE already pending in queue')
             return 'HOLD'
         cur.execute("""
             INSERT INTO execution_queue
@@ -2157,10 +2164,10 @@ def _cycle():
 
                             # Direction filter
                             if _mtf_data['direction'] == LONG_ONLY and dominant == 'SHORT':
-                                _log(f'[MTF] LONG_ONLY but signal SHORT — blocked')
+                                _log('[MTF] LONG_ONLY but signal SHORT — blocked')
                                 return
                             if _mtf_data['direction'] == SHORT_ONLY and dominant == 'LONG':
-                                _log(f'[MTF] SHORT_ONLY but signal LONG — blocked')
+                                _log('[MTF] SHORT_ONLY but signal LONG — blocked')
                                 return
 
                             # Inject MTF direction into regime result
@@ -2214,7 +2221,7 @@ def _cycle():
                             if not _is_dryrun:
                                 # L4: WARN entry block
                                 if _adaptive_result.get('l4_entry_blocked'):
-                                    _log(f'[L4] health=WARN entry blocked')
+                                    _log('[L4] health=WARN entry blocked')
                                     return
 
                                 # L1: mode cooldown block
@@ -2416,14 +2423,14 @@ def _cycle():
                             cur, ps_row[0], _v3_features or {}, _add_health)
                         if not _adp_dryrun():
                             if _add_gate.get('l4_add_blocked'):
-                                _log(f'[L4] health=WARN ADD blocked')
+                                _log('[L4] health=WARN ADD blocked')
                                 return
                             if _add_gate.get('l3_add_blocked'):
                                 _log(f'[L3] {_add_gate.get("l3_add_reason", "ADD blocked")}')
                                 return
                         else:
                             if _add_gate.get('l4_add_blocked'):
-                                _log(f'[L4_DRYRUN] health=WARN ADD would be blocked')
+                                _log('[L4_DRYRUN] health=WARN ADD would be blocked')
                             if _add_gate.get('l3_add_blocked'):
                                 _log(f'[L3_DRYRUN] {_add_gate.get("l3_add_reason", "")}')
                 except Exception as e:

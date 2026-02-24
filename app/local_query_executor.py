@@ -353,7 +353,7 @@ def get_service_health_snapshot():
                 elif 'masked' in ll:
                     proc_reason = 'masked'
                 else:
-                    proc_reason = f'parse_unknown'
+                    proc_reason = 'parse_unknown'
 
         # ── Final verdict: process alive + hb stale → OK+WARN (not DOWN) ──
         if hb_state == 'OK':
@@ -1053,18 +1053,18 @@ def _score_summary(_text=None):
             pass
 
         lines = [
-            f"📊 스코어 엔진 (4축)",
-            f"━━━━━━━━━━━━━━━━━━",
+            "📊 스코어 엔진 (4축)",
+            "━━━━━━━━━━━━━━━━━━",
             f"총점: {total:+.1f} → {dominant}",
-            f"",
+            "",
             f"기술(TECH):   {tech:+.0f} × {tech_w} = {tech_c:+.1f}",
             f"포지션(POS):  {pos:+.0f} × {pos_w} = {pos_c:+.1f}",
             f"레짐(REG):    {regime:+.0f} × {regime_w} = {regime_c:+.1f}",
             f"뉴스(NEWS):   {ne:+.0f} × {news_w} = {news_c:+.1f}{' [차단됨]' if guarded else ''}",
-            f"",
+            "",
             f"권고강도: {signal_stage_label} (score={abs_score:.0f}, stg1>=10, stg2>=45, stg3>=65)",
             f"분할단계: stage {pos_stage}/7 (capital used: {pos_capital_pct:.0f}%)",
-            f"",
+            "",
             f"엔진권고: {dominant} {signal_stage_label} (총점 {total:+.1f})",
         ]
         # 현재 포지션 정보
@@ -1075,8 +1075,8 @@ def _score_summary(_text=None):
             pass
         if guarded:
             lines.append(f"  ⚠ {dominant} 권고이나, TECH/POS 중립으로 뉴스 단독 차단")
-        lines.append(f"")
-        lines.append(f"뉴스 이벤트 내역:")
+        lines.append("")
+        lines.append("뉴스 이벤트 내역:")
         lines.append(f"  소스품질: {ne_comp.get('source_quality', 0):.1f}/20")
         lines.append(f"  카테고리: {ne_comp.get('category_weight', 0):.1f}/25")
         lines.append(f"  최신성: {ne_comp.get('recency', 0):.1f}/15")
@@ -1085,7 +1085,7 @@ def _score_summary(_text=None):
         score_trace = ne_details.get('score_trace', '')
         if score_trace:
             lines.append(f"  추적: {score_trace}")
-        lines.append(f"")
+        lines.append("")
         lines.append(f"손절: {r.get('dynamic_stop_loss_pct', 2.0)}%")
         lines.append(f"BTC: {r.get('price', '?')}")
         return '\n'.join(lines)
@@ -1195,7 +1195,7 @@ def _claude_audit(_text=None):
             today_cost = float(row[1] or 0)
             today_input = row[2] or 0
             today_output = row[3] or 0
-            lines.append(f'\n[오늘 사용량]')
+            lines.append('\n[오늘 사용량]')
             lines.append(f'  호출: {today_calls}건 | 비용: ${today_cost:.4f}')
             lines.append(f'  입력 토큰: {today_input:,} | 출력 토큰: {today_output:,}')
 
@@ -1208,7 +1208,7 @@ def _claude_audit(_text=None):
             """)
             gate_rows = cur.fetchall()
             if gate_rows:
-                lines.append(f'\n[게이트별 분류]')
+                lines.append('\n[게이트별 분류]')
                 for gr in gate_rows:
                     lines.append(f'  {gr[0] or "?"}: {gr[1]}건 (${float(gr[2]):.4f})')
 
@@ -1222,13 +1222,13 @@ def _claude_audit(_text=None):
             row = cur.fetchone()
             month_calls = row[0] or 0
             month_cost = float(row[1] or 0)
-            lines.append(f'\n[이번 달 누적]')
+            lines.append('\n[이번 달 누적]')
             lines.append(f'  호출: {month_calls}건 | 비용: ${month_cost:.4f}')
 
             # Budget remaining (from claude_gate)
             try:
                 import claude_gate
-                lines.append(f'\n[예산 한도]')
+                lines.append('\n[예산 한도]')
                 lines.append(f'  일일 호출 한도: {claude_gate.DAILY_CALL_LIMIT}')
                 lines.append(f'  일일 비용 한도: ${claude_gate.DAILY_COST_LIMIT}')
                 lines.append(f'  월간 비용 한도: ${claude_gate.MONTHLY_COST_LIMIT}')
@@ -1248,7 +1248,7 @@ def _claude_audit(_text=None):
             """)
             recent = cur.fetchall()
             if recent:
-                lines.append(f'\n[최근 호출 5건]')
+                lines.append('\n[최근 호출 5건]')
                 for r in recent:
                     cost_str = f'${float(r[4]):.4f}' if r[4] else '$0'
                     lines.append(f'  {r[0]} {r[1] or "?"}/{r[2] or "?"} '
@@ -2503,10 +2503,10 @@ def _debug_db_coverage(_text=None):
                     lines.append(f'  [{tbl}] gap={gs}..{ge}')
                     # Determine primary cause with evidence
                     if tbl == 'candles':
-                        lines.append(f'    primary: collector started recently '
-                                     f'(evidence: data only from latest period)')
-                        lines.append(f'    alt1: historical backfill not yet run')
-                        lines.append(f'    alt2: data in market_ohlcv table instead')
+                        lines.append('    primary: collector started recently '
+                                     '(evidence: data only from latest period)')
+                        lines.append('    alt1: historical backfill not yet run')
+                        lines.append('    alt2: data in market_ohlcv table instead')
                     elif tbl == 'news':
                         # Check if events has data in same period (evidence of system running)
                         try:
@@ -2521,11 +2521,11 @@ def _debug_db_coverage(_text=None):
                             lines.append(f'    primary: news collector stopped or switched table '
                                          f'(evidence: events has {evt_cnt} rows in same period)')
                         else:
-                            lines.append(f'    primary: system may not have been running')
-                        lines.append(f'    alt1: rows in news_raw/news_market_reaction tables')
-                        lines.append(f'    alt2: ts column mismatch (published_at vs ingested_at)')
+                            lines.append('    primary: system may not have been running')
+                        lines.append('    alt1: rows in news_raw/news_market_reaction tables')
+                        lines.append('    alt2: ts column mismatch (published_at vs ingested_at)')
                     else:
-                        lines.append(f'    primary: data collection not active in this period')
+                        lines.append('    primary: data collection not active in this period')
 
             # ── News tier UNKNOWN monthly (Item 3D) ──
             lines.append('\n[뉴스 tier=UNKNOWN 월별]')
@@ -2571,8 +2571,8 @@ def _debug_db_coverage(_text=None):
                     overall_pct = total_unknown / total_all * 100
                     lines.append(f'  전체: {total_unknown}/{total_all} ({overall_pct:.1f}%)')
                     if overall_pct >= 99:
-                        lines.append(f'  diagnosis: classification gated or not executed '
-                                     f'(APPROVAL_REQUIRED=True in news_classifier_config)')
+                        lines.append('  diagnosis: classification gated or not executed '
+                                     '(APPROVAL_REQUIRED=True in news_classifier_config)')
             except Exception as e:
                 lines.append(f'  조회 실패: {e}')
 
@@ -2678,7 +2678,7 @@ def _debug_news_sample(_text=None):
             rows = cur.fetchall()
 
         if not rows:
-            return f'📰 뉴스 샘플\n━━━━━━━━━━━━━━━━━━\n데이터 없음 (최근 24시간)'
+            return '📰 뉴스 샘플\n━━━━━━━━━━━━━━━━━━\n데이터 없음 (최근 24시간)'
 
         # Import preview classifier
         import news_classifier_config as ncc
@@ -2773,7 +2773,7 @@ def _debug_news_sample(_text=None):
             if last_trading_ts:
                 lines.append(f'  last_trading_ts={last_trading_ts}')
             else:
-                lines.append(f'  last_trading_ts=none (24h 내 trading 후보 없음)')
+                lines.append('  last_trading_ts=none (24h 내 trading 후보 없음)')
             return '\n'.join(lines)
 
         # Display items
@@ -2872,7 +2872,7 @@ def _debug_news_reaction_sample(_text=None):
             '━━━━━━━━━━━━━━━━━━',
             f'raw_coverage: {total_traced}/{total_news} ({raw_pct:.1f}%)',
             f'eligible_coverage: {eligible_traced}/{eligible_news} ({eligible_pct:.1f}%)',
-            f'  (eligible=캔들 커버리지 범위 내 + 24h 룩어헤드 존재)',
+            '  (eligible=캔들 커버리지 범위 내 + 24h 룩어헤드 존재)',
             f'  30m: {has_30m}/{total_traced} | '
             f'2h: {has_2h}/{total_traced} | '
             f'24h: {has_24h}/{total_traced}',
@@ -2946,7 +2946,7 @@ def _backfill_dryrun_summary(cur):
         exp, act = int(r[0] or 0), int(r[1] or 0)
         summary.append(f'  candles_1m: remaining={max(0, exp - act):,}')
     except Exception:
-        summary.append(f'  candles_1m: 조회 실패')
+        summary.append('  candles_1m: 조회 실패')
 
     try:
         cur.execute("""
@@ -2957,7 +2957,7 @@ def _backfill_dryrun_summary(cur):
         exp, act = int(r[0] or 0), int(r[1] or 0)
         summary.append(f'  ohlcv_5m: remaining={max(0, exp - act):,}')
     except Exception:
-        summary.append(f'  ohlcv_5m: 조회 실패')
+        summary.append('  ohlcv_5m: 조회 실패')
 
     try:
         cur.execute("""
@@ -2968,7 +2968,7 @@ def _backfill_dryrun_summary(cur):
         r = cur.fetchone()
         summary.append(f'  news_classify: remaining={r[0] or 0:,}')
     except Exception:
-        summary.append(f'  news_classify: 조회 실패')
+        summary.append('  news_classify: 조회 실패')
 
     try:
         cur.execute("""
@@ -2977,17 +2977,17 @@ def _backfill_dryrun_summary(cur):
         r = cur.fetchone()
         summary.append(f'  macro_trace: remaining={max(0, r[0] or 0):,}')
     except Exception:
-        summary.append(f'  macro_trace: 조회 실패')
+        summary.append('  macro_trace: 조회 실패')
 
     try:
         cur.execute("SELECT count(*) FROM price_events;")
         cnt = cur.fetchone()[0] or 0
         if cnt == 0:
-            summary.append(f'  ⚠ price_events: never_run (0건) — 백필 필수')
+            summary.append('  ⚠ price_events: never_run (0건) — 백필 필수')
         else:
             summary.append(f'  price_events: {cnt:,}건')
     except Exception:
-        summary.append(f'  ⚠ price_events: 테이블 미생성 — 백필 필수')
+        summary.append('  ⚠ price_events: 테이블 미생성 — 백필 필수')
 
     return summary
 
@@ -3610,20 +3610,20 @@ def _debug_state(_text=None):
         lines.append(f'  backfill: ENABLED={bf_enabled} '
                      f'(/debug backfill_enable on|off)')
     except Exception:
-        lines.append(f'  backfill: check failed')
+        lines.append('  backfill: check failed')
     try:
         import news_classifier_config as ncc
         _applied = not ncc.APPROVAL_REQUIRED
         lines.append(f'  news_classifier: APPLIED={_applied} '
                      f'(APPROVAL_REQUIRED={ncc.APPROVAL_REQUIRED})')
     except Exception:
-        lines.append(f'  news_classifier: import failed')
+        lines.append('  news_classifier: import failed')
     try:
         import feature_flags
         for _ff_name, _ff_val in feature_flags.get_all().items():
             lines.append(f'  {_ff_name}: {_ff_val}')
     except Exception:
-        lines.append(f'  feature_flags: import failed')
+        lines.append('  feature_flags: import failed')
 
     # state_mode from telegram_cmd_poller
     lines.append('')
@@ -4030,7 +4030,6 @@ def _debug_storage(_text=None):
 
             # Count prunable 1m candles
             try:
-                from datetime import timedelta
                 cur.execute("""
                     SELECT COUNT(*) FROM candles
                     WHERE tf='1m' AND ts < now() - interval '180 days';
@@ -4143,7 +4142,7 @@ def _debug_news_path_sample(_text=None):
             elig_pct = (eligible_traced / eligible * 100) if eligible > 0 else 0
 
             lines.append('')
-            lines.append(f'[커버리지]')
+            lines.append('[커버리지]')
             lines.append(f'  raw: {total_c}/{total_news} ({raw_pct:.1f}%) | '
                          f'eligible: {eligible_traced}/{eligible} ({elig_pct:.1f}%)')
             lines.append(f'  분류완료={classified_c} | 미분류={pending}')
@@ -4725,7 +4724,7 @@ def _debug_order_throttle(_text=None):
             status = order_throttle.get_throttle_status(cur)
             lines = ['🚦 Order Throttle Guard', '━━━━━━━━━━━━━━━━━━']
             # Rate limits
-            lines.append(f'📊 Rate Limits')
+            lines.append('📊 Rate Limits')
             lines.append(f'  1h: {status["hourly_count"]}/{status["hourly_limit"]}')
             lines.append(f'  10m: {status["10min_count"]}/{status["10min_limit"]}')
             # Entry lock
@@ -4735,13 +4734,13 @@ def _debug_order_throttle(_text=None):
             else:
                 lines.append('🔓 Entry: UNLOCKED')
             # Cooldowns
-            lines.append(f'\n⏱ Cooldowns')
+            lines.append('\n⏱ Cooldowns')
             for action, remaining in status.get('cooldowns', {}).items():
                 icon = '⏳' if remaining > 0 else '✅'
                 lines.append(f'  {icon} {action}: {remaining:.0f}s' if remaining > 0 else f'  {icon} {action}: ready')
             # Last reject
             if status.get('last_reject'):
-                lines.append(f'\n❌ Last Reject')
+                lines.append('\n❌ Last Reject')
                 lines.append(f'  {status["last_reject"][:100]}')
                 lines.append(f'  at: {status.get("last_reject_ts_str", "?")}')
             # Backoff state
@@ -4974,7 +4973,7 @@ def _reconcile(_text=None):
         lines.append('━━━━━━━━━━━━━━━━━━━━━━━━')
 
         # Section 1: Exchange
-        lines.append(f'\n[거래소(Bybit)]')
+        lines.append('\n[거래소(Bybit)]')
         if exch_status != 'OK':
             lines.append(f'  상태: ERROR — {exch.get("error", "API 호출 실패")}')
         else:
@@ -4986,7 +4985,7 @@ def _reconcile(_text=None):
         lines.append(f'  미체결주문: {open_count}건')
 
         # Section 2: Strategy DB
-        lines.append(f'\n[전략DB]')
+        lines.append('\n[전략DB]')
         lines.append(f'  상태: {strat_state}')
         lines.append(f'  방향: {strat_side or "NONE"}')
         lines.append(f'  수량: {strat_qty}')
@@ -4994,7 +4993,7 @@ def _reconcile(_text=None):
             lines.append(f'  order_state: {order_state}')
 
         # Section 3: Comparison
-        lines.append(f'\n[대조 결과]')
+        lines.append('\n[대조 결과]')
 
         exch_dir = exch_pos if exch_pos != 'NONE' else 'NONE'
         strat_dir = strat_side if strat_side else 'NONE'
@@ -5018,8 +5017,8 @@ def _reconcile(_text=None):
         lines.append(f'  {verdict}')
 
         if 'MISMATCH' in verdict:
-            lines.append(f'\n⚠ 불일치 감지 — exchange_reader 자동 복구 대기 중')
-            lines.append(f'  수동 복구: /debug gate_details 에서 상태 확인')
+            lines.append('\n⚠ 불일치 감지 — exchange_reader 자동 복구 대기 중')
+            lines.append('  수동 복구: /debug gate_details 에서 상태 확인')
 
         return '\n'.join(lines)
     except Exception as e:
@@ -5402,13 +5401,13 @@ def _bundle(_text=None):
                         _st = ssm.get_status()
                         _set_ago = ''
                         if _st.get('last_set_ts'):
-                            _set_ago = f' ({int(time.time() - _st["last_set_ts"])}s ago)'
+                            _set_ago = f' ({int(_time.time() - _st["last_set_ts"])}s ago)'
                         ss_lines.append(f'  STATUS: {_st.get("last_set_result", "N/A")}{_set_ago}')
                         ss_lines.append(f'  stop_price: {_st.get("last_stop_price")}')
                         ss_lines.append(f'  order_id: {_st.get("last_order_id", "N/A")}')
                         _unset = _st.get('unset_since', 0)
                         if _unset > 0:
-                            ss_lines.append(f'  ⚠ UNSET for {int(time.time() - _unset)}s')
+                            ss_lines.append(f'  ⚠ UNSET for {int(_time.time() - _unset)}s')
                     except Exception as _ss_e:
                         ss_lines.append(f'  manager error: {_ss_e}')
                     # DB status
@@ -5679,7 +5678,7 @@ def _debug_risk_snapshot(_text=None):
                 try:
                     from strategy_v3 import adaptive_v3
                     state = adaptive_v3._state
-                    lines.append(f"\nAdaptive State:")
+                    lines.append("\nAdaptive State:")
                     for k in ('global_wr_penalty_active', 'mode_cooldowns',
                               'anti_paralysis_stage', 'warn_since_ts'):
                         if k in state:
@@ -5731,18 +5730,18 @@ def _debug_integrity(_text=None):
                 lines.append(f'Details: {result.get("details", "")}')
 
                 checks = result.get('checks', {})
-                lines.append(f'\nExchange:')
+                lines.append('\nExchange:')
                 lines.append(f'  side: {checks.get("exch_side", "?")}')
                 lines.append(f'  qty: {checks.get("exch_qty", "?")}')
                 lines.append(f'  active_orders: {checks.get("active_orders", "?")}')
                 lines.append(f'  conditional_orders: {checks.get("conditional_orders", "?")}')
 
-                lines.append(f'\nDB:')
+                lines.append('\nDB:')
                 lines.append(f'  side: {checks.get("db_side", "?")}')
                 lines.append(f'  qty: {checks.get("db_qty", "?")}')
                 lines.append(f'  plan_state: {checks.get("db_plan_state", "?")}')
 
-                lines.append(f'\nActivity (10min):')
+                lines.append('\nActivity (10min):')
                 lines.append(f'  signals: {checks.get("signals_10m", "?")}')
                 lines.append(f'  fills: {checks.get("fills_10m", "?")}')
 
@@ -5754,9 +5753,9 @@ def _debug_integrity(_text=None):
                         dt = datetime.datetime.fromtimestamp(_last_cleanup_ts)
                         lines.append(f'\nLast cleanup: {dt.strftime("%m-%d %H:%M:%S")}')
                     else:
-                        lines.append(f'\nLast cleanup: never')
+                        lines.append('\nLast cleanup: never')
                 except Exception:
-                    lines.append(f'\nLast cleanup: N/A')
+                    lines.append('\nLast cleanup: N/A')
 
                 # Integrity freeze status
                 try:
@@ -5765,7 +5764,7 @@ def _debug_integrity(_text=None):
                     if frozen:
                         lines.append(f'Entry freeze: ACTIVE ({remaining:.0f}s remaining)')
                     else:
-                        lines.append(f'Entry freeze: CLEAR')
+                        lines.append('Entry freeze: CLEAR')
                 except Exception:
                     pass
 

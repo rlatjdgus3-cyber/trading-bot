@@ -23,6 +23,7 @@ DIRECTIVE_TYPES = {
     'ANALYSIS_REQUEST',
     'PIPELINE_TUNE',
     'AUDIT',
+    'PROACTIVE_CONTROL',
 }
 
 RISK_PRESETS = {
@@ -90,6 +91,18 @@ def parse_directive(text, intent_json=None):
             }
 
     t = (text or '').lower().strip()
+
+    # PROACTIVE_CONTROL (must be checked before RISK_MODE — shared keywords)
+    for kw in ['proactive', '매크로', '선제', '중간관리', '리스크상태',
+               'macro status', 'risk status', '진입차단', '차단해제']:
+        if kw in t:
+            params = _parse_proactive_text(text)
+            return {
+                'dtype': 'PROACTIVE_CONTROL',
+                'params': params,
+                'idempotency_key': _compute_idempotency_key(
+                    'PROACTIVE_CONTROL', {'action': params.get('action', 'status')}),
+            }
 
     # WATCH_KEYWORDS
     for kw in ['키워드', '워치', '감시', 'keyword', 'watch']:
@@ -171,6 +184,20 @@ def _parse_keyword_text(text):
     return {'action': action, 'keywords': keywords}
 
 
+def _parse_proactive_text(text):
+    """Parse proactive control directive from natural language."""
+    t = (text or '').lower()
+    if any(x in t for x in ['차단해제', 'unblock', '해제', 'clear veto']):
+        return {'action': 'clear_veto'}
+    if any(x in t for x in ['진입차단', 'block', '차단']):
+        return {'action': 'set_veto', 'duration_min': 30}
+    if any(x in t for x in ['강화', 'aggressive', '적극']):
+        return {'action': 'set_mode', 'mode': 'aggressive'}
+    if any(x in t for x in ['완화', 'relaxed', '느슨']):
+        return {'action': 'set_mode', 'mode': 'relaxed'}
+    return {'action': 'status'}
+
+
 def _parse_pipeline_text(text):
     """Parse pipeline tune directive from natural language."""
     t = (text or '').lower()
@@ -246,6 +273,8 @@ def execute_directive(conn, dtype, params, source='telegram'):
             result = _handle_pipeline_tune(conn, params, directive_id)
         elif dtype == 'AUDIT':
             result = _handle_audit(conn)
+        elif dtype == 'PROACTIVE_CONTROL':
+            result = _handle_proactive_control(conn, params, directive_id)
         else:
             result = {'error': 'no handler'}
 
@@ -709,3 +738,125 @@ def _handle_audit(conn):
     message = '\n'.join(lines)
     report['message'] = message
     return report
+
+
+def _handle_proactive_control(conn, params, directive_id=None):
+    """Handle PROACTIVE_CONTROL directive.
+
+    params: {action: 'status'|'set_veto'|'clear_veto'|'set_mode', ...}
+    """
+    action = params.get('action', 'status')
+
+    with conn.cursor() as cur:
+        if action == 'status':
+            # Return current proactive manager state
+            try:
+                import proactive_manager
+                summary = proactive_manager.get_macro_summary(cur)
+                lines = ['=== Proactive Manager Status ===']
+                lines.append(f'Risk Level: {summary.get("risk_level", "?")}')
+
+                qqq = summary.get('qqq')
+                if qqq:
+                    lines.append(f'QQQ: ${qqq["price"]:.2f}'
+                                 f' (1h: {qqq.get("chg_1h", "?"):+.2f}%'
+                                 f', 2h: {qqq.get("chg_2h", "?"):+.2f}%)')
+
+                vix = summary.get('vix')
+                if vix:
+                    lines.append(f'VIX: {vix["price"]:.1f}')
+
+                events = summary.get('macro_event')
+                if events:
+                    lines.append(f'Macro Event: {", ".join(events)}')
+
+                veto = summary.get('entry_veto')
+                if veto:
+                    lines.append(f'Entry Veto: {veto}')
+                else:
+                    lines.append('Entry Veto: OFF')
+
+                sl_t = summary.get('sl_tighten')
+                if sl_t:
+                    lines.append(f'SL Tighten: {sl_t}')
+
+                # Recent proactive actions
+                try:
+                    cur.execute("""
+                        SELECT ts, action_type, severity, reason
+                        FROM proactive_log
+                        ORDER BY ts DESC LIMIT 5;
+                    """)
+                    rows = cur.fetchall()
+                    if rows:
+                        lines.append('\n[Recent Actions]')
+                        for r in rows:
+                            lines.append(
+                                f'  {str(r[0])[:16]} {r[1]} [{r[2]}] {(r[3] or "")[:60]}')
+                except Exception:
+                    pass
+
+                msg = '\n'.join(lines)
+                return {'status': summary, 'message': msg}
+            except ImportError:
+                return {'message': 'proactive_manager not available'}
+
+        elif action == 'set_veto':
+            duration_min = params.get('duration_min', 30)
+            try:
+                import proactive_manager
+                proactive_manager.set_entry_veto(
+                    cur, 'manual_directive', duration_min * 60)
+                return {
+                    'message': f'Entry veto SET for {duration_min} minutes (manual)'}
+            except ImportError:
+                return {'message': 'proactive_manager not available'}
+
+        elif action == 'clear_veto':
+            try:
+                import proactive_manager
+                proactive_manager.clear_entry_veto(cur)
+                return {'message': 'Entry veto CLEARED'}
+            except ImportError:
+                return {'message': 'proactive_manager not available'}
+
+        elif action == 'set_mode':
+            mode = params.get('mode', 'normal')
+            # Adjust proactive manager thresholds
+            if mode == 'aggressive':
+                overrides = {
+                    'qqq_warn_30m_pct': -0.3,
+                    'qqq_reduce_1h_pct': -0.7,
+                    'qqq_emergency_2h_pct': -1.0,
+                    'vix_spike_1h_pct': 10.0,
+                }
+                desc = 'AGGRESSIVE: lower thresholds, faster response'
+            elif mode == 'relaxed':
+                overrides = {
+                    'qqq_warn_30m_pct': -1.0,
+                    'qqq_reduce_1h_pct': -1.5,
+                    'qqq_emergency_2h_pct': -2.5,
+                    'vix_spike_1h_pct': 25.0,
+                }
+                desc = 'RELAXED: higher thresholds, less intervention'
+            else:
+                overrides = {}
+                desc = 'NORMAL: default thresholds'
+
+            cur.execute("""
+                INSERT INTO openclaw_policies (key, value, updated_at,
+                    directive_id, description)
+                VALUES ('proactive_thresholds', %s::jsonb, now(), %s, %s)
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now(),
+                    directive_id = EXCLUDED.directive_id;
+            """, (json.dumps(overrides), directive_id, desc))
+
+            return {
+                'mode': mode,
+                'overrides': overrides,
+                'message': f'Proactive mode: {mode.upper()}\n{desc}\n'
+                           f'Thresholds: {json.dumps(overrides)}',
+            }
+
+    return {'message': f'Unknown proactive action: {action}'}

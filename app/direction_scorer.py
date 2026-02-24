@@ -6,7 +6,6 @@ Falls back to legacy logic (_compute_scores_legacy) if score_engine fails.
 
 compute_scores() -> {long_score, short_score, dominant_side, confidence, context}
 """
-import os
 import sys
 import traceback
 sys.path.insert(0, '/root/trading-bot/app')

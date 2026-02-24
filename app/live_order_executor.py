@@ -1151,7 +1151,6 @@ def main():
 
 def _cycle(ex, _last_order_ts_unused):
     """One poll cycle.  Uses module-level _state dict for mutable state."""
-    global _state
 
     # --- Guard: KILL_SWITCH ---
     if os.path.exists(KILL_SWITCH_PATH):

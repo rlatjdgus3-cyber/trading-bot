@@ -679,13 +679,39 @@ def main():
                 _record_event('fetch_ok')
                 _stats['last_fetch_ok_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
             except Exception as _feed_err:
-                log("[news_bot] ERROR feed parse")
-                log(traceback.format_exc())
-                _record_event('fetch_fail')
-                _record_raw_error(db, source, 'feed_parse_error',
-                                  exception_msg=str(_feed_err)[:200])
-                _check_error_threshold('feed_parse', source, str(_feed_err))
-                continue
+                # 일시적 네트워크 오류 → 1회 재시도
+                _is_transient = isinstance(_feed_err, (
+                    ConnectionResetError, ConnectionError, TimeoutError, OSError))
+                if not _is_transient:
+                    try:
+                        import http.client
+                        _is_transient = isinstance(_feed_err, http.client.RemoteDisconnected)
+                    except Exception:
+                        pass
+                if _is_transient:
+                    log(f"[news_bot] WARN feed={source} transient error, retrying: {type(_feed_err).__name__}")
+                    time.sleep(2)
+                    try:
+                        feed = feedparser.parse(url, agent=FEED_AGENT)
+                        entries = getattr(feed, "entries", []) or []
+                        log(f"[news_bot] feed={source} retry OK entries={len(entries)}")
+                        _record_event('fetch_ok')
+                        _stats['last_fetch_ok_ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception as _retry_err:
+                        log(f"[news_bot] ERROR feed={source} retry failed: {type(_retry_err).__name__}: {_retry_err}")
+                        _record_event('fetch_fail')
+                        _record_raw_error(db, source, 'feed_parse_error',
+                                          exception_msg=str(_retry_err)[:200])
+                        _check_error_threshold('feed_parse', source, str(_retry_err))
+                        continue
+                else:
+                    log(f"[news_bot] ERROR feed={source} parse: {type(_feed_err).__name__}: {_feed_err}")
+                    log(traceback.format_exc())
+                    _record_event('fetch_fail')
+                    _record_raw_error(db, source, 'feed_parse_error',
+                                      exception_msg=str(_feed_err)[:200])
+                    _check_error_threshold('feed_parse', source, str(_feed_err))
+                    continue
 
             # P2-B: per-feed circuit breaker — isolate each feed's entry processing
             try:

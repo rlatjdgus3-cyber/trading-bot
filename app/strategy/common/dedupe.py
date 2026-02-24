@@ -5,8 +5,6 @@ Signal key format: {symbol}:{mode}:{side}:{stage_bucket}:{ts_bucket_3m}
 Uses DB table `signal_dedup_log` for persistence.
 """
 
-import time
-
 LOG_PREFIX = '[strategy.dedupe]'
 
 DEFAULT_WINDOW_SEC = 180  # 3 minutes

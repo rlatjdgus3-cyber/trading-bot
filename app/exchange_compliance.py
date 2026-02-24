@@ -70,7 +70,7 @@ def _compute_markets_hash(info):
 
 def _load_market_info(exchange, symbol=None):
     """Load and cache market info (minQty, stepSize, tickSize, etc.) from exchange."""
-    global _market_info_cache, _market_info_ts, _markets_version, _markets_hash
+    global _market_info_ts, _markets_version, _markets_hash
     sym = symbol or SYMBOL
     now = time.time()
 
@@ -135,7 +135,7 @@ def force_refresh_market_info(exchange, symbol=None, reason=''):
     """Force immediate market info refresh (e.g. after specific errors).
     Returns updated market info dict.
     """
-    global _market_info_cache, _market_info_ts
+    global _market_info_ts
     sym = symbol or SYMBOL
     _market_info_cache.pop(sym, None)
     _market_info_ts = 0
@@ -907,14 +907,14 @@ def run_10day_audit(cur):
             '📋 거래소 규정 준수 감사 보고서 (최근 10일)',
             '━' * 30,
             '',
-            f'📊 전체 통계',
+            '📊 전체 통계',
             f'  • 총 주문 시도: {total}건',
             f'  • 총 거부: {rejections}건 (거부율: {rejection_rate:.1f}%)',
             f'  • 거래소 오류: {exchange_errors}건',
             f'  • 사전 차단: {pre_rejects}건',
             f'  • 자동 보정: {auto_corrected}건',
             '',
-            f'⚠️ 특이 지표',
+            '⚠️ 특이 지표',
             f'  • Rate Limit 이벤트: {rate_limit_events}건',
             f'  • 포지션 모드 불일치: {mode_mismatch}건',
             f'  • 보호 모드 발동: {protection_activations}건',
@@ -1029,16 +1029,16 @@ def format_rejection_telegram_yaml(error_msg: str, order_params: dict = None) ->
 
     if matched:
         lines = [
-            f'❌ 주문 거부',
+            '❌ 주문 거부',
             f'- 사유: {matched["korean_message"]}',
             f'- 심각도: {matched["severity"]}',
             f'- 조치: {matched["suggested_fix"]}',
         ]
     else:
         lines = [
-            f'❌ 주문 거부',
+            '❌ 주문 거부',
             f'- 사유: {error_msg[:200]}',
-            f'- 조치: 수동 확인 필요',
+            '- 조치: 수동 확인 필요',
         ]
 
     if order_params:

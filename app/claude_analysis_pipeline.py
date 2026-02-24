@@ -9,7 +9,6 @@ ChatAgent에서 Claude 분석이 필요할 때 호출.
 import os
 import sys
 import json
-import time
 
 sys.path.insert(0, '/root/trading-bot/app')
 

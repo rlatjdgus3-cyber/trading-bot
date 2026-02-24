@@ -294,7 +294,7 @@ def _request_inner(gate: str, cooldown_key: str, context: dict,
     if call_type == CALL_TYPE_NORMAL and _check_market_conditions(context):
         call_type = CALL_TYPE_AUTO_EMERGENCY
         bypass = True
-        _log(f'MARKET CONDITION BYPASS: NORMAL -> AUTO_EMERGENCY')
+        _log('MARKET CONDITION BYPASS: NORMAL -> AUTO_EMERGENCY')
 
     # Stage 3.5: Event hash dedup (NORMAL only; AUTO_EMERGENCY uses shorter dedup)
     if call_type == CALL_TYPE_NORMAL:

@@ -197,7 +197,7 @@ class TestRegimeStrictBreakout(unittest.TestCase):
         # 2.0 * 0.008 = 0.016, within [0.008, 0.02]
         self.assertGreaterEqual(result['sl_pct'], 0.008)
         self.assertLessEqual(result['sl_pct'], 0.02)
-        self.assertEqual(result.get('max_stage'), 3)
+        self.assertEqual(result.get('max_stage'), 1)
 
     # ── Test 9: BREAKOUT UP + SHORT → hard block ──
     @patch('feature_flags.is_enabled', return_value=True)

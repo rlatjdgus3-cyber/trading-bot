@@ -11,7 +11,6 @@ All functions are FAIL-OPEN: errors return safe defaults.
 """
 import os
 import time
-import traceback
 
 SYMBOL = 'BTC/USDT:USDT'
 LOG_PREFIX = '[integrity]'
@@ -230,7 +229,6 @@ def is_entry_frozen():
     """Check if integrity-based entry freeze is active.
     Returns: (frozen: bool, remaining_sec: float)
     """
-    global _entry_freeze_until
     now = time.time()
     if now < _entry_freeze_until:
         return (True, _entry_freeze_until - now)

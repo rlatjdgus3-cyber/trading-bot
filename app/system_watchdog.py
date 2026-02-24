@@ -8,7 +8,6 @@ sends Telegram alerts. Zero LLM dependency. Runs independently of OpenClaw.
 Runs as a oneshot via systemd timer (every 3 minutes).
 """
 import os
-import sys
 import json
 import time
 import subprocess

@@ -59,7 +59,7 @@ class ShockBreakoutStrategy(ModeStrategy):
             breakout_side = 'SHORT'
             old_level = val
         else:
-            return self._hold(f'MODE_C: price inside VA, no breakout signal')
+            return self._hold('MODE_C: price inside VA, no breakout signal')
 
         # News override: check if news aligns with breakout direction
         news_score = regime_ctx.get('news_score', 0) if regime_ctx else 0
@@ -148,7 +148,7 @@ class ShockBreakoutStrategy(ModeStrategy):
                 'qty': None,
                 'tp': None,
                 'sl': None,
-                'reason': f'MODE_C EXIT: new box forming, transition to MODE_B REBUILD',
+                'reason': 'MODE_C EXIT: new box forming, transition to MODE_B REBUILD',
                 'signal_key': None,
                 'chase_entry': False,
                 'order_type': 'market',

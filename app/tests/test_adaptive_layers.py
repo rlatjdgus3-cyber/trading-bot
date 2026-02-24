@@ -161,9 +161,12 @@ class TestLayer1GlobalWR:
         assert result['l1_effective_threshold_add'] == 10
 
     def test_wr_above_40_unblock(self):
-        """WR >= 40% → global WR block released"""
+        """WR >= 40% → global WR block released (after consecutive improvements)"""
         from strategy_v3 import adaptive_v3
         adaptive_v3._state['global_wr_penalty_active'] = True
+        # D2-2: requires consecutive improvements; set to threshold-1 so this call completes it
+        adaptive_v3._state['wr_recovery_consecutive'] = 2
+        adaptive_v3._state['last_wr_sample'] = 0.40
         cfg = _default_cfg()
 
         # 20 trades: 9 wins, 11 losses = 45% WR

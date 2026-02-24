@@ -403,8 +403,9 @@ def compute_modifier(total_score, features, v3_regime, price, regime_ctx=None):
                     if dryrun:
                         reasoning.append(f'[L2_DRYRUN] {reason_str}')
                     else:
-                        blocked = True
-                        block_reason = reason_str
+                        if not blocked:
+                            blocked = True
+                            block_reason = reason_str
                         reasoning.append(f'[L2] {reason_str}')
         except Exception as e:
             _log(f'L2 FAIL-OPEN: {e}')

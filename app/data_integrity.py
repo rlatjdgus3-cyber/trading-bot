@@ -22,8 +22,7 @@ Usage:
 """
 import sys
 import json
-import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 sys.path.insert(0, '/root/trading-bot/app')
 
@@ -68,7 +67,7 @@ def _scan_monthly_coverage(cur, table, ts_col, tf_filter=None):
     where = ""
     params = []
     if tf_filter:
-        where = f"WHERE tf = %s"
+        where = "WHERE tf = %s"
         params = [tf_filter]
     cur.execute(f"""
         SELECT to_char({ts_col}, 'YYYY-MM') AS month, COUNT(*) AS cnt
@@ -647,14 +646,14 @@ def format_integrity_report(report):
     ]
 
     c1m = report.get('candles_1m', {})
-    lines.append(f'[candles 1m]')
+    lines.append('[candles 1m]')
     lines.append(f'  months={c1m.get("months", 0)} total_rows={c1m.get("total_rows", 0):,}')
     if c1m.get('gaps'):
         for g in c1m['gaps']:
             lines.append(f'  GAP: {g[0]} → {g[1]} ({g[2]} months)')
 
     o5m = report.get('market_ohlcv_5m', {})
-    lines.append(f'[market_ohlcv 5m]')
+    lines.append('[market_ohlcv 5m]')
     lines.append(f'  months={o5m.get("months", 0)} total_rows={o5m.get("total_rows", 0):,}')
     if o5m.get('gaps'):
         for g in o5m['gaps']:

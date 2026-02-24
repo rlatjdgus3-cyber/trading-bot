@@ -16,7 +16,6 @@ Components (5 factors):
   4. market_reaction  (0-25): macro_trace abs(btc_ret_2h) based
   5. watchlist_bonus  (0-15): watch_keywords match count
 """
-import os
 import re
 import sys
 import json
