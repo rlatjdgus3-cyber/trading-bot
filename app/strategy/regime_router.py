@@ -9,8 +9,12 @@ Outputs: {mode, confidence, reasons, drift_submode}
 """
 
 import os
+import sys
 import threading
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import feature_flags
 
 LOG_PREFIX = '[regime_router]'
 
@@ -124,7 +128,8 @@ def route(features, gate_status=None, current_position=None):
         lower_bound = val * (1 - buffer_pct)
         is_c_breakout = price > upper_bound or price < lower_bound
 
-    if (is_c_volume or is_c_impulse) and is_c_breakout:
+    # 2026-02-24: ff_mode_c_enabled 비활성 시 MODE_C 차단 (0% WR, -$85 손실원)
+    if (is_c_volume or is_c_impulse) and is_c_breakout and feature_flags.is_enabled('ff_mode_c_enabled'):
         reasons.append('MODE_C: volume/impulse spike + price outside VA')
         if is_c_volume:
             reasons.append(f'volume_z={volume_z:.2f} >= {vol_z_min}')
@@ -177,6 +182,16 @@ def route(features, gate_status=None, current_position=None):
         }
 
     # ── Priority 3: Default to MODE_B (Volatile Range) ──
+    # 2026-02-24: ff_mode_b_enabled 비활성 시 MODE_A 폴백 (0% WR, -$19 손실원)
+    if not feature_flags.is_enabled('ff_mode_b_enabled'):
+        reasons.append('MODE_B disabled → fallback to MODE_A (conservative)')
+        return {
+            'mode': 'A',
+            'confidence': 40,
+            'reasons': reasons,
+            'drift_submode': None,
+        }
+
     reasons.append('MODE_B: volatile range (default)')
     drift_submode = None
     drift_min = cfg_b.get('drift_poc_slope_min', 0.0015)

@@ -232,6 +232,11 @@ feature_flags:
   ff_chandelier_exit: false           # Phase 4 (기본 OFF)
   # Event Decision Mode — Claude direct decision on EVENT triggers
   ff_event_decision_mode: true        # Claude Decision Mode (활성)
+  # Trade analysis optimizations (2026-02-24)
+  ff_counter_signal_close: false      # counter_signal 청산 비활성 (1.4% WR, -$109 손실원)
+  ff_mode_c_enabled: false            # MODE_C Shock Breakout 비활성 (0% WR, -$85 손실원)
+  ff_event_mini_trigger: false        # event_mini_trigger 비활성 (7.1% WR, -$25 손실원)
+  ff_mode_b_enabled: false            # MODE_B Volatile Range 비활성 (0% WR, -$19 손실원)
 
 # ── UNIFIED ENGINE v1.1 Parameters ──
 unified_v11:

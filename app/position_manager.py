@@ -1917,10 +1917,13 @@ def _decide(ctx=None):
         return ('CLOSE', f'LONG signal without structure (total_score={total_score}, confirms={confirms})')
 
     # Reduce on counter signal (v3.0: total_score based)
-    if side == 'long' and total_score <= -15:
-        return ('REDUCE', f'counter signal (total_score={total_score})')
-    if side == 'short' and total_score >= 15:
-        return ('REDUCE', f'counter signal (total_score={total_score})')
+    # 2026-02-24: ff_counter_signal_close 비활성 시 차단 (1.4% WR, -$109 손실원)
+    import feature_flags as _ff_cs
+    if _ff_cs.is_enabled('ff_counter_signal_close'):
+        if side == 'long' and total_score <= -15:
+            return ('REDUCE', f'counter signal (total_score={total_score})')
+        if side == 'short' and total_score >= 15:
+            return ('REDUCE', f'counter signal (total_score={total_score})')
 
     # ADD check (v3.0: profit-zone gate + regime-unified threshold)
     regime_ctx = ctx.get('regime_ctx', {})
@@ -2793,10 +2796,16 @@ def _cycle():
                 # Legacy: record event_hash for in-memory dedup too
                 event_trigger.record_event_hash(event_result.event_hash)
 
-                # ── GPT-mini 1차 결정 (항상 실행) ──
-                _log(f'EVENT → GPT-mini 1차 (caller={CALLER})')
-                ev_action, mini_result = _handle_event_trigger_mini(
-                    cur, ctx, event_result, snapshot)
+                # ── GPT-mini 1차 결정 ──
+                # 2026-02-24: ff_event_mini_trigger 비활성 시 차단 (7.1% WR, -$25 손실원)
+                import feature_flags as _ff_evt
+                if not _ff_evt.is_enabled('ff_event_mini_trigger'):
+                    _log(f'EVENT → GPT-mini BLOCKED (ff_event_mini_trigger=false)')
+                    ev_action, mini_result = 'HOLD', {'aborted': True, 'reason': 'ff_disabled'}
+                else:
+                    _log(f'EVENT → GPT-mini 1차 (caller={CALLER})')
+                    ev_action, mini_result = _handle_event_trigger_mini(
+                        cur, ctx, event_result, snapshot)
                 # Log GPT-mini call
                 event_lock.log_claude_call(
                     caller=CALLER, gate_type='event_trigger_mini',
