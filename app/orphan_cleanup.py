@@ -10,7 +10,6 @@ Usage:
 """
 import os
 import time
-import traceback
 import urllib.parse
 import urllib.request
 
@@ -168,6 +167,37 @@ def cleanup_if_flat(ex, symbol, reason='post_exit'):
     return (False, 'no orphan orders found')
 
 
+def post_exit_cleanup(ex, symbol, caller='event_decision'):
+    """Post-exit cleanup for Event Decision Mode.
+
+    Waits 1s, checks if flat, cancels all orphan orders.
+    FAIL-OPEN: errors never block trading.
+
+    Returns: (cleaned: bool, detail: str)
+    """
+    try:
+        time.sleep(1)
+        pos_qty = _get_position_qty(ex, symbol)
+        if pos_qty < 0:
+            return (False, 'pos_qty unknown — skipped')
+        if pos_qty > 1e-09:
+            return (False, f'pos_qty={pos_qty} — position still exists')
+
+        ca, cc = cancel_all_orders_for_symbol(ex, symbol, reason=caller)
+        total = ca + cc
+        if total > 0:
+            msg = (f'[Event Decision Cleanup] {symbol}\n'
+                   f'  caller: {caller}\n'
+                   f'  canceled: {ca} active + {cc} conditional')
+            _log(msg)
+            _send_telegram(msg)
+            return (True, f'canceled {ca}+{cc} orders')
+        return (False, 'no orphan orders')
+    except Exception as e:
+        _log(f'post_exit_cleanup error (FAIL-OPEN): {e}')
+        return (False, f'error: {e}')
+
+
 def pre_flight_cleanup(ex, cur, symbol):
     """Pre-flight check before new entry. If pos=0 and pending orders exist, cleanup once.
 
@@ -197,7 +227,7 @@ def pre_flight_cleanup(ex, cur, symbol):
                 pass
 
         if has_orders:
-            _log(f'pre-flight: pos=0 but orders exist — cleanup')
+            _log('pre-flight: pos=0 but orders exist — cleanup')
             cancel_all_orders_for_symbol(ex, symbol, reason='pre_flight')
     except Exception as e:
         _log(f'pre_flight_cleanup error (FAIL-OPEN): {e}')

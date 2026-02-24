@@ -17,7 +17,6 @@ Cost control:
   - Telegram throttle: same event type max once per 10 min
 """
 import hashlib
-import json
 import sys
 import time
 from datetime import datetime, timezone
@@ -31,6 +30,7 @@ MODE_DEFAULT = 'DEFAULT'
 MODE_EVENT = 'EVENT'
 MODE_EMERGENCY = 'EMERGENCY'
 MODE_USER = 'USER'
+MODE_EVENT_DECISION = 'EVENT_DECISION'
 
 # ── price spike thresholds (return %) ──────────────────────
 PRICE_SPIKE_1M_PCT = 1.0
@@ -63,6 +63,13 @@ EMERGENCY_LIQ_DIST_PCT = 3.0
 EMERGENCY_ATR_SURGE_PCT = 40
 EMERGENCY_VOL_SPIKE_RATIO = 2.5
 EMERGENCY_VOL_ZSCORE = 3.0
+
+# ── Event Decision Mode thresholds (lower sensitivity) ───
+EVENT_DECISION_PRICE_1M_PCT = 0.5     # 기존 1.0에서 하향
+EVENT_DECISION_PRICE_5M_PCT = 1.0     # 기존 1.8에서 하향
+EVENT_DECISION_RANGE_POS_LOW = -0.1
+EVENT_DECISION_RANGE_POS_HIGH = 1.1
+EVENT_DECISION_IMPULSE_MIN = 1.5
 
 # ── box range filter (EMERGENCY suppression) ─────────────
 BOX_BB_BANDWIDTH_PCT = 0.6
@@ -635,10 +642,29 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
 
     # Phase 2-5: event triggers
     all_triggers = []
-    all_triggers.extend(_check_price_spikes(snapshot))
+
+    # Check ff_event_decision_mode for lower thresholds
+    _use_event_decision = False
+    try:
+        import feature_flags as _ff_et
+        _use_event_decision = _ff_et.is_enabled('ff_event_decision_mode')
+    except Exception:
+        pass
+
+    if _use_event_decision:
+        # Use lower EVENT_DECISION thresholds for price spikes
+        all_triggers.extend(_check_price_spikes_decision(snapshot))
+    else:
+        all_triggers.extend(_check_price_spikes(snapshot))
     all_triggers.extend(_check_volume_spike(snapshot))
     all_triggers.extend(_check_level_breaks(snapshot, cur))
     all_triggers.extend(_check_regime_change(snapshot, prev_scores))
+
+    # Additional checks for EVENT_DECISION mode
+    if _use_event_decision:
+        all_triggers.extend(_check_range_position_extreme(snapshot))
+        all_triggers.extend(_check_impulse_spike(snapshot, cur))
+        all_triggers.extend(_check_liquidity_stress(snapshot))
 
     if all_triggers:
         _log(f'edge triggers fired: {[t["type"] for t in all_triggers]} '
@@ -659,7 +685,7 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
             surviving.append(t)
 
     if not surviving:
-        _log(f'all triggers deduped, returning DEFAULT')
+        _log('all triggers deduped, returning DEFAULT')
         return EventResult()  # DEFAULT
 
     # Update timestamps for surviving triggers only + purge expired entries
@@ -697,6 +723,18 @@ def evaluate(snapshot, prev_scores=None, position=None, cur=None,
         return EventResult()  # still accumulating, return DEFAULT
 
     eh = compute_event_hash(bundled, symbol=symbol, price=price)
+
+    if _use_event_decision:
+        _log(f'EVENT_DECISION: triggers={[t["type"] for t in bundled]} hash={eh[:12]}')
+        return EventResult(
+            mode=MODE_EVENT_DECISION,
+            triggers=bundled,
+            event_hash=eh,
+            priority=PRIORITY_EVENT,
+            call_type='AUTO_EMERGENCY',
+            should_call_claude=True,
+        )
+
     _log(f'EVENT: triggers={[t["type"] for t in bundled]} hash={eh[:12]}')
     return EventResult(
         mode=MODE_EVENT,
@@ -733,6 +771,40 @@ def _check_price_spikes(snapshot) -> list:
     return triggers
 
 
+def _check_price_spikes_decision(snapshot) -> list:
+    """Check price spikes with lower EVENT_DECISION thresholds."""
+    triggers = []
+    returns = snapshot.get('returns', {})
+    for key, ret_key, threshold in [
+        ('price_spike_1m', 'ret_1m', EVENT_DECISION_PRICE_1M_PCT),
+        ('price_spike_5m', 'ret_5m', EVENT_DECISION_PRICE_5M_PCT),
+    ]:
+        ret = returns.get(ret_key)
+        now_active = ret is not None and abs(ret) >= threshold
+        was_active = _prev_edge_state[key]
+        if now_active and not was_active:
+            triggers.append({
+                'type': key,
+                'value': ret,
+                'threshold': threshold,
+                'direction': 'up' if ret > 0 else 'down',
+            })
+        _prev_edge_state[key] = now_active
+    # Keep original 15m threshold
+    ret_15m = returns.get('ret_15m')
+    now_active_15m = ret_15m is not None and abs(ret_15m) >= PRICE_SPIKE_15M_PCT
+    was_active_15m = _prev_edge_state['price_spike_15m']
+    if now_active_15m and not was_active_15m:
+        triggers.append({
+            'type': 'price_spike_15m',
+            'value': ret_15m,
+            'threshold': PRICE_SPIKE_15M_PCT,
+            'direction': 'up' if ret_15m > 0 else 'down',
+        })
+    _prev_edge_state['price_spike_15m'] = now_active_15m
+    return triggers
+
+
 def _check_volume_spike(snapshot) -> list:
     """Check vol_ratio against threshold — edge-based (False→True only).
     v14: also requires abs(ret_5m) >= 0.4% (body confirmation) to reduce noise."""
@@ -762,7 +834,6 @@ _prev_level_state = {'above_vah': False, 'below_val': False, 'poc_zone': None}
 
 def _check_level_breaks(snapshot, cur=None) -> list:
     """Check POC shift, VAH/VAL breach — only on *transitions*, not static state."""
-    global _prev_level_state
     triggers = []
     price = snapshot.get('price', 0)
     if not price:
@@ -884,6 +955,59 @@ def _check_3bar_directional(snapshot) -> list:
         'bars': last3,
         'position_critical': False,
     }]
+
+
+# ── Event Decision Mode additional checks ────────────────
+
+def _check_range_position_extreme(snapshot) -> list:
+    """Check if range_pos is outside [-0.1, 1.1] — extreme deviation from range."""
+    triggers = []
+    range_pos = snapshot.get('range_pos')
+    if range_pos is None:
+        return triggers
+    if range_pos < EVENT_DECISION_RANGE_POS_LOW or range_pos > EVENT_DECISION_RANGE_POS_HIGH:
+        triggers.append({
+            'type': 'range_position_extreme',
+            'value': round(range_pos, 3),
+            'threshold': f'{EVENT_DECISION_RANGE_POS_LOW}~{EVENT_DECISION_RANGE_POS_HIGH}',
+            'direction': 'up' if range_pos > EVENT_DECISION_RANGE_POS_HIGH else 'down',
+        })
+    return triggers
+
+
+def _check_impulse_spike(snapshot, cur=None) -> list:
+    """Check if impulse >= 1.5 — sharp directional momentum."""
+    triggers = []
+    impulse = None
+    try:
+        from strategy.common import features
+        impulse = features.compute_impulse(cur)
+    except Exception:
+        impulse = snapshot.get('impulse')
+    if impulse is None:
+        return triggers
+    if abs(impulse) >= EVENT_DECISION_IMPULSE_MIN:
+        triggers.append({
+            'type': 'impulse_spike',
+            'value': round(impulse, 3),
+            'threshold': EVENT_DECISION_IMPULSE_MIN,
+            'direction': 'up' if impulse > 0 else 'down',
+        })
+    return triggers
+
+
+def _check_liquidity_stress(snapshot) -> list:
+    """Check if spread_ok or liquidity_ok is False — market stress."""
+    triggers = []
+    spread_ok = snapshot.get('spread_ok', True)
+    liquidity_ok = snapshot.get('liquidity_ok', True)
+    if not spread_ok or not liquidity_ok:
+        triggers.append({
+            'type': 'liquidity_stress',
+            'value': f'spread_ok={spread_ok},liquidity_ok={liquidity_ok}',
+            'threshold': 'spread_ok=True,liquidity_ok=True',
+        })
+    return triggers
 
 
 def _check_emergency_escalation(snapshot, position=None, prev_scores=None) -> list:
@@ -1015,7 +1139,7 @@ def _check_emergency_escalation(snapshot, position=None, prev_scores=None) -> li
 
     # Volatility zscore trigger bypasses vol_ratio gate
     if vol_zscore_triggered:
-        _log(f'volatility zscore emergency: bypassing vol_ratio gate')
+        _log('volatility zscore emergency: bypassing vol_ratio gate')
         return market_critical_signals
 
     # Market-critical signals require vol_ratio >= 2.5x gate

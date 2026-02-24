@@ -191,7 +191,7 @@ def _build_fact_section(ctx=None):
             f"move_4h={evt.get('btc_move_4h', '?')}%, "
             f"zscore={evt.get('vol_zscore', '?')}")
     if perf:
-        lines.append(f"\nPerformance Summary:")
+        lines.append("\nPerformance Summary:")
         lines.append(f"- Avg move 1h: {perf.get('avg_move_1h', 'N/A')}%")
         lines.append(f"- Avg move 4h: {perf.get('avg_move_4h', 'N/A')}%")
         lines.append(f"- Up/Down: {perf.get('up_count', 0)}/{perf.get('down_count', 0)}")
@@ -268,7 +268,7 @@ def event_trigger_analysis(context_packet=None, snapshot=None, event_result=None
             trigger_lines.append(f"  - {t.get('type', '?')}: value={t.get('value', '?')} "
                                  f"threshold={t.get('threshold', '?')}")
         if trigger_lines:
-            prompt += f"\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
+            prompt += "\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
 
     # 3. Gate selection: EMERGENCY → 'emergency', EVENT → 'event_trigger'
     er_mode = getattr(event_result, 'mode', 'EVENT') if event_result else 'EVENT'
@@ -335,7 +335,7 @@ def event_trigger_analysis_mini(context_packet=None, snapshot=None, event_result
             trigger_lines.append(f"  - {t.get('type', '?')}: value={t.get('value', '?')} "
                                  f"threshold={t.get('threshold', '?')}")
         if trigger_lines:
-            prompt += f"\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
+            prompt += "\n## Event Triggers\n" + '\n'.join(trigger_lines) + '\n'
 
     er_mode = getattr(event_result, 'mode', 'EVENT') if event_result else 'EVENT'
 
@@ -386,6 +386,30 @@ def event_trigger_analysis_mini(context_packet=None, snapshot=None, event_result
 
 VALID_ACTIONS = {'HOLD', 'OPEN_LONG', 'OPEN_SHORT', 'REDUCE', 'CLOSE', 'REVERSE'}
 
+# ── Event Decision Mode ──────────────────────────────────
+
+VALID_EVENT_ACTIONS = frozenset({
+    'HOLD', 'RISK_OFF_REDUCE', 'HARD_EXIT', 'REVERSE', 'HEDGE', 'FREEZE_NEW_ENTRY',
+})
+
+VALID_EVENT_CLASSES = frozenset({
+    'FLASH_DROP', 'FLASH_PUMP', 'BREAKOUT', 'FAKEOUT', 'LIQUIDITY_STRESS',
+})
+
+EVENT_DECISION_FALLBACK = {
+    'event_class': 'FAKEOUT',
+    'confidence': 0.0,
+    'action': 'HOLD',
+    'params': {},
+    'reasoning_short': 'FALLBACK — Claude parse failure',
+    'safety_checks': {
+        'orphan_orders_cleanup_required': False,
+        'stop_order_required': False,
+        'reverse_allowed': False,
+    },
+    'fallback_used': True,
+}
+
 
 def _parse_response(raw=None):
     """Parse Claude's JSON response. Falls back on parse failure."""
@@ -416,7 +440,7 @@ def _parse_response(raw=None):
         confidence = max(0.0, min(1.0, float(data.get('confidence', 0.5))))
         ttl_seconds = max(30, min(300, int(data.get('ttl_seconds', 60))))
     except (ValueError, TypeError):
-        _log(f'field parse error, using defaults')
+        _log('field parse error, using defaults')
         reduce_pct, target_stage, confidence, ttl_seconds = 0, 1, 0.5, 60
 
     return {
@@ -464,6 +488,252 @@ def score_change_analysis(context_packet=None):
     parsed['estimated_cost_usd'] = result.get('estimated_cost_usd', 0)
     parsed['gate_type'] = result.get('gate_type', 'pre_action')
     parsed['model'] = result.get('model', '')
+    return parsed
+
+
+# ── Event Decision Mode: Claude direct decision ─────────
+
+def _build_event_decision_prompt(bundle, snapshot):
+    """Build Claude prompt for EVENT_DECISION mode."""
+    pos = bundle.get('position', {})
+    orders = bundle.get('orders', {})
+    mctx = bundle.get('mctx', {})
+    micro = bundle.get('microstructure', {})
+    recent = bundle.get('recent_execution', [])
+    health = bundle.get('system_health', {})
+    risk_cfg = bundle.get('risk_config', {})
+    triggers = bundle.get('triggers', [])
+
+    lines = [
+        'Role: Crypto trading risk analyst with EXECUTION AUTHORITY.',
+        'You must respond with STRICT JSON only — no markdown, no explanation.',
+        '',
+        '── Current Position ──',
+        f'  side: {pos.get("side", "NONE")}',
+        f'  qty: {pos.get("qty", 0)}',
+        f'  entry_price: {pos.get("entry_price", 0)}',
+        f'  mark_price: {pos.get("mark_price", 0)}',
+        f'  uPnL: {pos.get("upnl", 0)}',
+        f'  uPnL%: {pos.get("upnl_pct", 0)}',
+        f'  leverage: {pos.get("leverage", 0)}',
+        f'  liq_price: {pos.get("liq_price", 0)}',
+        '',
+        '── Active Orders ──',
+        f'  active_count: {orders.get("active_count", 0)}',
+        f'  conditional_count: {orders.get("conditional_count", 0)}',
+        f'  has_orphan_risk: {orders.get("has_orphan_risk", False)}',
+        '',
+        '── Trigger Events ──',
+    ]
+    for t in triggers:
+        lines.append(f'  - {t.get("type", "?")}: value={t.get("value", "?")} '
+                      f'threshold={t.get("threshold", "?")}')
+
+    lines += [
+        '',
+        '── Market Context ──',
+        f'  regime: {mctx.get("regime", "?")}',
+        f'  drift: {mctx.get("drift", 0)}',
+        f'  adx: {mctx.get("adx", 0)}',
+        f'  atr_pct: {mctx.get("atr_pct", 0)}',
+        f'  impulse: {mctx.get("impulse", 0)}',
+        f'  volume_z: {mctx.get("volume_z", 0)}',
+        f'  range_pos: {mctx.get("range_pos", 0)}',
+        f'  breakout: {mctx.get("breakout", False)}',
+        f'  ret_1m: {mctx.get("ret_1m", 0)}%',
+        f'  ret_5m: {mctx.get("ret_5m", 0)}%',
+        f'  ret_15m: {mctx.get("ret_15m", 0)}%',
+        '',
+        '── Microstructure ──',
+        f'  spread_ok: {micro.get("spread_ok", True)}',
+        f'  liquidity_ok: {micro.get("liquidity_ok", True)}',
+        f'  orderbook_imbalance: {micro.get("orderbook_imbalance", 0)}',
+        f'  slippage_est: {micro.get("slippage_est", 0)}',
+        '',
+        '── Recent Execution (last 5) ──',
+    ]
+    for trade in recent[:5]:
+        lines.append(f'  - {trade.get("action", "?")} {trade.get("side", "?")} '
+                      f'pnl={trade.get("pnl", "?")} reason={trade.get("reason", "?")}')
+
+    lines += [
+        '',
+        '── System Health ──',
+        f'  gate_status: {health.get("gate_status", "OK")}',
+        f'  down_services: {health.get("down_services", [])}',
+        f'  latency_ms: {health.get("latency_ms", 0)}',
+        '',
+        '── Risk Config ──',
+        f'  allowed_actions: {list(VALID_EVENT_ACTIONS)}',
+        f'  max_reduce_ratio: 0.70',
+        f'  max_reverse_ratio: 0.30',
+        f'  max_hedge_ratio: 0.30',
+        f'  max_freeze_minutes: 60',
+        '',
+        '── Instructions ──',
+        'Analyze the trigger events and decide the optimal action.',
+        'HOLD = do nothing, keep position as-is',
+        'RISK_OFF_REDUCE = reduce position by reduce_ratio (0.0-1.0)',
+        'HARD_EXIT = close entire position immediately',
+        'REVERSE = close + open opposite direction (only if reverse_allowed)',
+        'HEDGE = open hedge position (opposite direction, hedge_size_ratio)',
+        'FREEZE_NEW_ENTRY = block new entries for freeze_minutes',
+        '',
+        'Respond with STRICT JSON only:',
+        '{',
+        '  "event_class": "FLASH_DROP|FLASH_PUMP|BREAKOUT|FAKEOUT|LIQUIDITY_STRESS",',
+        '  "confidence": 0.0-1.0,',
+        '  "action": "HOLD|RISK_OFF_REDUCE|HARD_EXIT|REVERSE|HEDGE|FREEZE_NEW_ENTRY",',
+        '  "params": {',
+        '    "reduce_ratio": 0.0-1.0,',
+        '    "freeze_minutes": 0-60,',
+        '    "new_sl_type": "EXCHANGE_HARD_SL|ATR_TRAIL|BREAKEVEN",',
+        '    "new_sl_value": 0,',
+        '    "reverse_size_ratio": 0.0-1.0,',
+        '    "hedge_size_ratio": 0.0-1.0',
+        '  },',
+        '  "reasoning_short": "...",',
+        '  "safety_checks": {',
+        '    "orphan_orders_cleanup_required": true/false,',
+        '    "stop_order_required": true/false,',
+        '    "reverse_allowed": true/false',
+        '  }',
+        '}',
+    ]
+    return '\n'.join(lines)
+
+
+def _parse_event_decision_response(text):
+    """Parse Claude EVENT_DECISION JSON response. Returns HOLD fallback on failure."""
+    if not text:
+        return dict(EVENT_DECISION_FALLBACK)
+
+    raw = text.strip()
+    # Strip markdown
+    raw = re.sub(r'^\s*```(?:json)?\s*\n?', '', raw)
+    raw = re.sub(r'\n?\s*```\s*$', '', raw)
+    raw = raw.strip()
+
+    data = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # regex fallback: find first { ... }
+        m = re.search(r'\{[\s\S]*\}', raw)
+        if m:
+            try:
+                data = json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+
+    if not data or not isinstance(data, dict):
+        _log(f'event_decision parse failed: {raw[:200]}')
+        return dict(EVENT_DECISION_FALLBACK)
+
+    # Validate action
+    action = (data.get('action') or '').upper()
+    if action not in VALID_EVENT_ACTIONS:
+        _log(f'event_decision invalid action: {action}')
+        return dict(EVENT_DECISION_FALLBACK)
+
+    # Validate event_class
+    event_class = (data.get('event_class') or '').upper()
+    if event_class not in VALID_EVENT_CLASSES:
+        event_class = 'FAKEOUT'
+
+    # Clamp params
+    params = data.get('params', {})
+    if not isinstance(params, dict):
+        params = {}
+    try:
+        params['reduce_ratio'] = max(0.0, min(1.0, float(params.get('reduce_ratio', 0))))
+        params['freeze_minutes'] = max(0, min(60, int(params.get('freeze_minutes', 0))))
+        params['reverse_size_ratio'] = max(0.0, min(1.0, float(params.get('reverse_size_ratio', 0))))
+        params['hedge_size_ratio'] = max(0.0, min(1.0, float(params.get('hedge_size_ratio', 0))))
+        params['new_sl_value'] = float(params.get('new_sl_value', 0))
+        params['new_sl_type'] = str(params.get('new_sl_type', ''))
+    except (ValueError, TypeError):
+        params = {'reduce_ratio': 0, 'freeze_minutes': 0,
+                  'reverse_size_ratio': 0, 'hedge_size_ratio': 0,
+                  'new_sl_value': 0, 'new_sl_type': ''}
+
+    # Confidence
+    try:
+        confidence = max(0.0, min(1.0, float(data.get('confidence', 0.5))))
+    except (ValueError, TypeError):
+        confidence = 0.5
+
+    # Safety checks
+    safety = data.get('safety_checks', {})
+    if not isinstance(safety, dict):
+        safety = {}
+
+    return {
+        'event_class': event_class,
+        'confidence': confidence,
+        'action': action,
+        'params': params,
+        'reasoning_short': str(data.get('reasoning_short', ''))[:500],
+        'safety_checks': {
+            'orphan_orders_cleanup_required': bool(safety.get('orphan_orders_cleanup_required', False)),
+            'stop_order_required': bool(safety.get('stop_order_required', False)),
+            'reverse_allowed': bool(safety.get('reverse_allowed', False)),
+        },
+        'fallback_used': False,
+    }
+
+
+def event_decision_analysis(context_bundle, snapshot, event_result):
+    """EVENT_DECISION Claude analysis — Claude decides action directly.
+
+    gate: event_trigger, call_type: AUTO_EMERGENCY
+    Returns parsed decision dict (action=HOLD on failure).
+    """
+    import time as _time
+
+    # Snapshot validation
+    import market_snapshot
+    valid, reason = market_snapshot.validate_snapshot(snapshot)
+    if not valid:
+        _log(f'event_decision aborted: {reason}')
+        return {**EVENT_DECISION_FALLBACK, 'abort_reason': reason}
+
+    import claude_gate
+
+    # Build enriched prompt
+    prompt = _build_event_decision_prompt(context_bundle, snapshot)
+
+    er_mode = getattr(event_result, 'mode', 'EVENT_DECISION') if event_result else 'EVENT_DECISION'
+    cooldown_key = 'event_decision'
+    gate_context = {
+        'event_mode': er_mode,
+        'event_hash': getattr(event_result, 'event_hash', None) if event_result else None,
+        'trigger_type': ((getattr(event_result, 'triggers', None) or [])[0].get('type', '')
+                         if event_result and getattr(event_result, 'triggers', None) else ''),
+        'is_emergency': False,
+    }
+
+    start_ms = int(_time.time() * 1000)
+    result = claude_gate.call_claude(
+        gate='event_trigger', prompt=prompt, cooldown_key=cooldown_key,
+        context=gate_context, max_tokens=800, call_type='AUTO_EMERGENCY')
+    elapsed_ms = int(_time.time() * 1000) - start_ms
+
+    if result.get('fallback_used'):
+        _log(f'event_decision gate denied: {result.get("gate_reason", "unknown")}')
+        return {**EVENT_DECISION_FALLBACK, 'fallback_used': True,
+                'gate_reason': result.get('gate_reason', ''),
+                'api_latency_ms': elapsed_ms,
+                'call_type': 'AUTO_EMERGENCY'}
+
+    parsed = _parse_event_decision_response(result.get('text', ''))
+    parsed['api_latency_ms'] = elapsed_ms
+    parsed['input_tokens'] = result.get('input_tokens', 0)
+    parsed['output_tokens'] = result.get('output_tokens', 0)
+    parsed['estimated_cost_usd'] = result.get('estimated_cost_usd', 0)
+    parsed['gate_type'] = result.get('gate_type', 'event_trigger')
+    parsed['model'] = result.get('model', '')
+    parsed['call_type'] = 'AUTO_EMERGENCY'
     return parsed
 
 

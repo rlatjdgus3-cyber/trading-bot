@@ -879,7 +879,7 @@ def _handle_event_trigger(cur=None, ctx=None, event_result=None, snapshot=None):
     action = result.get('action') or result.get('recommended_action', 'HOLD')
 
     if action == 'SKIP':
-        _log(f'CLAUDE_SKIP: event_trigger API fail → SKIP')
+        _log('CLAUDE_SKIP: event_trigger API fail → SKIP')
         return 'HOLD'
 
     pos = ctx.get('position', {})
@@ -1039,7 +1039,7 @@ def _handle_event_trigger_mini(cur=None, ctx=None, event_result=None, snapshot=N
     action = result.get('action') or result.get('recommended_action', 'HOLD')
 
     if action == 'SKIP':
-        _log(f'CLAUDE_SKIP: GPT-mini API fail → SKIP')
+        _log('CLAUDE_SKIP: GPT-mini API fail → SKIP')
         return ('HOLD', result)
 
     pos = ctx.get('position', {})
@@ -1306,7 +1306,7 @@ def _handle_emergency_v2(cur=None, ctx=None, event_result=None, snapshot=None):
     action = result.get('action') or result.get('recommended_action', 'HOLD')
 
     if action == 'SKIP':
-        _log(f'CLAUDE_SKIP: emergency_v2 API fail → SKIP')
+        _log('CLAUDE_SKIP: emergency_v2 API fail → SKIP')
         return 'HOLD'
 
     pos = ctx.get('position', {})
@@ -1667,7 +1667,6 @@ def _v2_position_check(ctx, side, stage, price):
     FAIL-OPEN: returns None on any error.
     """
     try:
-        from strategy.common.features import build_feature_snapshot
         from strategy.regime_router import route, get_mode_config
         from strategy.modes.static_range import StaticRangeStrategy
         from strategy.modes.volatile_range import VolatileRangeStrategy
@@ -2379,7 +2378,7 @@ def _check_async_claude_result(cur):
     Called at the start of each _cycle().
     Returns action string or None.
     """
-    global _claude_result, _claude_result_ts, _claude_result_consumed
+    global _claude_result_consumed
 
     with _claude_thread_lock:
         if _claude_result_consumed or _claude_result is None:
@@ -2547,6 +2546,34 @@ def _cycle():
             # Phase 2: Build context (using snapshot if available)
             ctx = _build_context(cur, pos, snapshot=snapshot)
 
+            # Phase 2.5: Proactive Manager — 적극적 중간관리자
+            try:
+                import proactive_manager
+                proactive_manager.ensure_tables(cur)
+                _scores_for_proactive = ctx.get('scores', {})
+                _dyn_sl = _scores_for_proactive.get('dynamic_stop_loss_pct', 2.0)
+
+                # SL tighten factor from proactive manager
+                _sl_tighten = proactive_manager.get_sl_tighten_factor(cur)
+                if _sl_tighten < 1.0:
+                    _dyn_sl = _dyn_sl * _sl_tighten
+                    _log(f'[proactive] SL tightened: {_dyn_sl:.2f}% (factor={_sl_tighten:.2f})')
+
+                proactive_actions = proactive_manager.evaluate(
+                    cur, pos=pos, snapshot=snapshot,
+                    scores=_scores_for_proactive,
+                    dynamic_sl_pct=_dyn_sl)
+
+                if proactive_actions:
+                    proactive_result = proactive_manager.execute_actions(
+                        cur, proactive_actions, pos=pos)
+                    _executed = proactive_result.get('executed', [])
+                    if _executed:
+                        _log(f'[proactive] executed {len(_executed)} actions: '
+                             f'{[a["action"] for a in _executed]}')
+            except Exception as _pm_err:
+                _log(f'[proactive] error (FAIL-OPEN): {_pm_err}')
+
             # Phase 3: Event trigger evaluation
             event_result = event_trigger.evaluate(
                 snapshot=snapshot, prev_scores=_prev_scores,
@@ -2582,6 +2609,101 @@ def _cycle():
 
                 if em_action and em_action != 'HOLD':
                     _reset_hold_tracker(f'emergency action: {em_action}')
+                _prev_scores = ctx.get('scores', {})
+                if snapshot and snapshot.get('atr_14') is not None:
+                    _prev_scores['atr_14'] = snapshot.get('atr_14')
+                return LOOP_FAST_SEC
+
+            elif event_result.mode == event_trigger.MODE_EVENT_DECISION:
+                # ── EVENT DECISION: Claude direct decision mode ──
+                _trigger_types = [t['type'] for t in event_result.triggers]
+                price = snapshot.get('price', 0) if snapshot else 0
+                _log(f'EVENT_DECISION: caller={CALLER} triggers={_trigger_types}')
+
+                # DB-based pre-filters (same as MODE_EVENT)
+                _suppress_reason = None
+                _lock_info = {}
+
+                ev_locked, ev_lock_info = event_lock.check_event_lock(
+                    SYMBOL, _trigger_types, price, conn=conn)
+                if ev_locked:
+                    _suppress_reason = 'db_event_lock'
+                    _lock_info = ev_lock_info
+
+                if not _suppress_reason and event_result.event_hash:
+                    h_locked, h_lock_info = event_lock.check_hash_lock(
+                        event_result.event_hash, conn=conn)
+                    if h_locked:
+                        _suppress_reason = 'db_hash_lock'
+                        _lock_info = h_lock_info
+
+                if not _suppress_reason:
+                    hs_locked, hs_lock_info = event_lock.check_hold_suppress(
+                        SYMBOL, conn=conn)
+                    if hs_locked:
+                        _suppress_reason = 'db_hold_suppress'
+                        _lock_info = hs_lock_info
+
+                if not _suppress_reason:
+                    if event_trigger.check_event_hash_dedup(event_result.event_hash):
+                        _suppress_reason = 'local_dedupe'
+                    elif event_trigger.is_hold_repeat(_trigger_types, pos):
+                        _suppress_reason = 'local_hold_repeat'
+                    elif _should_skip_claude_call(pos):
+                        _suppress_reason = 'local_consecutive_hold'
+
+                if _suppress_reason:
+                    remaining = _lock_info.get('remaining_sec', 0)
+                    _log(f'EVENT_DECISION suppressed: reason={_suppress_reason} '
+                         f'triggers={_trigger_types} remaining={remaining}s')
+                    event_lock.log_claude_call(
+                        caller=CALLER, gate_type='event_decision',
+                        call_type='AUTO_EMERGENCY', trigger_types=_trigger_types,
+                        action_result='SUPPRESSED', allowed=False,
+                        deny_reason=_suppress_reason, conn=conn)
+                    if _suppress_reason.startswith('db_') and remaining > 0:
+                        event_lock.notify_event_suppressed(
+                            SYMBOL, _lock_info, _trigger_types, caller=CALLER)
+                    elif event_trigger.should_send_telegram_event(
+                            _trigger_types + ['_suppress']):
+                        _send_telegram(
+                            report_formatter.format_event_suppressed(
+                                _trigger_types, _suppress_reason,
+                                detail={'caller': CALLER}))
+                    _prev_scores = ctx.get('scores', {})
+                    if snapshot and snapshot.get('atr_14') is not None:
+                        _prev_scores['atr_14'] = snapshot.get('atr_14')
+                    return LOOP_FAST_SEC
+
+                # Acquire DB locks
+                event_lock.acquire_event_lock(
+                    SYMBOL, _trigger_types, price, caller=CALLER, conn=conn)
+                if event_result.event_hash:
+                    event_lock.acquire_hash_lock(
+                        event_result.event_hash, caller=CALLER, conn=conn)
+                event_trigger.record_event_hash(event_result.event_hash)
+
+                # Claude Decision Engine
+                _log(f'EVENT_DECISION → Claude direct (caller={CALLER})')
+                import event_decision_engine as _ede
+                ed_action, ed_detail = _ede.handle_event_decision(
+                    cur, ctx, event_result, snapshot, pos, conn=conn)
+
+                # Record results
+                _record_claude_action(ed_action)
+                event_trigger.record_claude_result(ed_action, _trigger_types, pos)
+                event_lock.record_hold_result(
+                    SYMBOL, ed_action, _trigger_types, caller=CALLER, conn=conn)
+                event_lock.log_claude_call(
+                    caller=CALLER, gate_type='event_decision',
+                    call_type='AUTO_EMERGENCY', trigger_types=_trigger_types,
+                    action_result=ed_action, allowed=True,
+                    latency_ms=ed_detail.get('latency_ms', 0),
+                    conn=conn)
+
+                if ed_action and ed_action != 'HOLD':
+                    _reset_hold_tracker(f'event_decision action: {ed_action}')
+
                 _prev_scores = ctx.get('scores', {})
                 if snapshot and snapshot.get('atr_14') is not None:
                     _prev_scores['atr_14'] = snapshot.get('atr_14')
@@ -2709,7 +2831,7 @@ def _cycle():
                 return LOOP_FAST_SEC
             else:
                 # DEFAULT: score_engine only, no Claude call
-                _log(f'DEFAULT mode, score_engine only')
+                _log('DEFAULT mode, score_engine only')
 
             # P0-4: Shock guard check (1m rapid move defense)
             try:
@@ -2769,6 +2891,15 @@ def _cycle():
                 _scores = ctx.get('scores', {})
                 if pos and pos.get('side') and pos.get('entry_price'):
                     _sl_base = _scores.get('dynamic_stop_loss_pct', 2.0)
+                    # Proactive Manager: SL tighten override
+                    try:
+                        import proactive_manager as _pm_sl
+                        _pm_sl_factor = _pm_sl.get_sl_tighten_factor(cur)
+                        if _pm_sl_factor < 1.0:
+                            _sl_base = _sl_base * _pm_sl_factor
+                            _log(f'PROACTIVE SL: {_sl_base / _pm_sl_factor:.2f}% -> {_sl_base:.2f}%')
+                    except Exception:
+                        pass
                     # TIGHTEN_STOP: SL tightened (50% reduction)
                     if ctx.get('panic_tighten_stop'):
                         _sl_base = _sl_base * 0.5
@@ -2917,7 +3048,7 @@ def _cycle():
 
 
 def main():
-    _log(f'=== POSITION MANAGER START ===')
+    _log('=== POSITION MANAGER START ===')
     from watchdog_helper import init_watchdog
     init_watchdog(interval_sec=10)
     _log(f'BUILD_SHA={BUILD_SHA} CONFIG_VERSION={CONFIG_VERSION} CALLER={CALLER}')

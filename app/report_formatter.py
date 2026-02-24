@@ -4,7 +4,6 @@ report_formatter.py — 중앙 한국어 포매팅 모듈
 순수 포매팅 전용. DB/API/네트워크 호출 없음.
 어디서든 import 가능.
 """
-import os
 import re as _re
 
 # ── 한국어 번역 상수 ──────────────────────────────────────
@@ -61,6 +60,9 @@ TRIGGER_KR = {
     'emergency_volatility_zscore': '변동성 Z점수 긴급',
     'emergency_volume_confirmed': '거래량 확인(긴급)',
     'emergency_3bar_directional': '15분봉 3연속 방향성',
+    'range_position_extreme': '레인지 포지션 이탈',
+    'impulse_spike': '임펄스 급등',
+    'liquidity_stress': '유동성 스트레스',
 }
 
 RISK_KR = {
@@ -87,6 +89,23 @@ SUPPRESS_REASON_KR = {
     'cooldown_active': '쿨다운 대기 중',
     'daily_cap_exceeded': '일일 한도 초과',
     'budget_exceeded': '예산 초과',
+}
+
+EVENT_DECISION_ACTION_KR = {
+    'HOLD': '유지',
+    'RISK_OFF_REDUCE': '리스크 감소',
+    'HARD_EXIT': '긴급 전량 청산',
+    'REVERSE': '반전',
+    'HEDGE': '헤지',
+    'FREEZE_NEW_ENTRY': '신규 진입 동결',
+}
+
+EVENT_CLASS_KR = {
+    'FLASH_DROP': '플래시 급락',
+    'FLASH_PUMP': '플래시 급등',
+    'BREAKOUT': '돌파',
+    'FAKEOUT': '페이크아웃',
+    'LIQUIDITY_STRESS': '유동성 스트레스',
 }
 
 MODEL_LABEL_KR = {
@@ -1028,7 +1047,7 @@ def format_decision_alert(action, parsed, engine_action, scores, pos_state,
     total = _safe_float(scores.get('total_score'))
 
     lines = [
-        f'[📋 전략 판단]',
+        '[📋 전략 판단]',
     ]
 
     # Exchange-sourced position display
@@ -1077,7 +1096,7 @@ def format_enqueue_alert(eq_id, action, parsed, pos_state):
         qty_info = f'stage={parsed.get("target_stage", 1)}'
 
     lines = [
-        f'[⏳ 실행 대기]',
+        '[⏳ 실행 대기]',
         f'- 액션: {_kr_action(action)}',
         f'- 대기열 ID: {eq_id}',
     ]
@@ -1192,6 +1211,72 @@ def format_event_post_alert(trigger_types, action, result):
     return '\n'.join(lines)
 
 
+def format_event_decision_pre_alert(triggers, mode, snapshot=None):
+    """이벤트 결정 모드 — 분석 시작 알림."""
+    trigger_types = [t.get('type', '?') for t in (triggers or [])]
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+
+    price_line = ''
+    if snapshot:
+        ret_5m = (snapshot.get('returns') or {}).get('ret_5m')
+        if ret_5m is not None:
+            direction = '급등' if ret_5m > 0 else '급락'
+            price_line = f'\n- 가격: 5m {ret_5m:+.1f}% ({direction})'
+
+    return (
+        f'🎯 EVENT DECISION → Claude 직접 결정\n'
+        f'- 트리거: {", ".join(kr_types) or "?"}\n'
+        f'- 모드: {mode or "?"}'
+        f'{price_line}'
+    )
+
+
+def format_event_decision_post_alert(triggers, action, result, guards=None):
+    """이벤트 결정 모드 — 결과 알림."""
+    result = result or {}
+    guards = guards or []
+    trigger_types = [t.get('type', '?') for t in (triggers or [])]
+    kr_types = [_kr_trigger(t) for t in trigger_types]
+
+    action_kr = EVENT_DECISION_ACTION_KR.get(action, action)
+    event_class = result.get('event_class', '?')
+    event_class_kr = EVENT_CLASS_KR.get(event_class, event_class)
+    confidence = result.get('confidence', '?')
+    reasoning = result.get('reasoning_short', '')
+    params = result.get('params', {})
+
+    lines = [f'🎯 EVENT DECISION 결과: {action_kr}']
+    lines.append(f'- 이벤트: {event_class_kr}')
+    lines.append(f'- 확신도: {confidence}')
+    lines.append(f'- 트리거: {", ".join(kr_types) or "?"}')
+    if reasoning:
+        lines.append(f'- 근거: {reasoning[:100]}')
+
+    if action == 'RISK_OFF_REDUCE':
+        ratio = params.get('reduce_ratio', 0)
+        lines.append(f'- 축소비율: {ratio*100:.0f}%')
+    elif action == 'FREEZE_NEW_ENTRY':
+        freeze = params.get('freeze_minutes', 0)
+        lines.append(f'- 동결: {freeze}분')
+    elif action == 'REVERSE':
+        ratio = params.get('reverse_size_ratio', 0)
+        lines.append(f'- 반전비율: {ratio*100:.0f}%')
+    elif action == 'HEDGE':
+        ratio = params.get('hedge_size_ratio', 0)
+        lines.append(f'- 헤지비율: {ratio*100:.0f}%')
+
+    if guards:
+        lines.append(f'- 가드: {", ".join(guards)}')
+
+    safety = result.get('safety_checks', {})
+    if safety.get('orphan_orders_cleanup_required'):
+        lines.append('- 오펀 정리: 예정')
+    if safety.get('stop_order_required'):
+        lines.append('- SL 설정: 요청')
+
+    return '\n'.join(lines)
+
+
 def format_async_claude_result(action, result, reason):
     """Claude 비동기 분석 결과 한국어 포매팅."""
     result = result or {}
@@ -1202,7 +1287,7 @@ def format_async_claude_result(action, result, reason):
     reason_code = result.get('reason_code', '')
     detail = ', '.join(reason_bullets[:2]) if reason_bullets else reason_code
 
-    lines = [f'🧠 비동기 Claude 분석 완료 (claude_waited=false)']
+    lines = ['🧠 비동기 Claude 분석 완료 (claude_waited=false)']
     lines.append(f'- 조치: {_kr_action(action)}')
     lines.append(f'- 확신도: {confidence}')
     if risk and risk != '?':
@@ -1278,7 +1363,7 @@ def format_hold_suppress_notice(symbol, count, ttl_min, trigger_types):
 def format_budget_exceeded(reason, daily_report=''):
     """Claude 예산 초과 알림."""
     lines = [
-        f'⚠️ Claude 예산 초과',
+        '⚠️ Claude 예산 초과',
         f'- 사유: {reason}',
     ]
     if daily_report:
@@ -1323,7 +1408,7 @@ def format_lock_stats_report(hours, caller_stats, lock_stats):
                 f"  {s['caller']}: {s['allowed_calls']}회 허용 / "
                 f"{s['denied_calls']}회 거부 / ${s['total_cost']:.4f}")
 
-    lines.append(f'\n=== 활성 락 ===')
+    lines.append('\n=== 활성 락 ===')
     lines.append(f"합계: {lock_stats.get('total_active', 0)}")
     lock_type_kr = {'event': '이벤트', 'hash': '해시', 'hold_sup': 'HOLD 억제'}
     for lt in ('event', 'hash', 'hold_sup'):

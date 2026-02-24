@@ -5,7 +5,6 @@ Each module imports the relevant ensure_* function to guarantee
 its tables/columns exist before first use.  Safe to call repeatedly
 (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
 """
-import os
 import sys
 sys.path.insert(0, '/root/trading-bot/app')
 LOG_PREFIX = '[db_migrations]'
@@ -949,6 +948,43 @@ def ensure_claude_call_log(cur):
     _log('ensure_claude_call_log done')
 
 
+def ensure_event_decision_log(cur):
+    '''Event Decision Mode — Claude direct decision log.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.event_decision_log (
+            id               BIGSERIAL PRIMARY KEY,
+            ts               TIMESTAMPTZ NOT NULL DEFAULT now(),
+            symbol           TEXT NOT NULL DEFAULT 'BTC/USDT:USDT',
+            mode             TEXT NOT NULL,
+            triggers         JSONB NOT NULL DEFAULT '[]',
+            event_hash       TEXT,
+            snapshot_price   NUMERIC,
+            -- Claude
+            claude_called    BOOLEAN DEFAULT false,
+            claude_raw       JSONB,
+            claude_parsed    JSONB,
+            -- Safety guard
+            guard_applied    BOOLEAN DEFAULT false,
+            guard_reasons    TEXT[],
+            original_action  TEXT,
+            final_action     TEXT,
+            -- Execution
+            eq_ids           BIGINT[],
+            entry_lock_key   TEXT,
+            entry_lock_ttl   INTEGER,
+            -- Cost
+            latency_ms       INTEGER DEFAULT 0,
+            input_tokens     INTEGER DEFAULT 0,
+            output_tokens    INTEGER DEFAULT 0,
+            estimated_cost   NUMERIC(8,6) DEFAULT 0,
+            model_used       TEXT
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_edl_ts ON event_decision_log(ts);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_edl_symbol ON event_decision_log(symbol);')
+    _log('ensure_event_decision_log done')
+
+
 def ensure_news_title_ko(cur):
     '''Add title_ko column to news table for Korean translation.'''
     cur.execute("""
@@ -1729,6 +1765,8 @@ def run_all():
             ensure_position_state_stop_status(cur)
             # D1-1: panic_guard_events 테이블
             ensure_panic_guard_events(cur)
+            # Event Decision Mode — Claude direct decision log
+            ensure_event_decision_log(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

@@ -19,9 +19,6 @@ FAIL-OPEN: Errors in this module never block trading, only log warnings.
 import os
 import sys
 import time
-import json
-import random
-import string
 import threading
 import traceback
 
@@ -475,6 +472,54 @@ def _is_ff_enabled():
         return feature_flags.is_enabled('ff_server_stop_orders')
     except Exception:
         return False
+
+
+    def sync_event_stop(self, cur, position, new_sl_pct=None, urgency='MEDIUM'):
+        """Event Decision Mode stop sync — wraps sync_stop_order with urgency bypass.
+
+        Args:
+            cur: DB cursor
+            position: dict with {side, qty, entry_price, mark_price}
+            new_sl_pct: optional SL distance in % (e.g. 1.5 = 1.5% from mark)
+            urgency: MEDIUM/HIGH/CRITICAL — HIGH+ bypasses debounce
+
+        Returns: (synced: bool, detail: str)
+        """
+        import feature_flags
+        if not feature_flags.is_enabled('ff_server_stop_orders'):
+            return (True, 'ff_server_stop_orders OFF')
+
+        side = (position.get('side') or '').lower()
+        mark = float(position.get('mark_price', 0) or position.get('price', 0) or 0)
+        qty = float(position.get('qty', 0))
+
+        if not side or qty <= 0 or mark <= 0:
+            return (True, 'no position for event stop')
+
+        # Compute SL price from new_sl_pct or fallback to entry-based
+        if new_sl_pct and new_sl_pct > 0:
+            if side == 'long':
+                sl_price = round(mark * (1 - new_sl_pct / 100), 2)
+            else:
+                sl_price = round(mark * (1 + new_sl_pct / 100), 2)
+        else:
+            # Fallback: use 2% from mark
+            if side == 'long':
+                sl_price = round(mark * 0.98, 2)
+            else:
+                sl_price = round(mark * 1.02, 2)
+
+        # HIGH/CRITICAL urgency: bypass debounce
+        if urgency in ('HIGH', 'CRITICAL'):
+            if not self._lock.acquire(blocking=False):
+                return (True, 'lock held — skipping event stop')
+            try:
+                self._last_sync_ts = 0  # reset debounce
+                return self._sync_inner(cur, position, sl_price)
+            finally:
+                self._lock.release()
+        else:
+            return self.sync_stop_order(cur, position, sl_price)
 
 
 # Module-level singleton with thread-safe init
