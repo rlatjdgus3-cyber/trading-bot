@@ -144,6 +144,10 @@ HELP_TEXT = (
     "  /bundle — 종합 진단 (외부AI 복붙용)\n"
     "  /trade_history [N] — 최근 N건 체결 (기본 10)\n"
     "  /pnl_recent [N] — 최근 N건 PnL 요약 (기본 10)\n"
+    "  /review_now — 즉시 전략 리뷰 실행\n"
+    "  /proposals — 대기 중 개선 제안 목록\n"
+    "  /apply_proposal <id> — 특정 제안 수동 적용\n"
+    "  /freeze [분] — 긴급 전체 동결 (기본 30분)\n"
     "  /debug — 디버그 서브커맨드 메뉴\n"
     "    /debug version — 빌드/버전/환경\n"
     "    /debug router — 라우팅 디버그\n"
@@ -1028,7 +1032,7 @@ def _format_market_data(price, ctx):
         r24_pct = (h24 - l24) / l24 * 100 if l24 else 0
         r72_pct = (h72 - l72) / l72 * 100 if l72 else 0
         pos_24 = (price - l24) / (h24 - l24) * 100 if (h24 - l24) > 0 else 50
-        lines.append(f'\n[가격 범위]')
+        lines.append('\n[가격 범위]')
         lines.append(f'24h: ${l24:,.0f} ~ ${h24:,.0f} (범위 {r24_pct:.1f}%)')
         lines.append(f'72h: ${l72:,.0f} ~ ${h72:,.0f} (범위 {r72_pct:.1f}%)')
         lines.append(f'현재가 위치: 24h 레인지 {pos_24:.0f}% 지점')
@@ -1036,11 +1040,11 @@ def _format_market_data(price, ctx):
     # Indicators
     ind = ctx.get('ind', {})
     if ind:
-        lines.append(f'\n[Bollinger Bands]')
+        lines.append('\n[Bollinger Bands]')
         lines.append(f'Upper: ${ind.get("bb_up", 0):,.0f} | Mid: ${ind.get("bb_mid", 0):,.0f} | Lower: ${ind.get("bb_dn", 0):,.0f}')
         lines.append(f'Bandwidth: {ind.get("bb_bw", 0):.2f}% | Mid 기울기: {ind.get("bb_mid_slope", "n/a")}')
 
-        lines.append(f'\n[Ichimoku]')
+        lines.append('\n[Ichimoku]')
         lines.append(f'Tenkan: ${ind.get("tenkan", 0):,.0f} | Kijun: ${ind.get("kijun", 0):,.0f}')
         lines.append(f'Cloud: Span A=${ind.get("span_a", 0):,.0f} Span B=${ind.get("span_b", 0):,.0f}')
         cloud_top = max(ind.get('span_a', 0), ind.get('span_b', 0))
@@ -1053,7 +1057,7 @@ def _format_market_data(price, ctx):
             cloud_pos = '가격 ∈ Cloud (내부)'
         lines.append(cloud_pos)
 
-        lines.append(f'\n[이동평균 & 기타]')
+        lines.append('\n[이동평균 & 기타]')
         lines.append(f'MA50: ${ind.get("ma50", 0):,.0f} | MA200: ${ind.get("ma200", 0):,.0f}')
         lines.append(f'RSI(14): {ind.get("rsi", 0)} | ATR(14): {ind.get("atr", 0)}')
         if ind.get('vol_spike'):
@@ -1062,7 +1066,7 @@ def _format_market_data(price, ctx):
     # Volume profile
     vp = ctx.get('vp', {})
     if vp:
-        lines.append(f'\n[Volume Profile]')
+        lines.append('\n[Volume Profile]')
         lines.append(f'POC: ${vp.get("poc", 0):,.0f} | VAH: ${vp.get("vah", 0):,.0f} | VAL: ${vp.get("val", 0):,.0f}')
 
     return '\n'.join(lines)
@@ -1545,7 +1549,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                             execute_status = f'YES (eq_id={eq_id})'
                             _send_enqueue_alert(eq_id, final_action, exec_parsed, pos_state)
                         else:
-                            execute_status = f'BLOCKED (safety)'
+                            execute_status = 'BLOCKED (safety)'
                 else:
                     # EXIT actions bypass trade_switch
                     eq_id = _enqueue_claude_action(cur, exec_parsed, pos_state, scores, snapshot)
@@ -1553,7 +1557,7 @@ def _ai_strategy_advisory(text: str, call_type: str = 'AUTO') -> tuple:
                         execute_status = f'YES (eq_id={eq_id})'
                         _send_enqueue_alert(eq_id, final_action, exec_parsed, pos_state)
                     else:
-                        execute_status = f'BLOCKED (safety)'
+                        execute_status = 'BLOCKED (safety)'
 
             # Phase 5: Build output + DB save
             total = scores.get('total_score', 0)
@@ -2098,6 +2102,7 @@ _KNOWN_SLASH_COMMANDS = [
     '/snapshot', '/snap', '/fact', '/now', '/close_all', '/force',
     '/detail', '/trade', '/reconcile', '/mctx', '/mode',
     '/bundle', '/trade_history', '/pnl_recent', '/supervisor',
+    '/review_now', '/proposals', '/apply_proposal', '/freeze',
     # Korean aliases
     '/포지션', '/주문', '/잔고', '/자산', '/전략포지션', '/리스크', '/risk',
     '/스냅샷', '/팩트', '/전청산', '/서비스', '/상태', '/스코어', '/테스트', '/감사',
@@ -2696,7 +2701,7 @@ def _trade_flatten() -> str:
         # 2. Close position
         try:
             ex = _get_exchange()
-            from live_order_executor import get_position, place_close_order, SYMBOL as _SYM
+            from live_order_executor import get_position, place_close_order
             side, qty, upnl, pct = get_position(ex)
             if side and qty > 0:
                 order = place_close_order(ex, side, qty)
@@ -2708,8 +2713,8 @@ def _trade_flatten() -> str:
                 ) + _footer('trade_flatten', 'local', 'local')
             else:
                 return (
-                    f'ℹ️ 포지션 없음 — 청산 불필요\n'
-                    f'  entry_enabled=OFF (설정 완료)'
+                    'ℹ️ 포지션 없음 — 청산 불필요\n'
+                    '  entry_enabled=OFF (설정 완료)'
                 ) + _footer('trade_flatten', 'local', 'local')
         except Exception as e:
             return (
@@ -2956,7 +2961,7 @@ def handle_command(text: str, chat_id: int = 0) -> str:
     t = (text or "").strip()
 
     # Benchmark service routing (separate process)
-    if t.startswith('/bench') or t.startswith('/apply_proposal') or t.startswith('/apply_confirm'):
+    if t.startswith('/bench') or t.startswith('/apply_confirm'):
         import subprocess
         result = subprocess.run(
             ['/usr/bin/python3', '/root/trading-bot/benchmark_service/bench_telegram.py', '--handle', t],
@@ -3126,10 +3131,141 @@ def handle_command(text: str, chat_id: int = 0) -> str:
         return ai_result + _footer('force_strategy', 'claude', ai_provider,
                                    call_type='USER_MANUAL', bypass=True)
 
+    # /review_now — 즉시 전략 리뷰 실행
+    if t == '/review_now' or t.startswith('/review_now '):
+        _log('/review_now command received')
+        conn = None
+        try:
+            import proactive_manager
+            conn = _get_db_conn()
+            with conn.cursor() as cur:
+                result = proactive_manager.run_periodic_review(cur, force=True)
+            if result.get('review_done'):
+                count = result.get('proposals_count', 0)
+                lines = [f'✅ 전략 리뷰 완료 — {count}건 제안']
+                for p in result.get('proposals', [])[:3]:
+                    lines.append(f'  • [{p.get("category", "?")}] {p.get("title", "?")}')
+                if count > 0:
+                    lines.append(f'\n/proposals 로 전체 조회')
+                return '\n'.join(lines) + _footer('review_now', 'local', 'claude')
+            else:
+                reason = result.get('reason', 'unknown')
+                return f'⚠ 리뷰 미실행: {reason}' + _footer('review_now', 'local', 'local')
+        except Exception as e:
+            _log(f'/review_now error: {e}')
+            return f'⚠ 리뷰 실패: {e}' + _footer('review_now', 'error', 'local')
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # /proposals — 대기 중 개선 제안 목록
+    if t in ('/proposals', '/제안', '/제안목록'):
+        _log('/proposals command received')
+        conn = None
+        try:
+            import proactive_manager
+            conn = _get_db_conn()
+            with conn.cursor() as cur:
+                proposals = proactive_manager.get_pending_proposals(cur, limit=10)
+            if not proposals:
+                return '📋 대기 중인 제안 없음' + _footer('proposals', 'local', 'local')
+            lines = [f'📋 대기 중 제안 ({len(proposals)}건)']
+            for p in proposals:
+                conf = p.get('confidence', 0)
+                lines.append(
+                    f'\n#{p["id"]} [{p.get("category", "?")}] {p.get("title", "?")}')
+                if p.get('config_key'):
+                    lines.append(
+                        f'  {p["config_key"]}: {p.get("current_value", "?")} → {p.get("proposed_value", "?")}')
+                lines.append(f'  확신도: {conf:.0%} | /apply_proposal {p["id"]} 로 적용')
+            return '\n'.join(lines) + _footer('proposals', 'local', 'local')
+        except Exception as e:
+            _log(f'/proposals error: {e}')
+            return f'⚠ 제안 조회 실패: {e}' + _footer('proposals', 'error', 'local')
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # /apply_proposal <id> — 특정 제안 수동 적용
+    if t == '/apply_proposal' or t.startswith('/apply_proposal '):
+        _log(f'/apply_proposal command: {t}')
+        parts = t.split()
+        if len(parts) < 2:
+            return '사용법: /apply_proposal <id>\n예: /apply_proposal 5' + \
+                _footer('apply_proposal', 'local', 'local')
+        try:
+            proposal_id = int(parts[1])
+        except (ValueError, IndexError):
+            return '⚠ 유효하지 않은 제안 ID' + _footer('apply_proposal', 'error', 'local')
+
+        conn = None
+        try:
+            import proactive_manager
+            conn = _get_db_conn()
+            with conn.cursor() as cur:
+                success, msg = proactive_manager.apply_proposal(
+                    cur, proposal_id, applied_by='telegram')
+            return msg + _footer('apply_proposal', 'local', 'local')
+        except Exception as e:
+            _log(f'/apply_proposal error: {e}')
+            return f'⚠ 적용 실패: {e}' + _footer('apply_proposal', 'error', 'local')
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # /freeze [분] — 운영자 긴급 전체 동결
+    if t == '/freeze' or t.startswith('/freeze '):
+        _log(f'/freeze command: {t}')
+        parts = t.split()
+        try:
+            minutes = int(parts[1]) if len(parts) > 1 else 30
+            minutes = max(1, min(1440, minutes))  # 1분~24시간 제한
+        except (ValueError, IndexError):
+            minutes = 30
+
+        conn = None
+        try:
+            import event_lock
+            conn = _get_db_conn()
+            with conn.cursor() as cur:
+                # 1. entry lock
+                lock_key = f'freeze_entry:{STRATEGY_SYMBOL}'
+                event_lock.acquire_lock(
+                    lock_key, ttl_sec=minutes * 60,
+                    caller='telegram_freeze', lock_type='freeze',
+                    conn=conn)
+                # 2. set entry veto
+                import proactive_manager
+                proactive_manager.set_entry_veto(
+                    cur, f'운영자 긴급 동결 ({minutes}분)', minutes * 60)
+            msg = (f'❄️ 전체 동결 활성화\n'
+                   f'- 기간: {minutes}분\n'
+                   f'- 신규 진입 차단\n'
+                   f'- 해제: 자동 만료 또는 /trade on')
+            return msg + _footer('freeze', 'local', 'local')
+        except Exception as e:
+            _log(f'/freeze error: {e}')
+            return f'⚠ 동결 실패: {e}' + _footer('freeze', 'error', 'local')
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     # /detail — expanded news report
     if t == '/detail' or t.startswith('/detail '):
         detail_text = t[len('/detail'):].strip() or '뉴스 상세 분석'
-        _log(f'/detail command: detail=True')
+        _log('/detail command: detail=True')
         detail_result, detail_provider = _ai_news_claude_advisory(
             detail_text, call_type='AUTO', detail=True)
         return detail_result + _footer('detail', 'claude', detail_provider)

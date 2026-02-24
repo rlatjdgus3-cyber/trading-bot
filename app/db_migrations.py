@@ -985,6 +985,35 @@ def ensure_event_decision_log(cur):
     _log('ensure_event_decision_log done')
 
 
+def ensure_proposals(cur):
+    '''Claude periodic review proposals table — config-level suggestions only.'''
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.proposals (
+            id              BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+            review_type     TEXT NOT NULL DEFAULT 'periodic_6h',
+            status          TEXT NOT NULL DEFAULT 'pending',
+            category        TEXT,
+            title           TEXT NOT NULL,
+            description     TEXT,
+            current_value   TEXT,
+            proposed_value  TEXT,
+            config_key      TEXT,
+            confidence      NUMERIC(4,3) DEFAULT 0,
+            reasoning       TEXT,
+            metrics_snapshot JSONB DEFAULT '{}'::jsonb,
+            claude_raw      JSONB,
+            applied_at      TIMESTAMPTZ,
+            applied_by      TEXT,
+            rejected_at     TIMESTAMPTZ,
+            rejected_by     TEXT
+        );
+    """)
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_proposals_ts ON proposals(ts DESC);')
+    _log('ensure_proposals done')
+
+
 def ensure_news_title_ko(cur):
     '''Add title_ko column to news table for Korean translation.'''
     cur.execute("""
@@ -1767,6 +1796,8 @@ def run_all():
             ensure_panic_guard_events(cur)
             # Event Decision Mode — Claude direct decision log
             ensure_event_decision_log(cur)
+            # Claude periodic review proposals
+            ensure_proposals(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')
