@@ -29,6 +29,7 @@ SHORT_LABELS = {
 
 COMPARISON_ROWS = [
     ('Return %', 'total_return_pct', '.2f'),
+    ('PnL ($)', 'cumulative_pnl', '.2f'),
     ('Win Rate %', 'win_rate', '.1f'),
     ('Max DD %', 'max_drawdown_pct', '.2f'),
     ('Trades', 'trade_count', 'd'),

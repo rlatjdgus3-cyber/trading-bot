@@ -14,6 +14,7 @@ Metrics computed:
   - Fee Ratio %
   - Long/Short Ratio
 """
+from collections import deque
 from datetime import datetime, timezone
 
 
@@ -39,6 +40,15 @@ def compute_metrics(executions, equity_series):
             metrics['total_return_pct'] = 0.0
         metrics['start_equity'] = round(start_eq, 2)
         metrics['end_equity'] = round(end_eq, 2)
+    elif trades:
+        # Fallback: estimate return from cumulative trade PnL
+        cumulative_pnl = sum(t['pnl'] for t in trades)
+        # Estimate starting capital from first trade notional (conservative)
+        first_notional = trades[0]['qty'] * trades[0]['open_price']
+        est_capital = max(first_notional * 10, 1000.0)  # assume ~10x notional
+        metrics['total_return_pct'] = round(cumulative_pnl / est_capital * 100, 2)
+        metrics['start_equity'] = round(est_capital, 2)
+        metrics['end_equity'] = round(est_capital + cumulative_pnl, 2)
     else:
         metrics['total_return_pct'] = 0.0
         metrics['start_equity'] = 0.0
@@ -73,10 +83,9 @@ def _pair_trades(executions):
     if not executions:
         return []
 
-    # Sort by timestamp
     sorted_execs = sorted(executions, key=lambda x: x['ts'])
     trades = []
-    open_positions = []  # stack of (side, qty_remaining, price, ts, fees)
+    open_positions = deque()  # FIFO queue: (side, qty, price, ts, fee)
 
     for ex in sorted_execs:
         side = ex['side'].upper()
@@ -86,10 +95,8 @@ def _pair_trades(executions):
         ts = ex['ts']
 
         if not open_positions or open_positions[0][0] == side:
-            # Same direction: add to position
             open_positions.append((side, qty, price, ts, fee))
         else:
-            # Opposite direction: close position(s)
             remaining = qty
             close_fees = fee
             while remaining > 0 and open_positions:
@@ -101,7 +108,6 @@ def _pair_trades(executions):
                 else:
                     pnl = fill_qty * (op_price - price)
 
-                # Proportional fees
                 entry_fee = op_fee * (fill_qty / op_qty) if op_qty > 0 else 0
                 exit_fee = close_fees * (fill_qty / qty) if qty > 0 else 0
                 total_fee = entry_fee + exit_fee
@@ -124,12 +130,10 @@ def _pair_trades(executions):
                     open_positions[0] = (op_side, leftover, op_price, op_ts,
                                          op_fee * (leftover / op_qty))
                 else:
-                    open_positions.pop(0)
+                    open_positions.popleft()
 
-            # If remaining > 0, new position in opposite direction
             if remaining > 0:
-                new_side = side
-                open_positions.append((new_side, remaining, price, ts,
+                open_positions.append((side, remaining, price, ts,
                                        close_fees * (remaining / qty) if qty > 0 else 0))
 
     return trades

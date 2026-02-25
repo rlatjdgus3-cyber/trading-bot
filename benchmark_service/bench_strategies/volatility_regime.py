@@ -56,7 +56,7 @@ def compute_signal(indicators, vol_profile, price, candles, historical_indicator
                 'rationale': f'insufficient history ({len(hist)} rows)',
                 'indicators': snap}
 
-    bbw_values = [_compute_bbw(h) for h in hist if _compute_bbw(h) > 0]
+    bbw_values = [v for v in (_compute_bbw(h) for h in hist) if v > 0]
     if not bbw_values:
         return {'signal': 'FLAT', 'confidence': 0,
                 'rationale': 'no valid BBW in history', 'indicators': snap}

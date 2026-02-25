@@ -13,9 +13,9 @@ State machine per strategy:
   SHORT + LONG  → close + open LONG (flip)
   Same signal   → HOLD
 """
-import time
 import json
 from datetime import datetime, timezone, timedelta
+import threading
 
 LOG_PREFIX = '[backtest_engine]'
 
@@ -27,6 +27,10 @@ INITIAL_EQUITY = 1000.0   # $1000 starting capital
 
 # Funding: 8-hour intervals (Bybit perpetual standard)
 FUNDING_INTERVAL_SEC = 8 * 3600
+
+# Thread-safe counter for unique exec_id generation within same millisecond
+_exec_counter = 0
+_exec_lock = threading.Lock()
 
 
 def _log(msg):
@@ -141,7 +145,7 @@ def _open_position(bench_conn, source_id, strategy_name, side, price):
     now = datetime.now(timezone.utc)
 
     # Record execution
-    exec_id = f'vm_{strategy_name}_{int(now.timestamp() * 1000)}'
+    exec_id = _make_exec_id(strategy_name)
     exec_side = 'BUY' if side == 'LONG' else 'SELL'
     _record_execution(bench_conn, source_id, exec_side, size, fill_price, fee,
                       exec_id, {'action': 'OPEN', 'virtual': True})
@@ -187,8 +191,7 @@ def _close_position(bench_conn, source_id, strategy_name, price, funding_rate=No
     net_pnl = raw_pnl - total_fees - funding_cost
 
     # Record close execution
-    now = datetime.now(timezone.utc)
-    exec_id = f'vm_{strategy_name}_{int(now.timestamp() * 1000)}'
+    exec_id = _make_exec_id(strategy_name)
     exec_side = 'SELL' if pos['side'] == 'LONG' else 'BUY'
     _record_execution(bench_conn, source_id, exec_side, pos['size'], fill_price, fee,
                       exec_id, {
@@ -255,6 +258,16 @@ def _accumulate_funding(bench_conn, source_id, strategy_name, pos, funding_rate)
                 WHERE source_id = %s;
             """, (incremental, source_id))
         bench_conn.commit()
+
+
+def _make_exec_id(strategy_name):
+    """Generate unique exec_id (safe for flip: close+open in same ms)."""
+    global _exec_counter
+    now = datetime.now(timezone.utc)
+    with _exec_lock:
+        _exec_counter += 1
+        seq = _exec_counter
+    return f'vm_{strategy_name}_{int(now.timestamp() * 1000)}_{seq}'
 
 
 def _record_execution(bench_conn, source_id, side, qty, price, fee, exec_id, meta):

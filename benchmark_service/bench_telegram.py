@@ -96,9 +96,17 @@ def _cmd_status():
             status = 'ON' if enabled else 'OFF'
             lines.append(f'\n{label} ({kind}) [{status}]')
             if last_exec:
-                age = datetime.now(timezone.utc) - last_exec.replace(tzinfo=timezone.utc) \
-                    if last_exec.tzinfo is None else datetime.now(timezone.utc) - last_exec
-                lines.append(f'  Last exec: {last_exec.strftime("%m-%d %H:%M")} ({age.seconds // 60}m ago)')
+                if last_exec.tzinfo is None:
+                    last_exec = last_exec.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - last_exec
+                total_min = int(age.total_seconds()) // 60
+                if total_min < 60:
+                    age_str = f'{total_min}m ago'
+                elif total_min < 1440:
+                    age_str = f'{total_min // 60}h{total_min % 60}m ago'
+                else:
+                    age_str = f'{total_min // 1440}d ago'
+                lines.append(f'  Last exec: {last_exec.strftime("%m-%d %H:%M")} ({age_str})')
             else:
                 lines.append('  Last exec: never')
             if last_pos:
@@ -188,7 +196,8 @@ def _cmd_snapshot():
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
                 age = now - ts
-                age_str = f'{age.seconds // 60}m ago' if age.seconds < 3600 else f'{age.seconds // 3600}h ago'
+                total_min = int(age.total_seconds()) // 60
+                age_str = f'{total_min}m ago' if total_min < 60 else f'{total_min // 60}h{total_min % 60}m ago'
                 lines.append(f'{label}')
                 lines.append(f'  {signal} ({conf}%) \u2014 {rationale}')
                 lines.append(f'  Updated: {age_str}')

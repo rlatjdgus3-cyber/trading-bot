@@ -244,6 +244,34 @@ def ensure_strategy_sources(cur):
     _log('ensure_strategy_sources done')
 
 
+def migrate_fix_our_strategy_side_mapping(cur):
+    """One-time fix: OUR_STRATEGY executions had direction (LONG/SHORT) as side
+    instead of trade action (BUY/SELL). Clear stale data so collector re-syncs
+    with correct BUY/SELL mapping."""
+    cur.execute(
+        "SELECT count(*) FROM bench_executions e "
+        "JOIN benchmark_sources s ON s.id = e.source_id "
+        "WHERE s.kind = 'OUR_STRATEGY' AND e.side IN ('LONG','SHORT');")
+    bad_rows = cur.fetchone()[0]
+    if bad_rows == 0:
+        return  # already migrated or no data
+
+    _log(f'fixing OUR_STRATEGY side mapping: {bad_rows} rows with LONG/SHORT side')
+
+    # Get source_id
+    cur.execute("SELECT id FROM benchmark_sources WHERE kind = 'OUR_STRATEGY' LIMIT 1;")
+    row = cur.fetchone()
+    if not row:
+        return
+    src_id = row[0]
+
+    # Clear stale execution + equity data → collector will re-sync
+    cur.execute("DELETE FROM bench_executions WHERE source_id = %s;", (src_id,))
+    cur.execute("DELETE FROM bench_equity_timeseries WHERE source_id = %s;", (src_id,))
+    cur.execute("DELETE FROM bench_collector_state WHERE source_id = %s;", (src_id,))
+    _log(f'OUR_STRATEGY data cleared for source_id={src_id}, will re-sync on next poll')
+
+
 def run_all():
     """Run all benchmark migrations. Safe to call multiple times."""
     conn = None
@@ -262,6 +290,7 @@ def run_all():
             ensure_bench_strategy_signals(cur)
             ensure_bench_virtual_positions(cur)
             ensure_strategy_sources(cur)
+            migrate_fix_our_strategy_side_mapping(cur)
         _log('run_all complete')
     except Exception as e:
         _log(f'run_all error: {e}')

@@ -29,6 +29,26 @@ POLL_SEC = 30
 SYMBOL = os.getenv('SYMBOL', 'BTC/USDT:USDT')
 STALE_THRESHOLD_SEC = 120  # skip if indicators older than 2 minutes
 
+# Close/exit order types — position direction is opposite of trade side
+_CLOSE_ORDER_TYPES = frozenset({
+    'EXIT', 'CLOSE', 'EMERGENCY_CLOSE', 'STOP_LOSS',
+    'SCHEDULED_CLOSE', 'REDUCE', 'REVERSE_CLOSE',
+})
+
+
+def _direction_to_side(direction, order_type):
+    """Map execution_log direction + order_type → BUY/SELL for FIFO pairing.
+
+    execution_log.direction = position direction (LONG/SHORT).
+    bench_executions.side must be trade action (BUY/SELL) for _pair_trades.
+    """
+    direction = (direction or '').upper()
+    order_type = (order_type or '').upper()
+    if order_type in _CLOSE_ORDER_TYPES:
+        return 'SELL' if direction in ('LONG', 'BUY') else 'BUY'
+    else:
+        return 'BUY' if direction in ('LONG', 'BUY') else 'SELL'
+
 
 def _sdnotify(state):
     """Send sd_notify state if NOTIFY_SOCKET is set."""
@@ -125,23 +145,16 @@ def _collect_our_strategy(bench_conn, source_id):
     try:
         main_conn = get_main_conn_ro()
         with main_conn.cursor() as mcur:
-            # 1. Executions
-            if last_exec_ts:
-                mcur.execute("""
-                    SELECT id, ts, order_id, symbol, direction, filled_qty,
-                           avg_fill_price, fee, status
-                    FROM execution_log
-                    WHERE status IN ('FILLED', 'VERIFIED') AND ts > %s
-                    ORDER BY ts LIMIT 500;
-                """, (last_exec_ts,))
-            else:
-                mcur.execute("""
-                    SELECT id, ts, order_id, symbol, direction, filled_qty,
-                           avg_fill_price, fee, status
-                    FROM execution_log
-                    WHERE status IN ('FILLED', 'VERIFIED')
-                    ORDER BY ts LIMIT 500;
-                """)
+            # 1. Executions — include order_type for BUY/SELL mapping
+            ts_clause = "AND ts > %s" if last_exec_ts else ""
+            params = (last_exec_ts,) if last_exec_ts else ()
+            mcur.execute(f"""
+                SELECT id, ts, order_id, symbol, direction, filled_qty,
+                       avg_fill_price, fee, status, order_type
+                FROM execution_log
+                WHERE status IN ('FILLED', 'VERIFIED') {ts_clause}
+                ORDER BY ts LIMIT 500;
+            """, params)
             exec_rows = mcur.fetchall()
 
             new_last_ts = last_exec_ts
@@ -149,25 +162,28 @@ def _collect_our_strategy(bench_conn, source_id):
             if exec_rows:
                 with bench_conn.cursor() as bcur:
                     for row in exec_rows:
-                        eid, ts, order_id, sym, direction, qty, price, fee, status = row
+                        (eid, ts, order_id, sym, direction,
+                         qty, price, fee, status, order_type) = row
                         exec_id = f'our_{eid}'
                         qty = float(qty) if qty else 0
                         price = float(price) if price else 0
                         fee = float(fee) if fee else 0
+                        side = _direction_to_side(direction, order_type)
                         bcur.execute("""
                             INSERT INTO bench_executions
                                 (ts, source_id, symbol, side, qty, price, fee, order_id, exec_id, meta)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (source_id, exec_id) DO NOTHING;
-                        """, (ts, source_id, sym or SYMBOL, direction or 'UNKNOWN',
+                        """, (ts, source_id, sym or SYMBOL, side,
                               qty, price, fee, order_id, exec_id,
-                              json.dumps({'status': status})))
+                              json.dumps({'status': status, 'order_type': order_type,
+                                          'direction': direction})))
                         new_last_ts = ts
                         new_last_id = exec_id
                 bench_conn.commit()
                 _log(f'our_strategy: {len(exec_rows)} executions synced')
 
-            # 2. Position snapshot
+            # 2. Position snapshot (only insert when changed)
             mcur.execute("""
                 SELECT symbol, side, total_qty, avg_entry_price, stage,
                        capital_used_usdt
@@ -175,34 +191,86 @@ def _collect_our_strategy(bench_conn, source_id):
             """, (SYMBOL,))
             pos_row = mcur.fetchone()
             if pos_row:
+                cur_side = pos_row[1]
+                cur_qty = float(pos_row[2] or 0)
                 with bench_conn.cursor() as bcur:
                     bcur.execute("""
-                        INSERT INTO bench_positions
-                            (source_id, symbol, size, side, entry_price, meta)
-                        VALUES (%s, %s, %s, %s, %s, %s);
-                    """, (source_id, pos_row[0] or SYMBOL,
-                          float(pos_row[2] or 0), pos_row[1],
-                          float(pos_row[3] or 0),
-                          json.dumps({'stage': pos_row[4], 'capital_used': float(pos_row[5] or 0)})))
+                        SELECT side, size FROM bench_positions
+                        WHERE source_id = %s ORDER BY ts DESC LIMIT 1;
+                    """, (source_id,))
+                    prev = bcur.fetchone()
+                    # Only insert if side or qty changed
+                    if not prev or prev[0] != cur_side or abs(float(prev[1]) - cur_qty) > 1e-9:
+                        bcur.execute("""
+                            INSERT INTO bench_positions
+                                (source_id, symbol, size, side, entry_price, meta)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (source_id, pos_row[0] or SYMBOL,
+                              cur_qty, cur_side,
+                              float(pos_row[3] or 0),
+                              json.dumps({'stage': pos_row[4], 'capital_used': float(pos_row[5] or 0)})))
                 bench_conn.commit()
 
-            # 3. Equity: read from main DB virtual_capital (latest row)
+            # 3. Equity: last equity + incremental PnL since last snapshot
             try:
-                mcur.execute("""
-                    SELECT capital_usdt FROM virtual_capital
-                    ORDER BY ts DESC LIMIT 1;
-                """)
-                vc_row = mcur.fetchone()
-                if vc_row and vc_row[0]:
-                    equity = float(vc_row[0])
-                    with bench_conn.cursor() as bcur:
-                        bcur.execute("""
-                            INSERT INTO bench_equity_timeseries
-                                (source_id, equity, wallet_balance, available_balance)
-                            VALUES (%s, %s, %s, %s);
-                        """, (source_id, equity, equity, equity))
-                    bench_conn.commit()
+                # Get last known equity from bench DB
+                with bench_conn.cursor() as bcur:
+                    bcur.execute("""
+                        SELECT equity, ts FROM bench_equity_timeseries
+                        WHERE source_id = %s ORDER BY ts DESC LIMIT 1;
+                    """, (source_id,))
+                    eq_row = bcur.fetchone()
+
+                if eq_row:
+                    last_equity = float(eq_row[0])
+                    last_eq_ts = eq_row[1]
+                    # Incremental PnL since last equity snapshot
+                    mcur.execute("""
+                        SELECT COALESCE(SUM(realized_pnl), 0)
+                        FROM execution_log
+                        WHERE status IN ('FILLED', 'VERIFIED')
+                          AND order_type IN ('CLOSE', 'REDUCE', 'REVERSE_CLOSE',
+                                             'EXIT', 'EMERGENCY_CLOSE', 'STOP_LOSS',
+                                             'SCHEDULED_CLOSE')
+                          AND realized_pnl IS NOT NULL
+                          AND ts > %s;
+                    """, (last_eq_ts,))
+                    delta_pnl = float(mcur.fetchone()[0])
+                    equity = last_equity + delta_pnl
+                else:
+                    # First run: full cumulative calculation
+                    mcur.execute("""
+                        SELECT COALESCE(SUM(realized_pnl), 0)
+                        FROM execution_log
+                        WHERE status IN ('FILLED', 'VERIFIED')
+                          AND order_type IN ('CLOSE', 'REDUCE', 'REVERSE_CLOSE',
+                                             'EXIT', 'EMERGENCY_CLOSE', 'STOP_LOSS',
+                                             'SCHEDULED_CLOSE')
+                          AND realized_pnl IS NOT NULL;
+                    """)
+                    cumulative_pnl = float(mcur.fetchone()[0])
+                    initial_capital = 1000.0
+                    try:
+                        mcur.execute("""
+                            SELECT capital_usdt FROM virtual_capital
+                            ORDER BY id ASC LIMIT 1;
+                        """)
+                        vc_row = mcur.fetchone()
+                        if vc_row and vc_row[0]:
+                            initial_capital = float(vc_row[0])
+                    except Exception:
+                        pass
+                    equity = initial_capital + cumulative_pnl
+
+                with bench_conn.cursor() as bcur:
+                    bcur.execute("""
+                        INSERT INTO bench_equity_timeseries
+                            (source_id, equity, wallet_balance, available_balance)
+                        VALUES (%s, %s, %s, %s);
+                    """, (source_id, equity, equity, equity))
+                bench_conn.commit()
             except Exception as e:
+                bench_conn.rollback()
                 _log(f'our_strategy equity fetch error: {e}')
 
             # Update checkpoint
