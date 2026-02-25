@@ -392,7 +392,7 @@ def compute_spread_ok(cur, symbol='BTC/USDT:USDT', max_spread_pct=0.05):
         return True  # FAIL-OPEN
 
 
-def compute_liquidity_ok(cur, symbol='BTC/USDT:USDT', window=50, min_ratio=0.5):
+def compute_liquidity_ok(cur, symbol='BTC/USDT:USDT', window=50, min_ratio=0.2):
     """Check if current volume >= min_ratio of median last `window` bars.
     FAIL-OPEN: returns True if data unavailable."""
     try:
@@ -407,8 +407,9 @@ def compute_liquidity_ok(cur, symbol='BTC/USDT:USDT', window=50, min_ratio=0.5):
         volumes = [float(r[0]) for r in rows if r[0] is not None]
         if len(volumes) < 10:
             return True
-        current = volumes[0]
-        hist = sorted(volumes[1:])
+        # Use previous COMPLETE candle (volumes[1]) to avoid incomplete current candle bias
+        current = volumes[1] if len(volumes) > 1 else volumes[0]
+        hist = sorted(volumes[2:]) if len(volumes) > 2 else sorted(volumes[1:])
         median = hist[len(hist) // 2]
         if median <= 0:
             return True

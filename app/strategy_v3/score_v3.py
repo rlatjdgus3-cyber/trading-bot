@@ -299,15 +299,15 @@ def _is_adaptive_dryrun():
 
 def _is_mr_allowed(features, regime_class, v3_regime):
     """[1-4] MeanReversion kill-switch for v1.1.
-    When ff_unified_engine_v11 is ON, MR is always OFF.
+    When ff_unified_engine_v11 is ON, ff_mr_enabled controls MR access.
     Returns True if MR entries are allowed."""
     try:
         import feature_flags
         if not feature_flags.is_enabled('ff_unified_engine_v11'):
             return True  # legacy behavior
 
-        # v1.1: MR 기본 OFF
-        return False
+        # v1.1: ff_mr_enabled 플래그로 MR 독립 제어
+        return feature_flags.is_enabled('ff_mr_enabled')
     except Exception:
         return True  # FAIL-OPEN
 

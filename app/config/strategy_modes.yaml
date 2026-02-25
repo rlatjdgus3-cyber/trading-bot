@@ -124,7 +124,7 @@ strategy_v3:
   breakout_reverse_block: true
 
   # Scoring guards
-  liquidity_hard_block: true
+  liquidity_hard_block: false
   spread_hard_block: true
   vol_pct_na_penalty: 10
   non_breakout_impulse_penalty: 20
@@ -228,6 +228,8 @@ feature_flags:
   ff_signal_spam_guard: true         # 반복 신호 쿨다운 (3회/30분 → 30분 cooldown)
   # Unified Engine v1.1 feature flags
   ff_unified_engine_v11: true         # Master switch (ON)
+  ff_mtf_direction_gate: false        # MTF 방향 게이트 일시 비활성화 (급상승 대응)
+  ff_mr_enabled: true                  # MeanReversion 독립 제어 (v1.1 내 kill-switch 해제)
   ff_pullback_trigger: false          # Phase 2 pullback (기본 OFF)
   ff_chandelier_exit: false           # Phase 4 (기본 OFF)
   # Event Decision Mode — Claude direct decision on EVENT triggers

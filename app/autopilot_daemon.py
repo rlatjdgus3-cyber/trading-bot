@@ -2150,25 +2150,29 @@ def _cycle():
                              f'(regime={v3_regime.get("regime_class", "?")} mode={v3_regime.get("entry_mode", "?")})')
                         return
 
-                    # [1-5] MTF Direction Gate (ff_unified_engine_v11)
+                    # [1-5] MTF Direction Gate (ff_unified_engine_v11 + ff_mtf_direction_gate)
                     try:
                         import feature_flags as _ff_mtf
                         if _ff_mtf.is_enabled('ff_unified_engine_v11'):
                             from mtf_direction import compute_mtf_direction, NO_TRADE, LONG_ONLY, SHORT_ONLY
                             _mtf_data = compute_mtf_direction(cur)
 
-                            # TOP-LEVEL GATE
-                            if _mtf_data['direction'] == NO_TRADE:
-                                _log(f'[MTF] NO_TRADE: {_mtf_data["reasons"]}')
-                                return
+                            # TOP-LEVEL GATE (gated by ff_mtf_direction_gate)
+                            _mtf_gate_on = _ff_mtf.is_enabled('ff_mtf_direction_gate')
+                            if _mtf_gate_on:
+                                if _mtf_data['direction'] == NO_TRADE:
+                                    _log(f'[MTF] NO_TRADE: {_mtf_data["reasons"]}')
+                                    return
 
-                            # Direction filter
-                            if _mtf_data['direction'] == LONG_ONLY and dominant == 'SHORT':
-                                _log('[MTF] LONG_ONLY but signal SHORT — blocked')
-                                return
-                            if _mtf_data['direction'] == SHORT_ONLY and dominant == 'LONG':
-                                _log('[MTF] SHORT_ONLY but signal LONG — blocked')
-                                return
+                                # Direction filter
+                                if _mtf_data['direction'] == LONG_ONLY and dominant == 'SHORT':
+                                    _log('[MTF] LONG_ONLY but signal SHORT — blocked')
+                                    return
+                                if _mtf_data['direction'] == SHORT_ONLY and dominant == 'LONG':
+                                    _log('[MTF] SHORT_ONLY but signal LONG — blocked')
+                                    return
+                            else:
+                                _log(f'[MTF] gate OFF (ff_mtf_direction_gate=false) dir={_mtf_data["direction"]}')
 
                             # Inject MTF direction into regime result
                             if v3_regime:
