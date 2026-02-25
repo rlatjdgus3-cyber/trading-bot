@@ -224,7 +224,7 @@ feature_flags:
   ff_config_versioning: false       # P3-2: 설정 버저닝
   ff_auto_apply_conservative: false # P3-3: 보수적 자동 적용
   # Safety hotfix flags
-  ff_allow_forced_entry: false       # FORCED=1 강제 진입 허용 여부 (default: 차단)
+  ff_allow_forced_entry: true        # FORCED=1 강제 진입 허용 (V3 drift override 진입 허용)
   ff_signal_spam_guard: true         # 반복 신호 쿨다운 (3회/30분 → 30분 cooldown)
   # Unified Engine v1.1 feature flags
   ff_unified_engine_v11: true         # Master switch (ON)

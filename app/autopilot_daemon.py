@@ -31,7 +31,7 @@ ALLOWED_SYMBOLS = frozenset({"BTC/USDT:USDT"})
 POLL_SEC = 20
 COOLDOWN_SEC = 30  # v2.1 중간 공격형
 MAX_DAILY_TRADES = 60
-MIN_CONFIDENCE = 35  # v3: conf>=35 진입 허용 (35-49: stage1 only, >=50: 기존 로직)
+MIN_CONFIDENCE = 25  # v3: conf>=25 진입 허용 (25-49: stage1 only, >=50: 기존 로직)
 CONF_ADD_THRESHOLD = 50  # conf>=50 이어야 ADD 허용
 DEFAULT_SIZE_PCT = 10
 REPEAT_SIGNAL_COOLDOWN_SEC = 900  # [0-3] 동일 방향 재신호 쿨다운 15분
@@ -2586,9 +2586,9 @@ def _cycle():
             # B1: FORCED hard block — autopilot FORCED entry prevention [0-3]
             try:
                 import feature_flags as _ff_forced
-                # [0-3] HARD BLOCK: conf<50 in autopilot → always rejected
-                if confidence < 50:
-                    _log(f'[FORCED_BLOCKED] autopilot에서 conf={confidence} < 50 진입 차단')
+                # [0-3] HARD BLOCK: conf<25 in autopilot → always rejected
+                if confidence < 25:
+                    _log(f'[FORCED_BLOCKED] autopilot에서 conf={confidence} < 25 진입 차단')
                     return
                 if not _ff_forced.is_enabled('ff_allow_forced_entry'):
                     _notify_telegram_throttled(
