@@ -31,6 +31,7 @@ __pycache__/
 .error_watcher_state.json
 .gpt_router_state.json
 .claude_gate_state.json
+.test_lifecycle_state.json
 test_mode.json
 status/
 :last_id
