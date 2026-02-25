@@ -1907,6 +1907,16 @@ def _run_strategy_v2(cur, scores, regime_ctx):
         meta['regime_tag'] = regime_ctx.get('regime', 'UNKNOWN')
 
     if action == 'EXIT' and position:
+        # V3 drift override 진입 포지션은 V2 EXIT 무시
+        try:
+            import feature_flags as _ff_v2exit
+            if not _ff_v2exit.is_enabled('ff_mtf_direction_gate') and _v3_result:
+                _v3_regime = _v3_result.get('regime_class', '')
+                if _v3_regime in ('DRIFT_UP', 'DRIFT_DOWN'):
+                    _log(f'v2 EXIT skipped: V3 drift override active (regime={_v3_regime})')
+                    return 'HOLD'
+        except Exception:
+            pass  # FAIL-OPEN
         # Enqueue CLOSE via execution_queue
         direction = position['side'].upper()
         # Duplicate check: don't enqueue if CLOSE already pending
