@@ -34,7 +34,7 @@ MAX_DAILY_TRADES = 60
 MIN_CONFIDENCE = 25  # v3: conf>=25 진입 허용 (25-49: stage1 only, >=50: 기존 로직)
 CONF_ADD_THRESHOLD = 50  # conf>=50 이어야 ADD 허용
 DEFAULT_SIZE_PCT = 10
-REPEAT_SIGNAL_COOLDOWN_SEC = 900  # [0-3] 동일 방향 재신호 쿨다운 15분
+REPEAT_SIGNAL_COOLDOWN_SEC = 300  # [0-3] 동일 방향 재신호 쿨다운 5분
 STOP_LOSS_COOLDOWN_WINDOW_SEC = 3600  # 손절 감시 윈도우 60분
 STOP_LOSS_COOLDOWN_TRIGGER = 2  # 연속 손절 N회 이상이면 쿨다운
 STOP_LOSS_COOLDOWN_PAUSE_SEC = 1800  # 손절 쿨다운 30분
@@ -1946,6 +1946,27 @@ def _run_strategy_v2(cur, scores, regime_ctx):
         return 'ACTED'
 
     if action == 'ENTER' and not position:
+        # V3 regime-direction conflict block (ff_drift_counter_block)
+        # 1) DRIFT_DOWN + LONG or DRIFT_UP + SHORT → counter-drift entry blocked
+        # 2) Any regime where V3 dominant_side != V2 side → V3 takes priority
+        try:
+            import feature_flags as _ff_drift_v2
+            if _v3_result:
+                _v3_rc = _v3_result.get('regime_class', '')
+                # Rule 1: drift counter-direction hard block
+                if _ff_drift_v2.is_enabled('ff_drift_counter_block'):
+                    if (_v3_rc == 'DRIFT_DOWN' and side == 'LONG') or \
+                       (_v3_rc == 'DRIFT_UP' and side == 'SHORT'):
+                        _log(f'v2 ENTER BLOCKED: {_v3_rc} vs {side} — counter-drift entry rejected')
+                        return 'HOLD'
+                # Rule 2: V3 post-modifier dominant_side conflicts with V2 side
+                _v3_dom = scores.get('dominant_side', side)
+                if _v3_dom != side:
+                    _log(f'v2 ENTER BLOCKED: V3 says {_v3_dom} but V2 wants {side} — regime priority')
+                    return 'HOLD'
+        except Exception as _e_drift:
+            _log(f'v2 drift block check error (FAIL-OPEN): {_e_drift}')
+
         # Enqueue via signals_action_v3 (same as old flow)
         if dedupe_hit:
             _log('v2 ENTER skipped: dedupe hit')
@@ -2611,9 +2632,10 @@ def _cycle():
                 _log(f'[FORCED] check error (FAIL-OPEN): {_e_forced}')
 
             # B2: Signal spam guard (3 signals/30min same direction → 30min cooldown)
+            #     DRIFT 레짐에서는 추세 방향 신호 반복이 정상이므로 스킵
             try:
                 import feature_flags as _ff_spam
-                if _ff_spam.is_enabled('ff_signal_spam_guard'):
+                if _ff_spam.is_enabled('ff_signal_spam_guard') and not _v3_is_drift:
                     _spam_ok, _spam_remaining = _check_signal_spam(SYMBOL, dominant)
                     if not _spam_ok:
                         _notify_telegram_throttled(
@@ -2622,6 +2644,8 @@ def _cycle():
                             msg_type='signal_spam', cooldown_sec=600)
                         _log(f'SIGNAL SPAM blocked: {dominant} (cooldown {_spam_remaining}s)')
                         return
+                elif _v3_is_drift:
+                    _log(f'[B2] Signal spam guard SKIPPED: regime={_v3_result.get("regime_class")} (drift bypass)')
             except Exception:
                 pass  # FAIL-OPEN
 

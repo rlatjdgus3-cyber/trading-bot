@@ -126,15 +126,30 @@ def _compute_drift_modifier(total_score, features, price, regime_class, cfg):
         modifier -= cfg['drift_aligned_bonus']  # negative = stronger SHORT
         reasoning.append(f'drift DOWN aligned SHORT: -{cfg["drift_aligned_bonus"]}')
 
-    # 2. Drift counter-direction penalty
+    # 2. Drift counter-direction HARD BLOCK (ff_drift_counter_block)
+    #    DRIFT_DOWN + LONG or DRIFT_UP + SHORT → MeanReversion counter-trend 진입 차단
+    try:
+        import feature_flags as _ff_drift
+        _drift_block_on = _ff_drift.is_enabled('ff_drift_counter_block')
+    except Exception:
+        _drift_block_on = True  # FAIL-CLOSED: 기본 차단
+
     if regime_class == 'DRIFT_UP' and dominant == 'SHORT':
-        # Push score toward LONG (reduce SHORT conviction)
-        modifier += cfg['drift_counter_penalty']
-        reasoning.append(f'drift UP vs SHORT — counter penalty: +{cfg["drift_counter_penalty"]}')
+        if _drift_block_on:
+            blocked = True
+            block_reason = f'DRIFT_UP vs SHORT — counter-drift entry blocked'
+            reasoning.append(block_reason)
+        else:
+            modifier += cfg['drift_counter_penalty']
+            reasoning.append(f'drift UP vs SHORT — counter penalty: +{cfg["drift_counter_penalty"]}')
     elif regime_class == 'DRIFT_DOWN' and dominant == 'LONG':
-        # Push score toward SHORT (reduce LONG conviction)
-        modifier -= cfg['drift_counter_penalty']
-        reasoning.append(f'drift DOWN vs LONG — counter penalty: -{cfg["drift_counter_penalty"]}')
+        if _drift_block_on:
+            blocked = True
+            block_reason = f'DRIFT_DOWN vs LONG — counter-drift entry blocked'
+            reasoning.append(block_reason)
+        else:
+            modifier -= cfg['drift_counter_penalty']
+            reasoning.append(f'drift DOWN vs LONG — counter penalty: -{cfg["drift_counter_penalty"]}')
 
     # 3. POC retest bonus (optional)
     if poc > 0 and atr_val > 0:
