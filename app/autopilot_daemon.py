@@ -2656,8 +2656,13 @@ def _cycle():
                 if _ff_trend.is_enabled('ff_unified_engine_v11') and _mtf_data:
                     from trend_triggers import evaluate_breakout, evaluate_pullback
 
-                    _bo = evaluate_breakout(cur, SYMBOL, _mtf_data['direction'], _v3_features or {})
-                    _pb = evaluate_pullback(cur, SYMBOL, _mtf_data['direction'], _v3_features or {})
+                    # MTF gate OFF → V3 dominant side 기준으로 breakout 방향 결정
+                    _bo_direction = _mtf_data['direction']
+                    if not _ff_trend.is_enabled('ff_mtf_direction_gate'):
+                        _bo_direction = 'LONG_ONLY' if dominant == 'LONG' else 'SHORT_ONLY'
+
+                    _bo = evaluate_breakout(cur, SYMBOL, _bo_direction, _v3_features or {})
+                    _pb = evaluate_pullback(cur, SYMBOL, _bo_direction, _v3_features or {})
 
                     if _bo['triggered']:
                         _trigger_type = 'DONCHIAN_BREAKOUT'
