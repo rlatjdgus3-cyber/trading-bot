@@ -400,6 +400,40 @@ def compute_modifier(total_score, features, v3_regime, price, regime_ctx=None):
             modifier -= vol_na_penalty
             reasoning.append(f'vol_pct=N/A → -{vol_na_penalty} penalty')
 
+        # Night session confidence penalty (ff_night_session_gate)
+        try:
+            import feature_flags as _ff_night
+            if _ff_night.is_enabled('ff_night_session_gate'):
+                from datetime import datetime, timezone, timedelta
+                kst = timezone(timedelta(hours=9))
+                hour_kst = datetime.now(kst).hour
+                start_h = cfg.get('night_session_start_hour_kst', 18)
+                end_h = cfg.get('night_session_end_hour_kst', 3)
+                is_night = hour_kst >= start_h or hour_kst < end_h
+                if is_night:
+                    night_penalty = cfg.get('night_session_conf_penalty', 15)
+                    if total_score >= 0:
+                        modifier -= night_penalty
+                    else:
+                        modifier += night_penalty
+                    reasoning.append(f'night session ({hour_kst}h KST) → -{night_penalty} conf penalty')
+        except Exception as e:
+            _log(f'night_session_gate FAIL-OPEN: {e}')
+
+        # LONG bearish EMA penalty (ff_long_bearish_penalty)
+        try:
+            import feature_flags as _ff_bear
+            if _ff_bear.is_enabled('ff_long_bearish_penalty'):
+                dominant = 'LONG' if total_score >= 0 else 'SHORT'
+                ema_9 = safe_float(features.get('ema_9'))
+                ema_21 = safe_float(features.get('ema_21'))
+                if dominant == 'LONG' and ema_9 > 0 and ema_21 > 0 and ema_9 < ema_21:
+                    bear_penalty = cfg.get('long_bearish_ema_penalty', 15)
+                    modifier -= bear_penalty
+                    reasoning.append(f'LONG + bearish EMA (ema9={ema_9:.0f}<ema21={ema_21:.0f}) → -{bear_penalty}')
+        except Exception as e:
+            _log(f'long_bearish_penalty FAIL-OPEN: {e}')
+
         # Clamp modifier
         modifier = _clamp(modifier, -50, 50)
 

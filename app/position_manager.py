@@ -1903,27 +1903,46 @@ def _decide(ctx=None):
             basis_tag = f' [{sl_basis}]' if sl_basis != 'PRICE_PCT' else ''
             return ('CLOSE', f'stop_loss hit ({sl_dist:.2f}% vs -{sl_pct}%){be_tag}{basis_tag}')
 
-    # Reversal / Close check (v3.0: total_score based)
-    if side == 'long' and total_score <= -25:
-        confirms = _structure_confirms(ctx, 'SHORT')
-        if confirms >= 2:
-            return ('REVERSE', f'strong SHORT reversal (total_score={total_score}, confirms={confirms})')
-        return ('CLOSE', f'SHORT signal without structure (total_score={total_score}, confirms={confirms})')
+    # Minimum hold time guard (ff_min_hold_time)
+    # Block non-SL closes within first N seconds to prevent noise-driven early exits
+    _min_hold_blocked = False
+    try:
+        import feature_flags as _ff_mh
+        if _ff_mh.is_enabled('ff_min_hold_time'):
+            from strategy_v3 import config_v3
+            _min_hold_sec = config_v3.get('min_hold_time_sec', 300)
+            _entry_ts = ctx.get('position_entry_ts')
+            if _entry_ts:
+                import time as _time_mh
+                _hold_elapsed = _time_mh.time() - _entry_ts
+                if _hold_elapsed < _min_hold_sec:
+                    _min_hold_blocked = True
+    except Exception:
+        pass  # FAIL-OPEN
 
-    if side == 'short' and total_score >= 25:
-        confirms = _structure_confirms(ctx, 'LONG')
-        if confirms >= 2:
-            return ('REVERSE', f'strong LONG reversal (total_score={total_score}, confirms={confirms})')
-        return ('CLOSE', f'LONG signal without structure (total_score={total_score}, confirms={confirms})')
+    # Reversal / Close check (v3.0: total_score based)
+    if not _min_hold_blocked:
+        if side == 'long' and total_score <= -25:
+            confirms = _structure_confirms(ctx, 'SHORT')
+            if confirms >= 2:
+                return ('REVERSE', f'strong SHORT reversal (total_score={total_score}, confirms={confirms})')
+            return ('CLOSE', f'SHORT signal without structure (total_score={total_score}, confirms={confirms})')
+
+        if side == 'short' and total_score >= 25:
+            confirms = _structure_confirms(ctx, 'LONG')
+            if confirms >= 2:
+                return ('REVERSE', f'strong LONG reversal (total_score={total_score}, confirms={confirms})')
+            return ('CLOSE', f'LONG signal without structure (total_score={total_score}, confirms={confirms})')
 
     # Reduce on counter signal (v3.0: total_score based)
     # 2026-02-24: ff_counter_signal_close 비활성 시 차단 (1.4% WR, -$109 손실원)
-    import feature_flags as _ff_cs
-    if _ff_cs.is_enabled('ff_counter_signal_close'):
-        if side == 'long' and total_score <= -15:
-            return ('REDUCE', f'counter signal (total_score={total_score})')
-        if side == 'short' and total_score >= 15:
-            return ('REDUCE', f'counter signal (total_score={total_score})')
+    if not _min_hold_blocked:
+        import feature_flags as _ff_cs
+        if _ff_cs.is_enabled('ff_counter_signal_close'):
+            if side == 'long' and total_score <= -15:
+                return ('REDUCE', f'counter signal (total_score={total_score})')
+            if side == 'short' and total_score >= 15:
+                return ('REDUCE', f'counter signal (total_score={total_score})')
 
     # ADD check (v3.0: profit-zone gate + regime-unified threshold)
     regime_ctx = ctx.get('regime_ctx', {})

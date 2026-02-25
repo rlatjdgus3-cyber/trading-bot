@@ -1,4 +1,4 @@
-daily_trade_limit: 60
+daily_trade_limit: 20
 min_order_qty_btc: 0.001
 
 mode_a_static_range:
@@ -131,9 +131,9 @@ strategy_v3:
   non_breakout_impulse_block_mult: 1.5
 
   # 연속손실 쿨다운
-  loss_streak_trigger: 3
-  loss_streak_cooldown_sec: 1200
-  loss_streak_window_hours: 3
+  loss_streak_trigger: 5
+  loss_streak_cooldown_sec: 7200
+  loss_streak_window_hours: 6
 
   # Performance guardrails
   mode_cooloff_enabled: true
@@ -169,6 +169,17 @@ strategy_v3:
   # D2-2: 히스테리시스 + 마비 방지 강화
   adaptive_penalty_relax_consecutive: 3    # penalty 완화에 필요한 연속 "개선" 신호 수
   adaptive_24h_zero_trade_partial_reset: true  # 24h 거래 0이면 penalty 부분 리셋
+
+  # Night session gate (18:00-03:00 KST)
+  night_session_conf_penalty: 15        # conf penalty during night hours
+  night_session_start_hour_kst: 18      # 18:00 KST
+  night_session_end_hour_kst: 3         # 03:00 KST
+
+  # LONG bearish penalty (EMA9 < EMA21 → LONG penalty)
+  long_bearish_ema_penalty: 15          # conf penalty for LONG when EMA bearish
+
+  # Minimum hold time
+  min_hold_time_sec: 300                # 5 minutes minimum before close/reduce
 
   # P0-1: SL basis conversion
   sl_basis: UPNL_PCT           # PRICE_PCT | UPNL_PCT | EQUITY_PCT
@@ -235,6 +246,9 @@ feature_flags:
   # Event Decision Mode — Claude direct decision on EVENT triggers
   ff_event_decision_mode: true        # Claude Decision Mode (활성)
   # Trade analysis optimizations (2026-02-24)
+  ff_night_session_gate: true           # 야간(18-03 KST) 진입 threshold +15
+  ff_long_bearish_penalty: true         # LONG 진입 시 EMA 하락 추세에서 penalty -15
+  ff_min_hold_time: true                # 포지션 최소 보유 시간 5분 (조기 청산 차단)
   ff_drift_counter_block: true         # DRIFT_DOWN+LONG / DRIFT_UP+SHORT 역방향 MR 진입 차단
   ff_counter_signal_close: false      # counter_signal 청산 비활성 (1.4% WR, -$109 손실원)
   ff_mode_c_enabled: false            # MODE_C Shock Breakout 비활성 (0% WR, -$85 손실원)
