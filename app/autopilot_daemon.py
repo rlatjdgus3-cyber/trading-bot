@@ -2673,8 +2673,12 @@ def _cycle():
                         dominant = _pb['side']
                         _log(f'[TRIGGER] EMA pullback: {_pb["side"]} @ {_pb["trigger_price"]:.1f}')
                     else:
-                        _log(f'[TRIGGER] no trigger fired — skipping (bo={_bo["reasons"][:1]}, pb={_pb["reasons"][:1]})')
-                        return
+                        if not _ff_trend.is_enabled('ff_mtf_direction_gate'):
+                            _trigger_type = 'V3_DRIFT_OVERRIDE'
+                            _log(f'[TRIGGER] no breakout but MTF gate OFF → V3 drift override ({dominant})')
+                        else:
+                            _log(f'[TRIGGER] no trigger fired — skipping (bo={_bo["reasons"][:1]}, pb={_pb["reasons"][:1]})')
+                            return
             except Exception as e:
                 _log(f'[TRIGGER] error (FAIL-OPEN): {e}')
 
